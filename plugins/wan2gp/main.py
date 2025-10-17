@@ -58,7 +58,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QTextEdit, QSlider, QCheckBox, QComboBox,
     QFileDialog, QGroupBox, QFormLayout, QTableWidget, QTableWidgetItem,
     QHeaderView, QProgressBar, QScrollArea, QListWidget, QListWidgetItem,
-    QMessageBox, QRadioButton, QSizePolicy
+    QMessageBox, QRadioButton, QSizePolicy, QMenu
 )
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QUrl, QSize, QRectF
 from PyQt6.QtGui import QPixmap, QImage, QDropEvent
@@ -165,6 +165,9 @@ class VideoResultItemWidget(QWidget):
 
 class QueueTableWidget(QTableWidget):
     rowsMoved = pyqtSignal(int, int)
+    rowsRemoved = pyqtSignal(list)
+    clearAllRequested = pyqtSignal()
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.setDragEnabled(True)
@@ -172,7 +175,38 @@ class QueueTableWidget(QTableWidget):
         self.setDropIndicatorShown(True)
         self.setDragDropMode(self.DragDropMode.InternalMove)
         self.setSelectionBehavior(self.SelectionBehavior.SelectRows)
-        self.setSelectionMode(self.SelectionMode.SingleSelection)
+        self.setSelectionMode(self.SelectionMode.ExtendedSelection)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.show_context_menu)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Delete:
+            self.remove_selected_rows()
+        else:
+            super().keyPressEvent(event)
+
+    def remove_selected_rows(self):
+        selected_rows = self.selectionModel().selectedRows()
+        if not selected_rows:
+            return
+        rows_to_remove = sorted([index.row() for index in selected_rows])
+        self.rowsRemoved.emit(rows_to_remove)
+
+    def show_context_menu(self, pos):
+        menu = QMenu(self)
+        selected_items = self.selectionModel().selectedRows()
+        
+        if selected_items:
+            count = len(selected_items)
+            remove_action_text = f"Remove {count} Selected Item{'s' if count > 1 else ''}"
+            remove_action = menu.addAction(remove_action_text)
+            remove_action.triggered.connect(self.remove_selected_rows)
+            menu.addSeparator()
+
+        clear_all_action = menu.addAction("Clear Queue")
+        clear_all_action.triggered.connect(self.clearAllRequested)
+        
+        menu.exec(self.viewport().mapToGlobal(pos))
 
     def dropEvent(self, event: QDropEvent):
         if event.source() == self and event.dropAction() == Qt.DropAction.MoveAction:
@@ -1275,6 +1309,8 @@ class WgpDesktopPluginWidget(QWidget):
         self.clear_queue_btn.clicked.connect(self._on_clear_queue)
         self.abort_btn.clicked.connect(self._on_abort)
         self.queue_table.rowsMoved.connect(self._on_queue_rows_moved)
+        self.queue_table.rowsRemoved.connect(self._remove_queue_rows)
+        self.queue_table.clearAllRequested.connect(self._on_clear_queue)
 
     def load_main_config(self):
         try:
@@ -1609,13 +1645,36 @@ class WgpDesktopPluginWidget(QWidget):
                     self.queue_table.setItem(row_idx, col_idx, QTableWidgetItem(str(cell_data)))
 
     def _on_remove_selected_from_queue(self):
-        selected_row = self.queue_table.currentRow()
-        if selected_row < 0: return
+        selected_row_indexes = self.queue_table.selectionModel().selectedRows()
+        row_indices_to_remove = [index.row() for index in selected_row_indexes]
+        
+        if not row_indices_to_remove:
+            current_row = self.queue_table.currentRow()
+            if current_row >= 0:
+                row_indices_to_remove.append(current_row)
+
+        if row_indices_to_remove:
+            self._remove_queue_rows(row_indices_to_remove)
+
+    def _remove_queue_rows(self, row_indices):
+        if not row_indices:
+            return
         with wgp.lock:
             is_running = self.thread and self.thread.isRunning()
-            offset = 1 if is_running else 0
             queue = self.state.get('gen', {}).get('queue', [])
-            if len(queue) > selected_row + offset: queue.pop(selected_row + offset)
+            
+            indices_to_pop = []
+            for row_idx in row_indices:
+                if is_running:
+                    if row_idx == 0: continue # Don't remove the currently running task
+                    indices_to_pop.append(row_idx)
+                else:
+                    if row_idx > 0:
+                        indices_to_pop.append(row_idx - 1)
+            
+            for queue_idx in sorted(indices_to_pop, reverse=True):
+                if 0 <= queue_idx < len(queue):
+                    queue.pop(queue_idx)
         self.update_queue_table()
 
     def _on_queue_rows_moved(self, source_row, dest_row):
