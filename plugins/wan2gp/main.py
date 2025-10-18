@@ -1952,7 +1952,7 @@ class Plugin(VideoEditorPlugin):
             duration_ms = end_ms - start_ms
             model_type = self.client_widget.state['model_type']
             fps = wgp.get_model_fps(model_type)
-            video_length_frames = int((duration_ms / 1000.0) * fps) if fps > 0 else int((duration_ms / 1000.0) * 16)
+            video_length_frames = int(round((duration_ms / 1000.0) * (fps if fps > 0 else 16))) + 1
             widgets = self.client_widget.widgets
             
             for w_name in ['mode_s', 'mode_t', 'mode_v', 'mode_l', 'image_end_checkbox']:
@@ -2009,7 +2009,7 @@ class Plugin(VideoEditorPlugin):
             duration_ms = end_ms - start_ms
             model_type = self.client_widget.state['model_type']
             fps = wgp.get_model_fps(model_type)
-            video_length_frames = int((duration_ms / 1000.0) * fps) if fps > 0 else int((duration_ms / 1000.0) * 16)
+            video_length_frames = int(round((duration_ms / 1000.0) * (fps if fps > 0 else 16))) + 1
             widgets = self.client_widget.widgets
             
             widgets['video_length'].setValue(video_length_frames)
@@ -2068,7 +2068,7 @@ class Plugin(VideoEditorPlugin):
             duration_ms = end_ms - start_ms
             model_type = self.client_widget.state['model_type']
             fps = wgp.get_model_fps(model_type)
-            video_length_frames = int((duration_ms / 1000.0) * fps) if fps > 0 else int((duration_ms / 1000.0) * 16)
+            video_length_frames = int(round((duration_ms / 1000.0) * (fps if fps > 0 else 16))) + 1
             widgets = self.client_widget.widgets
             
             widgets['video_length'].setValue(video_length_frames)
@@ -2130,7 +2130,7 @@ class Plugin(VideoEditorPlugin):
         duration_ms = end_ms - start_ms
         model_type = self.client_widget.state['model_type']
         fps = wgp.get_model_fps(model_type)
-        video_length_frames = int((duration_ms / 1000.0) * fps) if fps > 0 else int((duration_ms / 1000.0) * 16)
+        video_length_frames = int(round((duration_ms / 1000.0) * (fps if fps > 0 else 16))) + 1
         
         self.client_widget.widgets['video_length'].setValue(video_length_frames)
         self.client_widget.widgets['mode_t'].setChecked(True)
