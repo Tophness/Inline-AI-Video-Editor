@@ -15,6 +15,9 @@ from pathlib import Path
 # preventing any UI from being built and allowing us to use the
 # backend logic directly.
 
+class MockApp:
+    pass
+
 class MockGradioComponent(MagicMock):
     """A smarter mock that captures constructor arguments."""
     def __init__(self, *args, **kwargs):
@@ -331,6 +334,26 @@ class WgpDesktopPluginWidget(QWidget):
         self.apply_initial_config()
         self.connect_signals()
         self.init_wgp_state()
+
+    def _get_queue_data_for_table(self, queue):
+        """
+        Takes the raw queue from wgp.py's state and formats it for the QTableWidget.
+        This replaces the functionality of the removed wgp.get_queue_table.
+        """
+        data = []
+        # In wgp, the first item in the queue is the one currently being processed
+        # or the next one up. The UI should only show items *after* the current one.
+        if len(queue) <= 1:
+            return data
+
+        # Iterate from the second item onwards
+        for item in queue[1:]:
+            repeats = item.get('repeats', "1")
+            prompt = item.get('prompt', "")
+            length = item.get('length', "")
+            steps = item.get('steps', "")
+            data.append([str(repeats), prompt, str(length), str(steps)])
+        return data
 
     def setup_ui(self):
         main_layout = QVBoxLayout(self)
@@ -659,6 +682,13 @@ class WgpDesktopPluginWidget(QWidget):
         self.widgets['switch_thresh_row_index'] = guidance_layout.rowCount()
         guidance_layout.addRow("Switch Threshold:", self._create_slider_with_label('switch_threshold', 0, 1000, 0, 1.0, 0))
         layout.addRow(guidance_group)
+        chatter_group = self.create_widget(QGroupBox, 'chatter_group', "Chatterbox / TTS Options")
+        chatter_layout = QFormLayout(chatter_group)
+        chatter_layout.addRow("Pace:", self._create_slider_with_label('pace', 20, 100, 0.5, 100.0, 2))
+        chatter_layout.addRow("Exaggeration:", self._create_slider_with_label('exaggeration', 25, 200, 0.5, 100.0, 2))
+        chatter_layout.addRow("Temperature:", self._create_slider_with_label('temperature', 10, 150, 0.8, 100.0, 2))
+        layout.addRow(chatter_group)
+        chatter_group.setVisible(False)
         nag_group = self.create_widget(QGroupBox, 'nag_group', "NAG (Negative Adversarial Guidance)")
         nag_layout = QFormLayout(nag_group)
         nag_layout.addRow("NAG Scale:", self._create_slider_with_label('NAG_scale', 10, 200, 1.0, 10.0, 1))
@@ -1006,6 +1036,7 @@ class WgpDesktopPluginWidget(QWidget):
         model_filename = self.state.get('model_filename', '')
 
         image_outputs = model_def.get("image_outputs", False)
+        audio_only = model_def.get("audio_only", False)
         vace = wgp.test_vace_module(model_type)
         t2v = base_model_type in ['t2v', 't2v_2_2']
         i2v = wgp.test_class_i2v(model_type)
@@ -1113,6 +1144,16 @@ class WgpDesktopPluginWidget(QWidget):
         switch_thresh_val = ui_defaults.get("switch_threshold", 0)
         self.widgets['switch_threshold'].setValue(switch_thresh_val)
         self.widgets['switch_threshold_label'].setText(str(switch_thresh_val))
+
+        pace_val = ui_defaults.get('pace', 0.5)
+        self.widgets['pace'].setValue(int(pace_val * 100))
+        self.widgets['pace_label'].setText(f"{pace_val:.2f}")
+        exaggeration_val = ui_defaults.get('exaggeration', 0.5)
+        self.widgets['exaggeration'].setValue(int(exaggeration_val * 100))
+        self.widgets['exaggeration_label'].setText(f"{exaggeration_val:.2f}")
+        temperature_val = ui_defaults.get('temperature', 0.8)
+        self.widgets['temperature'].setValue(int(temperature_val * 100))
+        self.widgets['temperature_label'].setText(f"{temperature_val:.2f}")
 
         nag_scale_val = ui_defaults.get('NAG_scale', 1.0)
         self.widgets['NAG_scale'].setValue(int(nag_scale_val * 10))
@@ -1494,7 +1535,7 @@ class WgpDesktopPluginWidget(QWidget):
         full_inputs['lset_name'] = ""
         full_inputs['image_mode'] = 0
         full_inputs['mode'] = ""
-        expected_keys = { "audio_guide": None, "audio_guide2": None, "image_guide": None, "image_mask": None, "speakers_locations": "", "frames_positions": "", "keep_frames_video_guide": "", "keep_frames_video_source": "", "video_guide_outpainting": "", "switch_threshold2": 0, "model_switch_phase": 1, "batch_size": 1, "control_net_weight_alt": 1.0, "image_refs_relative_size": 50, "embedded_guidance_scale": None, "model_mode": None, "control_net_weight": 1.0, "control_net_weight2": 1.0, "mask_expand": 0, "remove_background_images_ref": 0, "prompt_enhancer": ""}
+        expected_keys = { "audio_guide": None, "audio_guide2": None, "image_guide": None, "image_mask": None, "speakers_locations": "", "frames_positions": "", "keep_frames_video_guide": "", "keep_frames_video_source": "", "video_guide_outpainting": "", "switch_threshold2": 0, "model_switch_phase": 1, "batch_size": 1, "control_net_weight_alt": 1.0, "image_refs_relative_size": 50, "embedded_guidance_scale": None, "model_mode": None, "control_net_weight": 1.0, "control_net_weight2": 1.0, "mask_expand": 0, "remove_background_images_ref": 0, "prompt_enhancer": "", "pace": 0.5, "exaggeration": 0.5, "temperature": 0.8}
         for key, default_value in expected_keys.items():
             if key not in full_inputs: full_inputs[key] = default_value
         full_inputs['prompt'] = self.widgets['prompt'].toPlainText()
@@ -1524,6 +1565,9 @@ class WgpDesktopPluginWidget(QWidget):
             full_inputs['guidance2_scale'] = self.widgets['guidance2_scale'].value() / 10.0
             full_inputs['guidance3_scale'] = self.widgets['guidance3_scale'].value() / 10.0
             full_inputs['switch_threshold'] = self.widgets['switch_threshold'].value()
+            full_inputs['pace'] = self.widgets['pace'].value() / 100.0
+            full_inputs['exaggeration'] = self.widgets['exaggeration'].value() / 100.0
+            full_inputs['temperature'] = self.widgets['temperature'].value() / 100.0
             full_inputs['NAG_scale'] = self.widgets['NAG_scale'].value() / 10.0
             full_inputs['NAG_tau'] = self.widgets['NAG_tau'].value() / 10.0
             full_inputs['NAG_alpha'] = self.widgets['NAG_alpha'].value() / 10.0
@@ -1588,7 +1632,7 @@ class WgpDesktopPluginWidget(QWidget):
         all_inputs['state'] = self.state
         wgp.set_model_settings(self.state, self.state['model_type'], all_inputs)
         self.state["validate_success"] = 1
-        wgp.process_prompt_and_add_tasks(self.state, self.state['model_type'])
+        wgp.process_prompt_and_add_tasks(self.state, 0, self.state['model_type'])
         self.update_queue_table()
         
     def start_generation(self):
@@ -1660,13 +1704,14 @@ class WgpDesktopPluginWidget(QWidget):
             queue = self.state.get('gen', {}).get('queue', [])
             is_running = self.thread and self.thread.isRunning()
             queue_to_display = queue if is_running else [None] + queue
-            table_data = wgp.get_queue_table(queue_to_display)
+            table_data = self._get_queue_data_for_table(queue_to_display)
             self.queue_table.setRowCount(0)
             self.queue_table.setRowCount(len(table_data))
+
             for row_idx, row_data in enumerate(table_data):
-                prompt_text = str(row_data[1]).split('>')[1].split('<')[0] if '>' in str(row_data[1]) else str(row_data[1])
-                for col_idx, cell_data in enumerate([row_data[0], prompt_text, row_data[2], row_data[3]]):
-                    self.queue_table.setItem(row_idx, col_idx, QTableWidgetItem(str(cell_data)))
+                for col_idx, cell_data in enumerate(row_data):
+                    item = QTableWidgetItem(str(cell_data))
+                    self.queue_table.setItem(row_idx, col_idx, item)
 
     def _on_remove_selected_from_queue(self):
         selected_row_indexes = self.queue_table.selectionModel().selectedRows()
@@ -1686,18 +1731,11 @@ class WgpDesktopPluginWidget(QWidget):
         with wgp.lock:
             is_running = self.thread and self.thread.isRunning()
             queue = self.state.get('gen', {}).get('queue', [])
-            
-            indices_to_pop = []
-            for row_idx in row_indices:
-                if is_running:
-                    if row_idx == 0: continue # Don't remove the currently running task
-                    indices_to_pop.append(row_idx)
-                else:
-                    if row_idx > 0:
-                        indices_to_pop.append(row_idx - 1)
+            offset = 1 if is_running else 0
+            indices_to_pop = [idx + offset for idx in row_indices]
             
             for queue_idx in sorted(indices_to_pop, reverse=True):
-                if 0 <= queue_idx < len(queue):
+                if 0 < queue_idx < len(queue):
                     queue.pop(queue_idx)
         self.update_queue_table()
 
@@ -1707,8 +1745,8 @@ class WgpDesktopPluginWidget(QWidget):
             is_running = self.thread and self.thread.isRunning()
             offset = 1 if is_running else 0
             real_source_idx = source_row + offset
-            real_dest_idx = dest_row + offset
             moved_item = queue.pop(real_source_idx)
+            real_dest_idx = dest_row + offset
             queue.insert(real_dest_idx, moved_item)
         self.update_queue_table()
 
@@ -1855,7 +1893,8 @@ class Plugin(VideoEditorPlugin):
             if wgp is None:
                 import wgp as wgp_module
                 wgp = wgp_module
-            
+
+            wgp.app = MockApp()
             self.client_widget = WgpDesktopPluginWidget(self)
             self.dock_widget.setWidget(self.client_widget)
             self._heavy_content_loaded = True
@@ -1976,7 +2015,7 @@ class Plugin(VideoEditorPlugin):
             duration_ms = end_ms - start_ms
             model_type = self.client_widget.state['model_type']
             fps = wgp.get_model_fps(model_type)
-            video_length_frames = int(round((duration_ms / 1000.0) * (fps if fps > 0 else 16))) + 1
+            video_length_frames = int(round(((duration_ms / 1000.0) * fps - 1) / 4)) * 4 + 1
             widgets = self.client_widget.widgets
             
             for w_name in ['mode_s', 'mode_t', 'mode_v', 'mode_l', 'image_end_checkbox']:
@@ -2033,7 +2072,7 @@ class Plugin(VideoEditorPlugin):
             duration_ms = end_ms - start_ms
             model_type = self.client_widget.state['model_type']
             fps = wgp.get_model_fps(model_type)
-            video_length_frames = int(round((duration_ms / 1000.0) * (fps if fps > 0 else 16))) + 1
+            video_length_frames = int(round(((duration_ms / 1000.0) * fps - 1) / 4)) * 4 + 1
             widgets = self.client_widget.widgets
             
             widgets['video_length'].setValue(video_length_frames)
@@ -2092,7 +2131,7 @@ class Plugin(VideoEditorPlugin):
             duration_ms = end_ms - start_ms
             model_type = self.client_widget.state['model_type']
             fps = wgp.get_model_fps(model_type)
-            video_length_frames = int(round((duration_ms / 1000.0) * (fps if fps > 0 else 16))) + 1
+            video_length_frames = int(round(((duration_ms / 1000.0) * fps - 1) / 4)) * 4 + 1
             widgets = self.client_widget.widgets
             
             widgets['video_length'].setValue(video_length_frames)
@@ -2154,7 +2193,7 @@ class Plugin(VideoEditorPlugin):
         duration_ms = end_ms - start_ms
         model_type = self.client_widget.state['model_type']
         fps = wgp.get_model_fps(model_type)
-        video_length_frames = int(round((duration_ms / 1000.0) * (fps if fps > 0 else 16))) + 1
+        video_length_frames = int(round(((duration_ms / 1000.0) * fps - 1) / 4)) * 4 + 1
         
         self.client_widget.widgets['video_length'].setValue(video_length_frames)
         self.client_widget.widgets['mode_t'].setChecked(True)
