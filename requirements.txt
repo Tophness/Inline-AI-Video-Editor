@@ -10,6 +10,7 @@ imageio-ffmpeg
 einops
 sentencepiece
 open_clip_torch>=2.29.0
+numpy==2.1.2
 
 # Video & media
 moviepy==1.0.3
@@ -29,6 +30,9 @@ gradio==5.29.0
 PyQt6
 dashscope
 loguru
+s3tokenizer
+conformer==0.3.2
+spacy_pkuseg
 
 # Vision & segmentation
 opencv-python>=4.12.0.88
@@ -50,7 +54,7 @@ pydantic==2.10.6
 # Math & modeling
 torchdiffeq>=0.2.5
 tensordict>=0.6.1
-mmgp==3.6.3
+mmgp==3.6.6
 peft==0.15.0
 matplotlib
 

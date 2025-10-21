@@ -48,6 +48,30 @@ class MockGradioModule:
 sys.modules['gradio'] = MockGradioModule()
 sys.modules['gradio.gallery'] = MockGradioModule()
 sys.modules['shared.gradio.gallery'] = MockGradioModule()
+class MockPluginModule:
+    pass
+
+class MockPluginManager:
+    def __init__(self, *args, **kwargs): pass
+    def discover_plugins(self, *args, **kwargs): return []
+    def load_plugins_from_directory(self, *args, **kwargs): pass
+    def inject_globals(self, *args, **kwargs): pass
+    def get_all_plugins(self, *args, **kwargs): return {}
+    def run_component_insertion(self, *args, **kwargs): pass
+    def setup_ui(self, *args, **kwargs): return {}
+
+class MockWAN2GPApplication:
+    def __init__(self, *args, **kwargs):
+        self.plugin_manager = MockPluginManager()
+    def initialize_plugins(self, *args, **kwargs): pass
+    def setup_ui_tabs(self, *args, **kwargs): pass
+    def run_component_insertion(self, *args, **kwargs): pass
+
+mock_plugin_module = MockPluginModule()
+mock_plugin_module.PluginManager = MockPluginManager
+mock_plugin_module.WAN2GPApplication = MockWAN2GPApplication
+mock_plugin_module.SYSTEM_PLUGINS = []
+sys.modules['shared.utils.plugins'] = mock_plugin_module
 # --- End of Gradio Hijacking ---
 
 wgp = None
