@@ -32,7 +32,6 @@ git clone https://github.com/Tophness/Inline-AI-Video-Editor.git
 cd Inline-AI-Video-Editor
 python -m venv venv
 venv\Scripts\activate
-pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu128
 pip install -r requirements.txt
 ```
 
@@ -43,7 +42,6 @@ git clone https://github.com/Tophness/Inline-AI-Video-Editor.git
 cd Inline-AI-Video-Editor
 python3 -m venv venv
 source venv/bin/activate
-pip install torch==2.7.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/test/cu128
 pip install -r requirements.txt
 ```
 
@@ -54,6 +52,9 @@ pip install -r requirements.txt
 ```bash
 python videoeditor.py
 ```
+
+Upon first run of the AI generator plugin, you will be asked to install WAN2GP or to select an existing WAN2GP installation.
+
 
 ## Screenshots
 ![sc1_](https://github.com/user-attachments/assets/98247de8-613d-418a-b71e-fdf2d6b547f4)

@@ -85,6 +85,33 @@ _cached_formats = None
 _cached_video_codecs = None
 _cached_audio_codecs = None
 
+def download_ffmpeg():
+    if os.name != 'nt': return
+    exes = ['ffmpeg.exe', 'ffprobe.exe', 'ffplay.exe']
+    if all(os.path.exists(e) for e in exes): return
+    api_url = 'https://api.github.com/repos/GyanD/codexffmpeg/releases/latest'
+    import requests
+    r = requests.get(api_url, headers={'Accept': 'application/vnd.github+json'})
+    assets = r.json().get('assets', [])
+    zip_asset = next((a for a in assets if 'essentials_build.zip' in a['name']), None)
+    if not zip_asset: return
+    zip_url = zip_asset['browser_download_url']
+    zip_name = zip_asset['name']
+    from tqdm import tqdm
+    with requests.get(zip_url, stream=True) as resp:
+        total = int(resp.headers.get('Content-Length', 0))
+        with open(zip_name, 'wb') as f, tqdm(total=total, unit='B', unit_scale=True) as pbar:
+            for chunk in resp.iter_content(chunk_size=8192):
+                f.write(chunk)
+                pbar.update(len(chunk))
+    import zipfile
+    with zipfile.ZipFile(zip_name) as z:
+        for f in z.namelist():
+            if f.endswith(tuple(exes)) and '/bin/' in f:
+                z.extract(f)
+                os.rename(f, os.path.basename(f))
+    os.remove(zip_name)
+
 def run_ffmpeg_command(args):
     try:
         startupinfo = None
@@ -2376,7 +2403,6 @@ class MainWindow(QMainWindow):
             pixmap_to_show.fill(QColor("black"))
 
         if self.scale_to_fit:
-            # When fitting, we want the label to resize with the scroll area
             self.preview_scroll_area.setWidgetResizable(True)
             scaled_pixmap = pixmap_to_show.scaled(
                 self.preview_scroll_area.viewport().size(),
@@ -2385,7 +2411,6 @@ class MainWindow(QMainWindow):
             )
             self.preview_widget.setPixmap(scaled_pixmap)
         else:
-            # For 1:1, the label takes the size of the pixmap, and the scroll area handles overflow
             self.preview_scroll_area.setWidgetResizable(False)
             self.preview_widget.setPixmap(pixmap_to_show)
             self.preview_widget.adjustSize()
@@ -3130,6 +3155,7 @@ class MainWindow(QMainWindow):
         event.accept()
 
 if __name__ == '__main__':
+    download_ffmpeg()
     app = QApplication(sys.argv)
     project_to_load_on_startup = None
     if len(sys.argv) > 1:
