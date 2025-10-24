@@ -1957,6 +1957,8 @@ class Plugin(VideoEditorPlugin):
             placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self.dock_widget = self.app.add_dock_widget(self, placeholder, self.name)
             self.dock_widget.visibilityChanged.connect(self._on_visibility_changed)
+            if self.dock_widget.isVisible():
+                self._on_visibility_changed(True)
         
         self.app.timeline_widget.context_menu_requested.connect(self.on_timeline_context_menu)
         self.app.status_label.setText(f"{self.name}: Enabled.")
