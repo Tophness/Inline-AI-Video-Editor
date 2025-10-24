@@ -1894,6 +1894,7 @@ class Plugin(VideoEditorPlugin):
                 import wgp as wgp_module
                 wgp = wgp_module
 
+            wgp.download_ffmpeg()
             wgp.app = MockApp()
             self.client_widget = WgpDesktopPluginWidget(self)
             self.dock_widget.setWidget(self.client_widget)
