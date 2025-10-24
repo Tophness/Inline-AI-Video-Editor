@@ -1969,27 +1969,60 @@ class Plugin(VideoEditorPlugin):
         if not self.setup_widget: return
         self.setup_widget.show_message("Waiting for folder selection...")
         
-        selected_path = QFileDialog.getExistingDirectory(self.app, "Select Wan2GP Installation Folder")
+        selected_path_str = QFileDialog.getExistingDirectory(self.app, "Select Wan2GP Installation Folder")
 
-        if not selected_path:
+        if not selected_path_str:
             self.setup_widget.show_message("")
             return
 
-        wgp_path_check = Path(selected_path) / 'wgp.py'
+        selected_path = Path(selected_path_str)
+        wgp_path_check = selected_path / 'wgp.py'
         if not wgp_path_check.exists():
             QMessageBox.warning(self.app, "Invalid Folder", "The selected folder does not contain 'wgp.py'.\nPlease select a valid Wan2GP root directory.")
             self.setup_widget.show_message("Invalid folder selected.")
             return
 
-        self.setup_widget.show_message(f"Using path: {selected_path}")
-        
-        global wan2gp_dir
-        wan2gp_dir = Path(selected_path)
+        self.setup_widget.set_buttons_enabled(False)
+        self.setup_widget.show_message("Valid folder selected. Checking requirements...")
+        QApplication.processEvents()
 
-        self.app.settings['wan2gp_path'] = selected_path
-        self.app._save_settings()
+        requirements_path = selected_path / 'requirements.txt'
 
-        QTimer.singleShot(500, self._load_heavy_ui)
+        try:
+            if requirements_path.exists():
+                import subprocess
+
+                self.setup_widget.show_message("Installing PyTorch... This can take several minutes.")
+                QApplication.processEvents()
+                torch_command = [
+                    sys.executable, "-m", "pip", "install",
+                    "torch==2.7.0", "torchvision", "torchaudio",
+                    "--index-url", "https://download.pytorch.org/whl/test/cu128"
+                ]
+                subprocess.check_call(torch_command)
+
+                self.setup_widget.show_message("Installing other requirements from selected folder...")
+                QApplication.processEvents()
+                req_command = [
+                    sys.executable, "-m", "pip", "install",
+                    "-r", str(requirements_path)
+                ]
+                subprocess.check_call(req_command)
+                self.setup_widget.show_message("Dependency installation complete!")
+
+            global wan2gp_dir
+            wan2gp_dir = selected_path
+            self.app.settings['wan2gp_path'] = selected_path_str
+            self.app._save_settings()
+            
+            QTimer.singleShot(500, self._load_heavy_ui)
+
+        except (subprocess.CalledProcessError, Exception) as e:
+            error_message = f"An error occurred installing dependencies.\nPlease check the console for more details.\n\nError: {e}"
+            QMessageBox.critical(self.app, "Setup Failed", error_message)
+            print(f"Full error details: {e}")
+            self.setup_widget.show_message(f"Installation failed. Check console for details.")
+            self.setup_widget.set_buttons_enabled(True)
 
     def _handle_install(self):
         if not self.setup_widget: return
