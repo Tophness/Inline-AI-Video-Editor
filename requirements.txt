@@ -5,3 +5,4 @@ GitPython
 ffmpeg-python
 onnxruntime
 tqdm
+Pillow
