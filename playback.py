@@ -195,27 +195,37 @@ class PlaybackManager(QObject):
             timeline, clips, proj_settings = self.get_timeline_data()
             w, h, fps = proj_settings['width'], proj_settings['height'], proj_settings['fps']
 
-            top_clip = next((c for c in sorted(clips, key=lambda x: x.track_index, reverse=True) 
-                             if c.track_type == 'video' and c.timeline_start_ms <= time_ms < (c.timeline_start_ms + c.duration_ms)), None)
+            video_clip_at_time = next((c for c in sorted(clips, key=lambda x: x.track_index, reverse=True) 
+                                     if c.track_type == 'video' and c.media_type in ['video', 'image'] and c.timeline_start_ms <= time_ms < c.timeline_end_ms), None)
+            
+            subtitle_clip_at_time = next((c for c in sorted(clips, key=lambda x: x.track_index, reverse=True)
+                                        if c.media_type == 'subtitle' and c.timeline_start_ms <= time_ms < c.timeline_end_ms), None)
 
             pixmap = QPixmap(w, h)
             pixmap.fill(QColor("black"))
 
-            if top_clip:
+            if video_clip_at_time:
                 try:
-                    if top_clip.media_type == 'image':
-                        out, _ = (ffmpeg.input(top_clip.source_path)
-                                        .filter('scale', w, h, force_original_aspect_ratio='decrease')
-                                        .filter('pad', w, h, '(ow-iw)/2', '(oh-ih)/2', 'black')
-                                        .output('pipe:', vframes=1, format='rawvideo', pix_fmt='rgb24')
-                                        .run(capture_stdout=True, quiet=True))
+                    video_seek_sec = (time_ms - video_clip_at_time.timeline_start_ms + video_clip_at_time.clip_start_ms) / 1000.0
+
+                    if video_clip_at_time.media_type == 'image':
+                        video_node = ffmpeg.input(video_clip_at_time.source_path, loop=1, framerate=fps)
                     else:
-                        clip_time_sec = (time_ms - top_clip.timeline_start_ms + top_clip.clip_start_ms) / 1000.0
-                        out, _ = (ffmpeg.input(top_clip.source_path, ss=f"{clip_time_sec:.6f}")
-                                        .filter('scale', w, h, force_original_aspect_ratio='decrease')
-                                        .filter('pad', w, h, '(ow-iw)/2', '(oh-ih)/2', 'black')
-                                        .output('pipe:', vframes=1, format='rawvideo', pix_fmt='rgb24')
-                                        .run(capture_stdout=True, quiet=True))
+                        video_node = ffmpeg.input(video_clip_at_time.source_path, ss=f"{video_seek_sec:.6f}")
+
+                    final_node = video_node.video
+
+                    if subtitle_clip_at_time:
+                        sub_seek_sec = (time_ms - subtitle_clip_at_time.timeline_start_ms + subtitle_clip_at_time.clip_start_ms) / 1000.0
+
+                        final_node = final_node.filter('setpts', f'PTS-STARTPTS+{sub_seek_sec}/TB')
+                        final_node = final_node.filter('subtitles', filename=subtitle_clip_at_time.source_path)
+
+                    out, _ = (final_node
+                                    .filter('scale', w, h, force_original_aspect_ratio='decrease')
+                                    .filter('pad', w, h, '(ow-iw)/2', '(oh-ih)/2', 'black')
+                                    .output('pipe:', vframes=1, format='rawvideo', pix_fmt='rgb24')
+                                    .run(capture_stdout=True, quiet=True))
 
                     if out:
                         image = QImage(out, w, h, QImage.Format.Format_RGB888)
@@ -246,16 +256,13 @@ class PlaybackManager(QObject):
     def _build_video_graph(self, start_ms, timeline, clips, proj_settings):
         w, h, fps = proj_settings['width'], proj_settings['height'], proj_settings['fps']
 
-        video_clips = [c for c in clips if c.track_type == 'video' and c.timeline_end_ms > start_ms]
-        if not video_clips:
+        visual_clips = [c for c in clips if c.track_type == 'video' and c.media_type in ['video', 'image'] and c.timeline_end_ms > start_ms]
+        subtitle_clips = [c for c in clips if c.media_type == 'subtitle' and c.timeline_end_ms > start_ms]
+        
+        if not visual_clips:
             return None
-        video_clips = sorted(
-            [c for c in clips if c.track_type == 'video' and c.timeline_end_ms > start_ms],
-            key=lambda c: c.track_index,
-            reverse=True
-        )
-        if not video_clips:
-            return None
+
+        visual_clips = sorted(visual_clips, key=lambda c: c.track_index, reverse=True)
 
         class VSegment:
             def __init__(self, c, t_start, t_end):
@@ -270,7 +277,7 @@ class PlaybackManager(QObject):
                 return self.timeline_start_ms + self.duration_ms
 
         event_points = {start_ms}
-        for c in video_clips:
+        for c in visual_clips:
             event_points.update({c.timeline_start_ms, c.timeline_end_ms})
         
         total_duration = timeline.get_total_duration()
@@ -284,35 +291,47 @@ class PlaybackManager(QObject):
             if t_end <= t_start: continue
             
             midpoint = t_start + 1
-            top_clip = next((c for c in video_clips if c.timeline_start_ms <= midpoint < c.timeline_end_ms), None)
+            top_clip = next((c for c in visual_clips if c.timeline_start_ms <= midpoint < c.timeline_end_ms), None)
 
             if top_clip:
                 visible_segments.append(VSegment(top_clip, t_start, t_end))
 
-        top_track_clips = visible_segments
-
         concat_inputs = []
         last_end_time_ms = start_ms
-        for clip in top_track_clips:
-            clip_read_start_ms = clip.clip_start_ms + max(0, start_ms - clip.timeline_start_ms)
-            clip_play_start_ms = max(start_ms, clip.timeline_start_ms)
-            clip_remaining_duration_ms = clip.timeline_end_ms - clip_play_start_ms
-            if clip_remaining_duration_ms <= 0:
-                last_end_time_ms = max(last_end_time_ms, clip.timeline_end_ms)
+        for segment_clip in visible_segments:
+            clip_read_start_ms = segment_clip.clip_start_ms
+            clip_duration_ms = segment_clip.duration_ms
+
+            if clip_duration_ms <= 0:
+                last_end_time_ms = max(last_end_time_ms, segment_clip.timeline_end_ms)
                 continue
-            input_stream = ffmpeg.input(clip.source_path, ss=clip_read_start_ms / 1000.0, t=clip_remaining_duration_ms / 1000.0, re=None)
-            if clip.media_type == 'image':
-                segment = input_stream.video.filter('loop', loop=-1, size=1, start=0).filter('setpts', 'N/(FRAME_RATE*TB)').filter('trim', duration=clip_remaining_duration_ms / 1000.0)
-            else:
-                segment = input_stream.video
+
+            input_stream = ffmpeg.input(segment_clip.source_path, ss=clip_read_start_ms / 1000.0, t=clip_duration_ms / 1000.0, re=None)
+
+            segment_node = input_stream.video
+            if segment_clip.media_type == 'image':
+                segment_node = segment_node.filter('loop', loop=-1, size=1, start=0).filter('setpts', 'N/(FRAME_RATE*TB)').filter('trim', duration=clip_duration_ms / 1000.0)
+
+            segment_midpoint_ms = segment_clip.timeline_start_ms + (segment_clip.duration_ms / 2)
+            active_sub_clip = next((sc for sc in subtitle_clips if sc.timeline_start_ms <= segment_midpoint_ms < sc.timeline_end_ms), None)
+
+            if active_sub_clip:
+                time_offset_sec = (segment_clip.timeline_start_ms - active_sub_clip.timeline_start_ms + active_sub_clip.clip_start_ms) / 1000.0
+                segment_node = segment_node.filter('setpts', f'PTS-STARTPTS+{max(0, time_offset_sec):.6f}/TB')
+                segment_node = segment_node.filter('subtitles', filename=active_sub_clip.source_path)
+                segment_node = segment_node.filter('setpts', 'PTS-STARTPTS')
+
             gap_start_ms = max(start_ms, last_end_time_ms)
-            if clip.timeline_start_ms > gap_start_ms:
-                gap_duration_sec = (clip.timeline_start_ms - gap_start_ms) / 1000.0
-                segment = segment.filter('tpad', start_duration=f'{gap_duration_sec:.6f}', color='black')
-            concat_inputs.append(segment)
-            last_end_time_ms = clip.timeline_end_ms
+            if segment_clip.timeline_start_ms > gap_start_ms:
+                gap_duration_sec = (segment_clip.timeline_start_ms - gap_start_ms) / 1000.0
+                segment_node = segment_node.filter('tpad', start_duration=f'{gap_duration_sec:.6f}', color='black')
+
+            concat_inputs.append(segment_node)
+            last_end_time_ms = segment_clip.timeline_end_ms
+
         if not concat_inputs:
             return None
+
         return ffmpeg.concat(*concat_inputs, v=1, a=0)
 
     def _build_audio_graph(self, start_ms, timeline, clips, proj_settings):

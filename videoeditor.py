@@ -7,6 +7,7 @@ import re
 import json
 import ffmpeg
 import copy
+import hashlib
 from plugins import PluginManager, ManagePluginsDialog
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QFileDialog, QLabel,
@@ -208,6 +209,55 @@ def get_available_codecs(codec_type='video'):
     _cached_audio_codecs = dict(sorted(audio_codecs.items()))
 
     return _cached_video_codecs if codec_type == 'video' else _cached_audio_codecs
+
+def _get_subtitle_duration_ms(file_path):
+    last_time_ms = 0
+    try:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read()
+            
+            # SRT format: 00:00:20,123 --> 00:00:22,456
+            srt_matches = re.findall(r'\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+(\d{2}):(\d{2}):(\d{2}),(\d{3})', content)
+            if srt_matches:
+                for h, m, s, ms in srt_matches:
+                    time_ms = int(h) * 3600000 + int(m) * 60000 + int(s) * 1000 + int(ms)
+                    if time_ms > last_time_ms:
+                        last_time_ms = time_ms
+                return last_time_ms
+
+            # ASS format: Dialogue: 0,0:00:07.84,0:00:10.25,...
+            ass_matches = re.findall(r'Dialogue:.+?,(\d):(\d{2}):(\d{2})\.(\d{2}),(\d):(\d{2}):(\d{2})\.(\d{2})', content)
+            if ass_matches:
+                 for _, _, _, _, h, m, s, cs in ass_matches:
+                    time_ms = int(h) * 3600000 + int(m) * 60000 + int(s) * 1000 + int(cs) * 10
+                    if time_ms > last_time_ms:
+                        last_time_ms = time_ms
+                 return last_time_ms
+    except Exception as e:
+        print(f"Could not parse subtitle duration for {os.path.basename(file_path)}: {e}")
+    
+    return 5000 # Fallback to 5 seconds if parsing fails or file is empty
+
+def _parse_timecode_string_to_ms(tc_string):
+    if not isinstance(tc_string, str):
+        return 0
+    
+    parts = tc_string.split(':')
+    try:
+        if len(parts) == 3:
+            h = int(parts[0])
+            m = int(parts[1])
+            s_parts = parts[2].split('.')
+            s = int(s_parts[0])
+            ms = 0
+            if len(s_parts) > 1:
+                ms_str = s_parts[1]
+                ms = int((ms_str + '000')[:3])
+            
+            return (h * 3600 + m * 60 + s) * 1000 + ms
+    except (ValueError, IndexError):
+        return 0
+    return 0
 
 class TimelineClip:
     def __init__(self, source_path, timeline_start_ms, clip_start_ms, duration_ms, track_index, track_type, media_type, group_id):
@@ -627,6 +677,8 @@ class TimelineWidget(QWidget):
             base_color = QColor("#46A")
             if clip.media_type == 'image':
                 base_color = QColor("#4A6")
+            elif clip.media_type == 'subtitle':
+                base_color = QColor("#D9A022")
             elif clip.track_type == 'audio':
                 base_color = QColor("#48C")
             
@@ -1278,7 +1330,7 @@ class TimelineWidget(QWidget):
             
             video_y, audio_y = -1, -1
 
-            if media_type in ['video', 'image']:
+            if media_type in ['video', 'image', 'subtitle']:
                 if track_type == 'video':
                     visual_index = self.timeline.num_video_tracks - track_index
                     video_y = self.video_tracks_y_start + visual_index * self.TRACK_HEIGHT
@@ -1338,7 +1390,7 @@ class TimelineWidget(QWidget):
                 video_track_idx = None
                 audio_track_idx = None
 
-                if media_type == 'image':
+                if media_type in ['image', 'subtitle']:
                     if drop_track_type == 'video': video_track_idx = drop_track_index
                 elif media_type == 'audio':
                     if drop_track_type == 'audio': audio_track_idx = drop_track_index
@@ -1387,7 +1439,7 @@ class TimelineWidget(QWidget):
         video_track_idx = None
         audio_track_idx = None
 
-        if media_type == 'image':
+        if media_type in ['image', 'subtitle']:
             if drop_track_type == 'video':
                 video_track_idx = drop_track_index
         elif media_type == 'audio':
@@ -1863,6 +1915,9 @@ class MainWindow(QMainWindow):
 
         self.plugin_manager = PluginManager(self)
         self.plugin_manager.discover_and_load_plugins()
+        
+        self.cache_dir = os.path.join(os.path.expanduser('~'), '.video_editor_cache')
+        os.makedirs(self.cache_dir, exist_ok=True)
 
         # Project settings with defaults
         self.project_fps = 50.0
@@ -2141,7 +2196,7 @@ class MainWindow(QMainWindow):
         has_audio = media_info['has_audio']
         media_type = media_info['media_type']
 
-        video_track = 1 if media_type in ['video', 'image'] else None
+        video_track = 1 if media_type in ['video', 'image', 'subtitle'] else None
         audio_track = 1 if has_audio else None
 
         self._add_clip_to_timeline(
@@ -2273,43 +2328,125 @@ class MainWindow(QMainWindow):
 
             data['action'] = action
             self.windows_menu.addAction(action)
+        
+    def _re_index_video_file(self, original_path):
+        self.status_label.setText(f"File appears to be missing an index. Rebuilding, please wait...")
+        QApplication.processEvents()
+
+        try:
+            path_bytes = os.path.abspath(original_path).encode('utf-8')
+            file_hash = hashlib.sha256(path_bytes).hexdigest()
+            # Always use a standard, compatible container like mp4 for the cache
+            cached_filename = f"{file_hash}.mp4"
+            cached_filepath = os.path.join(self.cache_dir, cached_filename)
+
+            if os.path.exists(cached_filepath):
+                self.status_label.setText("Found existing indexed version of the file.")
+                QApplication.processEvents()
+                return cached_filepath
+
+            startupinfo = None
+            if hasattr(subprocess, 'STARTUPINFO'):
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            
+            # Re-mux the file to create a new index. -movflags faststart is good practice.
+            process = subprocess.Popen(
+                ['ffmpeg', '-i', original_path, '-c', 'copy', '-movflags', 'faststart', cached_filepath],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+                encoding='utf-8', errors='ignore', startupinfo=startupinfo
+            )
+            
+            for line in iter(process.stdout.readline, ""):
+                print(line.strip()) # Optional: show ffmpeg progress in console
+            
+            process.wait()
+
+            if process.returncode == 0:
+                self.status_label.setText("Successfully rebuilt file index.")
+                QApplication.processEvents()
+                return cached_filepath
+            else:
+                self.status_label.setText("Failed to re-index the file.")
+                QApplication.processEvents()
+                if os.path.exists(cached_filepath): # Clean up failed attempt
+                    os.remove(cached_filepath)
+                return original_path # Fallback to original path on failure
+        except Exception as e:
+            self.status_label.setText(f"Error re-indexing file: {e}")
+            QApplication.processEvents()
+            return original_path # Fallback to original path on failure
 
     def _get_media_properties(self, file_path):
-        """Probes a file to get its media properties. Returns a dict or None."""
-        if file_path in self.media_properties:
-            return self.media_properties[file_path]
-        
+        current_path_for_probing = file_path
+
         try:
-            file_ext = os.path.splitext(file_path)[1].lower()
+            file_ext = os.path.splitext(current_path_for_probing)[1].lower()
             media_info = {}
             
             if file_ext in ['.png', '.jpg', '.jpeg']:
-                img = QImage(file_path)
+                img = QImage(current_path_for_probing)
                 media_info['media_type'] = 'image'
                 media_info['duration_ms'] = 5000
                 media_info['has_audio'] = False
                 media_info['width'] = img.width()
                 media_info['height'] = img.height()
+                media_info['source_path_for_clips'] = current_path_for_probing
+            elif file_ext in ['.srt', '.ass']:
+                media_info['media_type'] = 'subtitle'
+                media_info['duration_ms'] = _get_subtitle_duration_ms(current_path_for_probing)
+                media_info['has_audio'] = False
+                media_info['source_path_for_clips'] = current_path_for_probing
             else:
-                probe = ffmpeg.probe(file_path)
+                try:
+                    probe = ffmpeg.probe(current_path_for_probing)
+                except ffmpeg.Error as e:
+                    indexed_path = self._re_index_video_file(current_path_for_probing)
+                    if indexed_path != current_path_for_probing:
+                        current_path_for_probing = indexed_path
+                        probe = ffmpeg.probe(current_path_for_probing)
+                    else:
+                        raise e
+
                 video_stream = next((s for s in probe['streams'] if s['codec_type'] == 'video'), None)
                 audio_stream = next((s for s in probe['streams'] if s['codec_type'] == 'audio'), None)
 
                 if video_stream:
                     media_info['media_type'] = 'video'
-                    duration_sec = float(video_stream.get('duration', probe['format'].get('duration', 0)))
-                    media_info['duration_ms'] = int(duration_sec * 1000)
+                    
+                    duration_sec_str = video_stream.get('duration', probe['format'].get('duration'))
+                    
+                    if duration_sec_str and duration_sec_str != 'N/A':
+                        duration_ms = int(float(duration_sec_str) * 1000)
+                    else:
+                        duration_ms = 0
+
+                    if duration_ms < 1000:
+                        indexed_path = self._re_index_video_file(current_path_for_probing)
+                        if indexed_path != current_path_for_probing:
+                            current_path_for_probing = indexed_path
+                            probe = ffmpeg.probe(current_path_for_probing)
+                            video_stream = next((s for s in probe['streams'] if s['codec_type'] == 'video'), None)
+                            duration_sec_str = video_stream.get('duration', probe['format'].get('duration'))
+                            if duration_sec_str and duration_sec_str != 'N/A':
+                                duration_ms = int(float(duration_sec_str) * 1000)
+
+                    media_info['duration_ms'] = duration_ms
                     media_info['has_audio'] = audio_stream is not None
                     media_info['width'] = int(video_stream['width'])
                     media_info['height'] = int(video_stream['height'])
                     if 'r_frame_rate' in video_stream and video_stream['r_frame_rate'] != '0/0':
                         num, den = map(int, video_stream['r_frame_rate'].split('/'))
                         if den > 0: media_info['fps'] = num / den
+                    
+                    media_info['source_path_for_clips'] = current_path_for_probing
+
                 elif audio_stream:
                     media_info['media_type'] = 'audio'
                     duration_sec = float(audio_stream.get('duration', probe['format'].get('duration', 0)))
                     media_info['duration_ms'] = int(duration_sec * 1000)
                     media_info['has_audio'] = True
+                    media_info['source_path_for_clips'] = current_path_for_probing
                 else:
                     return None
             
@@ -2318,9 +2455,10 @@ class MainWindow(QMainWindow):
             print(f"Failed to probe file {os.path.basename(file_path)}: {e}")
             return None
 
+
     def _update_project_properties_from_clip(self, source_path):
         try:
-            media_info = self._get_media_properties(source_path)
+            media_info = self.media_properties.get(source_path)
             if not media_info or media_info['media_type'] not in ['video', 'image']:
                 return False
 
@@ -2633,22 +2771,24 @@ class MainWindow(QMainWindow):
                 action.triggered.connect(lambda checked, p=path: self._load_project_from_path(p))
                 self.recent_menu.addAction(action)
 
-    def _add_media_to_pool(self, file_path):
-        if file_path in self.media_pool:
+    def _add_media_to_pool(self, original_path):
+        if original_path in self.media_pool:
             return True
         
-        self.status_label.setText(f"Probing {os.path.basename(file_path)}..."); QApplication.processEvents()
+        self.status_label.setText(f"Probing {os.path.basename(original_path)}..."); QApplication.processEvents()
         
-        media_info = self._get_media_properties(file_path)
+        media_info = self._get_media_properties(original_path)
         
         if media_info:
-            self.media_properties[file_path] = media_info
-            self.media_pool.append(file_path)
-            self.project_media_widget.add_media_item(file_path)
-            self.status_label.setText(f"Added {os.path.basename(file_path)} to project.")
+            self.media_properties[original_path] = media_info
+            if original_path not in self.media_pool:
+                self.media_pool.append(original_path)
+            
+            self.project_media_widget.add_media_item(original_path)
+            self.status_label.setText(f"Added {os.path.basename(original_path)} to project.")
             return True
         else:
-            self.status_label.setText(f"Error probing file: {os.path.basename(file_path)}")
+            self.status_label.setText(f"Error probing file: {os.path.basename(original_path)}")
             return False
 
     def on_media_removed_from_pool(self, file_path):
@@ -2680,7 +2820,7 @@ class MainWindow(QMainWindow):
         return added_files
 
     def add_media_to_timeline(self):
-        file_paths, _ = QFileDialog.getOpenFileNames(self, "Add Media to Timeline", "", "All Supported Files (*.mp4 *.mov *.avi *.png *.jpg *.jpeg *.mp3 *.wav);;Video Files (*.mp4 *.mov *.avi);;Image Files (*.png *.jpg *.jpeg);;Audio Files (*.mp3 *.wav)")
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "Add Media to Timeline", "", "All Supported Files (*.mp4 *.mov *.mkv *.avi *.png *.jpg *.jpeg *.mp3 *.wav *.srt *.ass);;Video Files (*.mp4 *.mov *.mkv *.avi);;Image Files (*.png *.jpg *.jpeg);;Audio Files (*.mp3 *.wav);;Subtitle Files (*.srt *.ass)")
         if not file_paths:
             return
 
@@ -2705,7 +2845,7 @@ class MainWindow(QMainWindow):
                 video_track_index = None
                 audio_track_index = None
 
-                if media_type in ['video', 'image']:
+                if media_type in ['video', 'image', 'subtitle']:
                     for i in range(1, self.timeline.num_video_tracks + 2):
                         is_occupied = any(
                             c.timeline_start_ms < clip_end_time and c.timeline_end_ms > clip_start_time
@@ -2729,13 +2869,13 @@ class MainWindow(QMainWindow):
                 if video_track_index is not None:
                     if video_track_index > self.timeline.num_video_tracks:
                         self.timeline.num_video_tracks = video_track_index
-                    video_clip = TimelineClip(file_path, clip_start_time, 0, duration_ms, video_track_index, 'video', media_type, group_id)
+                    video_clip = TimelineClip(media_info['source_path_for_clips'], clip_start_time, 0, duration_ms, video_track_index, 'video', media_type, group_id)
                     self.timeline.add_clip(video_clip)
                 
                 if audio_track_index is not None:
                     if audio_track_index > self.timeline.num_audio_tracks:
                         self.timeline.num_audio_tracks = audio_track_index
-                    audio_clip = TimelineClip(file_path, clip_start_time, 0, duration_ms, audio_track_index, 'audio', media_type, group_id)
+                    audio_clip = TimelineClip(media_info['source_path_for_clips'], clip_start_time, 0, duration_ms, audio_track_index, 'audio', media_type, group_id)
                     self.timeline.add_clip(audio_clip)
 
             self.status_label.setText(f"Added {len(added_files)} file(s) to timeline.")
@@ -2743,11 +2883,18 @@ class MainWindow(QMainWindow):
         self._perform_complex_timeline_change("Add Media to Timeline", add_clips_action)
 
     def add_media_files(self):
-        file_paths, _ = QFileDialog.getOpenFileNames(self, "Open Media Files", "", "All Supported Files (*.mp4 *.mov *.avi *.png *.jpg *.jpeg *.mp3 *.wav);;Video Files (*.mp4 *.mov *.avi);;Image Files (*.png *.jpg *.jpeg);;Audio Files (*.mp3 *.wav)")
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "Open Media Files", "", "All Supported Files (*.mp4 *.mov *.mkv *.avi *.png *.jpg *.jpeg *.mp3 *.wav *.srt *.ass);;Video Files (*.mp4 *.mov *.mkv *.avi);;Image Files (*.png *.jpg *.jpeg);;Audio Files (*.mp3 *.wav);;Subtitle Files (*.srt *.ass)")
         if file_paths:
             self._add_media_files_to_project(file_paths)
 
     def _add_clip_to_timeline(self, source_path, timeline_start_ms, duration_ms, media_type, clip_start_ms=0, video_track_index=None, audio_track_index=None):
+        media_info = self.media_properties.get(source_path)
+        if not media_info:
+            self.status_label.setText(f"Cannot add clip, missing properties for {os.path.basename(source_path)}")
+            return
+
+        path_for_clip = media_info['source_path_for_clips']
+
         if media_type in ['video', 'image']:
             self._update_project_properties_from_clip(source_path)
 
@@ -2757,19 +2904,20 @@ class MainWindow(QMainWindow):
         if video_track_index is not None:
              if video_track_index > self.timeline.num_video_tracks:
                  self.timeline.num_video_tracks = video_track_index
-             video_clip = TimelineClip(source_path, timeline_start_ms, clip_start_ms, duration_ms, video_track_index, 'video', media_type, group_id)
+             video_clip = TimelineClip(path_for_clip, timeline_start_ms, clip_start_ms, duration_ms, video_track_index, 'video', media_type, group_id)
              self.timeline.add_clip(video_clip)
         
         if audio_track_index is not None:
              if audio_track_index > self.timeline.num_audio_tracks:
                  self.timeline.num_audio_tracks = audio_track_index
-             audio_clip = TimelineClip(source_path, timeline_start_ms, clip_start_ms, duration_ms, audio_track_index, 'audio', media_type, group_id)
+             audio_clip = TimelineClip(path_for_clip, timeline_start_ms, clip_start_ms, duration_ms, audio_track_index, 'audio', media_type, group_id)
              self.timeline.add_clip(audio_clip)
 
         new_state = self._get_current_timeline_state()
         command = TimelineStateChangeCommand("Add Clip", self.timeline, *old_state, *new_state)
         command.undo()
         self.undo_stack.push(command)
+
 
     def _split_at_time(self, clip_to_split, time_ms, new_group_id=None):
         if not (clip_to_split.timeline_start_ms < time_ms < clip_to_split.timeline_end_ms): return False

@@ -86,52 +86,53 @@ class Encoder(QObject):
             w, h, fps = project_settings['width'], project_settings['height'], project_settings['fps']
             sample_rate, channel_layout = '44100', 'stereo'
 
-            # --- VIDEO GRAPH CONSTRUCTION (Definitive Solution) ---
 
             all_video_clips = sorted(
-                [c for c in timeline.clips if c.track_type == 'video'],
+                [c for c in timeline.clips if c.track_type == 'video' and c.media_type != 'subtitle'],
                 key=lambda c: c.track_index
             )
 
-            # 1. Start with a base black canvas that defines the project's duration.
-            # This is our master clock and bottom layer.
             final_video = ffmpeg.input(f'color=c=black:s={w}x{h}:r={fps}:d={total_dur_sec}', f='lavfi')
 
-            # 2. Process each clip individually and overlay it.
             for clip in all_video_clips:
-                # A new, separate input for every single clip guarantees no conflicts.
                 if clip.media_type == 'image':
                     clip_input = ffmpeg.input(clip.source_path, loop=1, framerate=fps)
                 else:
                     clip_input = ffmpeg.input(clip.source_path)
 
-                # a) Calculate the time shift to align the clip's content with the timeline.
-                #    This ensures the correct frame of the source is shown at the start of the clip.
                 timeline_start_sec = clip.timeline_start_ms / 1000.0
                 clip_start_sec = clip.clip_start_ms / 1000.0
                 time_shift_sec = timeline_start_sec - clip_start_sec
 
-                # b) Prepare the layer: apply the time shift, then scale and pad.
                 timed_layer = (
                     clip_input.video
                     .setpts(f'PTS+{time_shift_sec}/TB')
                     .filter('scale', w, h, force_original_aspect_ratio='decrease')
                     .filter('pad', w, h, '(ow-iw)/2', '(oh-ih)/2', 'black')
                 )
-                
-                # c) Define the visibility window for the overlay on the master timeline.
+
                 timeline_end_sec = (clip.timeline_start_ms + clip.duration_ms) / 1000.0
                 enable_expression = f'between(t,{timeline_start_sec:.6f},{timeline_end_sec:.6f})'
 
-                # d) Overlay the prepared layer onto the composition, enabling it only during its time window.
-                #    eof_action='pass' handles finite streams gracefully.
                 final_video = ffmpeg.overlay(final_video, timed_layer, enable=enable_expression, eof_action='pass')
-                
-            # 3. Set final output format and framerate.
+
+            all_subtitle_clips = sorted(
+                [c for c in timeline.clips if c.media_type == 'subtitle'],
+                key=lambda c: c.track_index
+            )
+
+            for sub_clip in all_subtitle_clips:                
+                timeline_start_sec = sub_clip.timeline_start_ms / 1000.0
+                timeline_end_sec = (sub_clip.timeline_start_ms + sub_clip.duration_ms) / 1000.0
+                enable_expression = f'between(t,{timeline_start_sec:.6f},{timeline_end_sec:.6f})'
+                subtitle_layer = (
+                    ffmpeg.input(f'color=c=black@0.0:s={w}x{h}:r={fps}:d={total_dur_sec}', f='lavfi')
+                    .filter('subtitles', filename=sub_clip.source_path)
+                )
+                final_video = ffmpeg.overlay(final_video, subtitle_layer, enable=enable_expression)
+
             final_video = final_video.filter('format', pix_fmts='yuv420p').filter('fps', fps=fps)
 
-
-            # --- AUDIO GRAPH CONSTRUCTION (UNCHANGED and CORRECT) ---
             track_audio_streams = []
             for i in range(1, timeline.num_audio_tracks + 1):
                 track_clips = sorted([c for c in timeline.clips if c.track_type == 'audio' and c.track_index == i], key=lambda c: c.timeline_start_ms)
@@ -155,7 +156,6 @@ class Encoder(QObject):
                 if track_segments:
                     track_audio_streams.append(ffmpeg.concat(*track_segments, v=0, a=1))
 
-            # --- FINAL OUTPUT ASSEMBLY ---
             output_args = {}
             stream_args = []
             has_audio = bool(track_audio_streams) and export_settings.get('acodec')
