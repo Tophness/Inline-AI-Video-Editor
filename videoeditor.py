@@ -2278,7 +2278,12 @@ class MainWindow(QMainWindow):
         new_action = QAction("&New Project", self); new_action.triggered.connect(self.new_project)
         open_action = QAction("&Open Project...", self); open_action.triggered.connect(self.open_project)
         self.recent_menu = file_menu.addMenu("Recent")
-        save_action = QAction("&Save Project As...", self); save_action.triggered.connect(self.save_project_as)
+        self.save_action = QAction("&Save Project", self)
+        self.save_action.setShortcut("Ctrl+S")
+        self.save_action.triggered.connect(self.save_project)
+        self.save_action.setEnabled(False)
+        save_as_action = QAction("&Save Project As...", self)
+        save_as_action.triggered.connect(self.save_project_as)
         add_media_to_timeline_action = QAction("Add Media to &Timeline...", self)
         add_media_to_timeline_action.triggered.connect(self.add_media_to_timeline)
         add_media_action = QAction("&Add Media to Project...", self); add_media_action.triggered.connect(self.add_media_files)
@@ -2286,7 +2291,9 @@ class MainWindow(QMainWindow):
         settings_action = QAction("Se&ttings...", self); settings_action.triggered.connect(self.open_settings_dialog)
         exit_action = QAction("E&xit", self); exit_action.triggered.connect(self.close)
         file_menu.addAction(new_action); file_menu.addAction(open_action); file_menu.addSeparator()
-        file_menu.addAction(save_action)
+        file_menu.addAction(new_action); file_menu.addAction(open_action); file_menu.addSeparator()
+        file_menu.addAction(self.save_action)
+        file_menu.addAction(save_as_action)
         file_menu.addSeparator()
         file_menu.addAction(add_media_to_timeline_action)
         file_menu.addAction(add_media_action)
@@ -2688,17 +2695,22 @@ class MainWindow(QMainWindow):
         self.update_undo_redo_actions()
         self.status_label.setText("New project created. Add media to begin.")
         self.playback_manager.seek_to_frame(0)
+        self.save_action.setEnabled(False)
 
-    def save_project_as(self):
-        path, _ = QFileDialog.getSaveFileName(self, "Save Project", "", "JSON Project Files (*.json)")
-        if not path: return
+    def save_project(self):
+        if self.current_project_path:
+            self._write_project_to_file(self.current_project_path)
+        else:
+            self.save_project_as()
+
+    def _write_project_to_file(self, path):
         project_data = {
             "media_pool": self.media_pool,
             "clips": [{"source_path": c.source_path, "timeline_start_ms": c.timeline_start_ms, "clip_start_ms": c.clip_start_ms, "duration_ms": c.duration_ms, "track_index": c.track_index, "track_type": c.track_type, "media_type": c.media_type, "group_id": c.group_id} for c in self.timeline.clips],
             "selection_regions": self.timeline_widget.selection_regions,
             "last_export_path": self.last_export_path,
             "settings": {
-                "num_video_tracks": self.timeline.num_video_tracks, 
+                "num_video_tracks": self.timeline.num_video_tracks,
                 "num_audio_tracks": self.timeline.num_audio_tracks,
                 "project_width": self.project_width,
                 "project_height": self.project_height,
@@ -2706,10 +2718,21 @@ class MainWindow(QMainWindow):
             }
         }
         try:
-            with open(path, "w") as f: json.dump(project_data, f, indent=4)
-            self.current_project_path = path; self.status_label.setText(f"Project saved to {os.path.basename(path)}")
+            with open(path, "w") as f:
+                json.dump(project_data, f, indent=4)
+            
+            self.current_project_path = path
+            self.status_label.setText(f"Project saved to {os.path.basename(path)}")
             self._add_to_recent_files(path)
-        except Exception as e: self.status_label.setText(f"Error saving project: {e}")
+            self.save_action.setEnabled(True)
+        except Exception as e:
+            self.status_label.setText(f"Error saving project: {e}")
+
+    def save_project_as(self):
+        path, _ = QFileDialog.getSaveFileName(self, "Save Project", "", "JSON Project Files (*.json)")
+        if not path:
+            return
+        self._write_project_to_file(path)
 
     def open_project(self):
         path, _ = QFileDialog.getOpenFileName(self, "Open Project", "", "JSON Project Files (*.json)")
@@ -2752,6 +2775,7 @@ class MainWindow(QMainWindow):
             self.playback_manager.seek_to_frame(0)
             self.status_label.setText(f"Project '{os.path.basename(path)}' loaded.")
             self._add_to_recent_files(path)
+            self.save_action.setEnabled(True)
         except Exception as e: self.status_label.setText(f"Error opening project: {e}")
 
     def _add_to_recent_files(self, path):
