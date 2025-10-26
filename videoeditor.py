@@ -7,7 +7,7 @@ import re
 import json
 import ffmpeg
 import copy
-import hashlib
+import tempfile
 from plugins import PluginManager, ManagePluginsDialog
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QFileDialog, QLabel,
@@ -1916,15 +1916,10 @@ class MainWindow(QMainWindow):
         self.plugin_manager = PluginManager(self)
         self.plugin_manager.discover_and_load_plugins()
         
-        self.cache_dir = os.path.join(os.path.expanduser('~'), '.video_editor_cache')
-        os.makedirs(self.cache_dir, exist_ok=True)
-
-        # Project settings with defaults
         self.project_fps = 50.0
         self.project_width = 1280
         self.project_height = 720
-        
-        # Preview settings
+
         self.scale_to_fit = True
         self.current_preview_pixmap = None
 
@@ -2336,124 +2331,124 @@ class MainWindow(QMainWindow):
             data['action'] = action
             self.windows_menu.addAction(action)
         
-    def _re_index_video_file(self, original_path):
-        self.status_label.setText(f"File appears to be missing an index. Rebuilding, please wait...")
+    def _re_index_video_to_temp_file(self, original_path):
+        self.status_label.setText(f"File may be corrupt or missing an index. Attempting to rebuild, please wait...")
         QApplication.processEvents()
 
         try:
-            path_bytes = os.path.abspath(original_path).encode('utf-8')
-            file_hash = hashlib.sha256(path_bytes).hexdigest()
-            # Always use a standard, compatible container like mp4 for the cache
-            cached_filename = f"{file_hash}.mp4"
-            cached_filepath = os.path.join(self.cache_dir, cached_filename)
-
-            if os.path.exists(cached_filepath):
-                self.status_label.setText("Found existing indexed version of the file.")
-                QApplication.processEvents()
-                return cached_filepath
+            temp_dir = tempfile.gettempdir()
+            temp_filename = f"ve_reindex_{uuid.uuid4().hex}.mp4"
+            temp_filepath = os.path.join(temp_dir, temp_filename)
 
             startupinfo = None
             if hasattr(subprocess, 'STARTUPINFO'):
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            
-            # Re-mux the file to create a new index. -movflags faststart is good practice.
+
             process = subprocess.Popen(
-                ['ffmpeg', '-i', original_path, '-c', 'copy', '-movflags', 'faststart', cached_filepath],
+                ['ffmpeg', '-y', '-i', original_path, '-c', 'copy', '-movflags', 'faststart', temp_filepath],
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
                 encoding='utf-8', errors='ignore', startupinfo=startupinfo
             )
             
             for line in iter(process.stdout.readline, ""):
-                print(line.strip()) # Optional: show ffmpeg progress in console
+                pass
             
             process.wait()
 
             if process.returncode == 0:
-                self.status_label.setText("Successfully rebuilt file index.")
+                self.status_label.setText("Successfully re-indexed file to a temporary location for analysis.")
                 QApplication.processEvents()
-                return cached_filepath
+                return temp_filepath
             else:
-                self.status_label.setText("Failed to re-index the file.")
+                self.status_label.setText("Failed to re-index the file. It may be unsupported or severely corrupt.")
                 QApplication.processEvents()
-                if os.path.exists(cached_filepath): # Clean up failed attempt
-                    os.remove(cached_filepath)
-                return original_path # Fallback to original path on failure
+                if os.path.exists(temp_filepath):
+                    os.remove(temp_filepath)
+                return None
         except Exception as e:
-            self.status_label.setText(f"Error re-indexing file: {e}")
+            self.status_label.setText(f"An error occurred during file re-indexing: {e}")
             QApplication.processEvents()
-            return original_path # Fallback to original path on failure
+            return None
 
     def _get_media_properties(self, file_path):
-        current_path_for_probing = file_path
-
         try:
-            file_ext = os.path.splitext(current_path_for_probing)[1].lower()
+            file_ext = os.path.splitext(file_path)[1].lower()
             media_info = {}
             
             if file_ext in ['.png', '.jpg', '.jpeg']:
-                img = QImage(current_path_for_probing)
+                img = QImage(file_path)
                 media_info['media_type'] = 'image'
                 media_info['duration_ms'] = 5000
                 media_info['has_audio'] = False
                 media_info['width'] = img.width()
                 media_info['height'] = img.height()
-                media_info['source_path_for_clips'] = current_path_for_probing
+                media_info['source_path_for_clips'] = file_path
             elif file_ext in ['.srt', '.ass']:
                 media_info['media_type'] = 'subtitle'
-                media_info['duration_ms'] = _get_subtitle_duration_ms(current_path_for_probing)
+                media_info['duration_ms'] = _get_subtitle_duration_ms(file_path)
                 media_info['has_audio'] = False
-                media_info['source_path_for_clips'] = current_path_for_probing
+                media_info['source_path_for_clips'] = file_path
             else:
                 try:
-                    probe = ffmpeg.probe(current_path_for_probing)
-                except ffmpeg.Error as e:
-                    indexed_path = self._re_index_video_file(current_path_for_probing)
-                    if indexed_path != current_path_for_probing:
-                        current_path_for_probing = indexed_path
-                        probe = ffmpeg.probe(current_path_for_probing)
-                    else:
-                        raise e
+                    probe = ffmpeg.probe(file_path)
+                except ffmpeg.Error:
+                    probe = None
+
+                current_duration_ms = 0
+                if probe:
+                    dur_str = probe['format'].get('duration')
+                    if not dur_str or dur_str == 'N/A':
+                        vid = next((s for s in probe['streams'] if s['codec_type'] == 'video'), None)
+                        if vid: dur_str = vid.get('duration')
+                    if not dur_str or dur_str == 'N/A':
+                         aud = next((s for s in probe['streams'] if s['codec_type'] == 'audio'), None)
+                         if aud: dur_str = aud.get('duration')
+
+                    if dur_str and dur_str != 'N/A':
+                        try: current_duration_ms = float(dur_str) * 1000
+                        except ValueError: current_duration_ms = 0
+
+                if not probe or current_duration_ms < 1000:
+                    temp_path = self._re_index_video_to_temp_file(file_path)
+                    if temp_path:
+                        try:
+                            probe = ffmpeg.probe(temp_path)
+                        except Exception as e:
+                            print(f"Failed to probe temp file: {e}")
+                        finally:
+                            if os.path.exists(temp_path):
+                                try: os.remove(temp_path)
+                                except: pass
+
+                if not probe: return None
 
                 video_stream = next((s for s in probe['streams'] if s['codec_type'] == 'video'), None)
                 audio_stream = next((s for s in probe['streams'] if s['codec_type'] == 'audio'), None)
 
                 if video_stream:
                     media_info['media_type'] = 'video'
+                    duration_str = probe['format'].get('duration')
+                    if not duration_str or duration_str == 'N/A':
+                        duration_str = video_stream.get('duration')
                     
-                    duration_sec_str = video_stream.get('duration', probe['format'].get('duration'))
-                    
-                    if duration_sec_str and duration_sec_str != 'N/A':
-                        duration_ms = int(float(duration_sec_str) * 1000)
-                    else:
-                        duration_ms = 0
-
-                    if duration_ms < 1000:
-                        indexed_path = self._re_index_video_file(current_path_for_probing)
-                        if indexed_path != current_path_for_probing:
-                            current_path_for_probing = indexed_path
-                            probe = ffmpeg.probe(current_path_for_probing)
-                            video_stream = next((s for s in probe['streams'] if s['codec_type'] == 'video'), None)
-                            duration_sec_str = video_stream.get('duration', probe['format'].get('duration'))
-                            if duration_sec_str and duration_sec_str != 'N/A':
-                                duration_ms = int(float(duration_sec_str) * 1000)
-
-                    media_info['duration_ms'] = duration_ms
+                    media_info['duration_ms'] = int(float(duration_str) * 1000) if duration_str and duration_str != 'N/A' else 0
                     media_info['has_audio'] = audio_stream is not None
                     media_info['width'] = int(video_stream['width'])
                     media_info['height'] = int(video_stream['height'])
                     if 'r_frame_rate' in video_stream and video_stream['r_frame_rate'] != '0/0':
                         num, den = map(int, video_stream['r_frame_rate'].split('/'))
                         if den > 0: media_info['fps'] = num / den
-                    
-                    media_info['source_path_for_clips'] = current_path_for_probing
+                    media_info['source_path_for_clips'] = file_path
 
                 elif audio_stream:
                     media_info['media_type'] = 'audio'
-                    duration_sec = float(audio_stream.get('duration', probe['format'].get('duration', 0)))
-                    media_info['duration_ms'] = int(duration_sec * 1000)
+                    duration_str = probe['format'].get('duration')
+                    if not duration_str or duration_str == 'N/A':
+                         duration_str = audio_stream.get('duration')
+                    media_info['duration_ms'] = int(float(duration_str) * 1000) if duration_str and duration_str != 'N/A' else 0
                     media_info['has_audio'] = True
-                    media_info['source_path_for_clips'] = current_path_for_probing
+                    media_info['source_path_for_clips'] = file_path
                 else:
                     return None
             
