@@ -1546,10 +1546,6 @@ class TimelineWidget(QWidget):
                 clips_to_delete = [c for c in self.timeline.clips if c.id in self.selected_clips]
                 if clips_to_delete:
                     self.delete_clips_requested.emit(clips_to_delete)
-        elif event.key() == Qt.Key.Key_Left:
-            self.window().step_frame(-1)
-        elif event.key() == Qt.Key.Key_Right:
-            self.window().step_frame(1)
         else:
             super().keyPressEvent(event)
 
@@ -1926,6 +1922,7 @@ class MainWindow(QMainWindow):
 
         self._setup_ui()
         self._connect_signals()
+        self._create_actions_and_shortcuts()
 
         self.preview_widget.installEventFilter(self)
         self._default_splitter_handle_width = self.splitter.handleWidth()
@@ -2142,6 +2139,22 @@ class MainWindow(QMainWindow):
 
         self.mute_button.toggled.connect(self._on_mute_toggled)
         self.volume_slider.valueChanged.connect(self._on_volume_changed)
+
+    def _create_actions_and_shortcuts(self):
+        play_pause_action = QAction("Toggle Playback", self)
+        play_pause_action.setShortcut(Qt.Key.Key_Space)
+        play_pause_action.triggered.connect(self.toggle_playback)
+        self.addAction(play_pause_action)
+
+        step_forward_action = QAction("Step Frame Forward", self)
+        step_forward_action.setShortcut(Qt.Key.Key_Right)
+        step_forward_action.triggered.connect(lambda: self.step_frame(1))
+        self.addAction(step_forward_action)
+
+        step_back_action = QAction("Step Frame Backward", self)
+        step_back_action.setShortcut(Qt.Key.Key_Left)
+        step_back_action.triggered.connect(lambda: self.step_frame(-1))
+        self.addAction(step_back_action)
 
     def _show_preview_context_menu(self, pos):
         menu = QMenu(self)
