@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
 from PyQt6.QtGui import (QPainter, QColor, QPen, QFont, QFontMetrics, QMouseEvent, QAction,
                          QPixmap, QImage, QDrag, QCursor, QKeyEvent, QIcon, QTransform)
 from PyQt6.QtCore import (Qt, QPoint, QRect, QRectF, QSize, QPointF, QObject, QThread,
-                          pyqtSignal, QTimer, QByteArray, QMimeData)
+                          pyqtSignal, QTimer, QByteArray, QMimeData, QEvent)
 
 from undo import UndoStack, TimelineStateChangeCommand, MoveClipsCommand
 from playback import PlaybackManager
@@ -1908,6 +1908,7 @@ class MainWindow(QMainWindow):
         self.settings = {}
         self.settings_file = "settings.json"
         self.is_shutting_down = False
+        self.pre_fullscreen_visibility = {}
         self._load_settings()
 
         self.playback_manager = PlaybackManager(self._get_playback_data)
@@ -1925,6 +1926,9 @@ class MainWindow(QMainWindow):
 
         self._setup_ui()
         self._connect_signals()
+
+        self.preview_widget.installEventFilter(self)
+        self._default_splitter_handle_width = self.splitter.handleWidth()
 
         self.plugin_manager.load_enabled_plugins_from_settings(self.settings.get("enabled_plugins", []))
         self._apply_loaded_settings()
@@ -1988,6 +1992,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(self.splitter, 1)
 
         controls_widget = QWidget()
+        controls_widget.setObjectName("controls_widget")
         controls_layout = QHBoxLayout(controls_widget)
         controls_layout.setContentsMargins(0, 5, 0, 5)
 
@@ -2050,6 +2055,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(controls_widget)
 
         status_bar_widget = QWidget()
+        status_bar_widget.setObjectName("status_bar_widget")
         status_layout = QHBoxLayout(status_bar_widget)
         status_layout.setContentsMargins(5,2,5,2)
 
@@ -3293,6 +3299,49 @@ class MainWindow(QMainWindow):
         dialog = ManagePluginsDialog(self.plugin_manager, self)
         dialog.app = self
         dialog.exec()
+
+    def eventFilter(self, source, event):
+        if source is self.preview_widget and event.type() == QEvent.Type.MouseButtonDblClick:
+            self.toggle_fullscreen_preview()
+            return True
+        return super().eventFilter(source, event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
+            self.toggle_fullscreen_preview()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+
+    def toggle_fullscreen_preview(self):
+        controls_widget = self.centralWidget().findChild(QWidget, "controls_widget")
+        status_bar_widget = self.centralWidget().findChild(QWidget, "status_bar_widget")
+
+        widgets_map = {
+            "media_dock": self.media_dock,
+            "timeline": self.timeline_widget,
+            "menubar": self.menuBar(),
+            "controls": controls_widget,
+            "statusbar": status_bar_widget
+        }
+
+        if self.isFullScreen():
+            self.splitter.setHandleWidth(self._default_splitter_handle_width)
+            for name, widget in widgets_map.items():
+                if widget and name in self.pre_fullscreen_visibility:
+                    widget.setVisible(self.pre_fullscreen_visibility[name])
+
+            self.showNormal()
+            self.pre_fullscreen_visibility.clear()
+        else:
+            self.pre_fullscreen_visibility.clear()
+            for name, widget in widgets_map.items():
+                if widget:
+                    self.pre_fullscreen_visibility[name] = widget.isVisible()
+                    widget.hide()
+            
+            self.splitter.setHandleWidth(0)
+            self.showFullScreen()
 
     def closeEvent(self, event):
         if self.settings.get("confirm_on_exit", True):
