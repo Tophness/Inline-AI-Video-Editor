@@ -6,71 +6,182 @@ import json
 import tempfile
 import shutil
 import uuid
-from unittest.mock import MagicMock
+import inspect
 from pathlib import Path
 from contextlib import contextmanager
 import ffmpeg
 
-class MockApp:
-    pass
-
-class MockGradioComponent(MagicMock):
-    """A smarter mock that captures constructor arguments."""
-    def __init__(self, *args, **kwargs):
-        super().__init__(name=f"gr.{kwargs.get('elem_id', 'component')}")
+class MockComponent:
+    def __init__(self, type_name="Generic", *args, **kwargs):
+        self.type_name = type_name
+        self.args = args
         self.kwargs = kwargs
-        self.value = kwargs.get('value')
-        self.choices = kwargs.get('choices')
-        
-        for method in ['then', 'change', 'click', 'input', 'select', 'upload', 'mount', 'launch', 'on', 'release']:
-            setattr(self, method, lambda *a, **kw: self)
+        self.children = []
+        self.id = str(uuid.uuid4())
+        self.label = kwargs.get('label', None)
+        self.value = kwargs.get('value', None)
+        self.visible = kwargs.get('visible', True)
+        self.choices = kwargs.get('choices', [])
+        self.elem_id = kwargs.get('elem_id', None)
+        self.minimum = kwargs.get('minimum', 0)
+        self.maximum = kwargs.get('maximum', 100)
+        self.step = kwargs.get('step', 1)
+        self.interactive = kwargs.get('interactive', True)
+        self.placeholder = kwargs.get('placeholder', None)
+        self.props = kwargs
 
     def __enter__(self):
+        if hasattr(sys.modules['gradio'], '_push_context'):
+            sys.modules['gradio']._push_context(self)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        pass
+        if hasattr(sys.modules['gradio'], '_pop_context'):
+            sys.modules['gradio']._pop_context()
 
-class MockGradioError(Exception):
-    pass
+    def __getattr__(self, name):
+        def dummy_method(*args, **kwargs):
+            return self
+        return dummy_method
+
+    def __repr__(self):
+        return f"<MockComponent {self.type_name} id={self.id} label='{self.label}'>"
+
+class MockEventData:
+    def __init__(self, target=None, _data=None):
+        self.target = target
+        self._data = _data or {}
+
+class MockSelectData:
+    def __init__(self, index=0, value=None, selected=True):
+        self.index = index
+        self.value = value
+        self.selected = selected
+
+class MockProgress:
+    def __init__(self, track_tqdm=False): pass
+    def __call__(self, *args, **kwargs): pass
+    def tqdm(self, iterator, *args, **kwargs): return iterator
+
+class MockThemes:
+    def Soft(self, *args, **kwargs): return None
 
 class MockGradioModule:
-    def __getattr__(self, name):
-        if name == 'Error':
-            return lambda *args, **kwargs: MockGradioError(*args)
+    def __init__(self):
+        self.context_stack = []
+        self.root_components = []
+        self.is_capturing = False
 
-        if name in ['Info', 'Warning']:
-            return lambda *args, **kwargs: print(f"Intercepted gr.{name}:", *args)
+        self.EventData = MockEventData
+        self.SelectData = MockSelectData
+        self.Progress = MockProgress
+        self.themes = MockThemes()
 
-        return lambda *args, **kwargs: MockGradioComponent(*args, **kwargs)
+    def _push_context(self, component):
+        if not self.is_capturing: return
+        if self.context_stack:
+            self.context_stack[-1].children.append(component)
+        else:
+            self.root_components.append(component)
+        self.context_stack.append(component)
 
-sys.modules['gradio'] = MockGradioModule()
-sys.modules['gradio.gallery'] = MockGradioModule()
-sys.modules['shared.gradio.gallery'] = MockGradioModule()
-class MockPluginModule:
-    pass
+    def _pop_context(self):
+        if not self.is_capturing: return
+        if self.context_stack:
+            self.context_stack.pop()
 
+    def _register_component(self, component):
+        if not self.is_capturing: return component
+        if self.context_stack:
+            self.context_stack[-1].children.append(component)
+        return component
+
+    def start_capture(self):
+        self.context_stack = []
+        self.root_components = []
+        self.is_capturing = True
+
+    def stop_capture(self):
+        self.is_capturing = False
+        return self.root_components
+
+    def Column(self, *args, **kwargs): return MockComponent("Column", *args, **kwargs)
+    def Row(self, *args, **kwargs): return MockComponent("Row", *args, **kwargs)
+    def Tabs(self, *args, **kwargs): return MockComponent("Tabs", *args, **kwargs)
+    def Tab(self, *args, **kwargs): return MockComponent("Tab", *args, **kwargs)
+    def Group(self, *args, **kwargs): return MockComponent("Group", *args, **kwargs)
+    def Accordion(self, *args, **kwargs): return MockComponent("Accordion", *args, **kwargs)
+    def Slider(self, *args, **kwargs): return self._register_component(MockComponent("Slider", *args, **kwargs))
+    def Dropdown(self, *args, **kwargs): return self._register_component(MockComponent("Dropdown", *args, **kwargs))
+    def Textbox(self, *args, **kwargs): return self._register_component(MockComponent("Textbox", *args, **kwargs))
+    def Number(self, *args, **kwargs): return self._register_component(MockComponent("Number", *args, **kwargs))
+    def Checkbox(self, *args, **kwargs): return self._register_component(MockComponent("Checkbox", *args, **kwargs))
+    def Radio(self, *args, **kwargs): return self._register_component(MockComponent("Radio", *args, **kwargs))
+    def Audio(self, *args, **kwargs): return self._register_component(MockComponent("Audio", *args, **kwargs))
+    def File(self, *args, **kwargs): return self._register_component(MockComponent("File", *args, **kwargs))
+    def Image(self, *args, **kwargs): return self._register_component(MockComponent("Image", *args, **kwargs))
+    def Video(self, *args, **kwargs): return self._register_component(MockComponent("Video", *args, **kwargs))
+    def HTML(self, *args, **kwargs): return self._register_component(MockComponent("HTML", *args, **kwargs))
+    def Markdown(self, *args, **kwargs): return self._register_component(MockComponent("Markdown", *args, **kwargs))
+    def Button(self, *args, **kwargs): return self._register_component(MockComponent("Button", *args, **kwargs))
+    def DownloadButton(self, *args, **kwargs): return self._register_component(MockComponent("Button", *args, **kwargs))
+    def UploadButton(self, *args, **kwargs): return self._register_component(MockComponent("Button", *args, **kwargs))
+    def State(self, *args, **kwargs): return self._register_component(MockComponent("State", *args, **kwargs))
+    def Gallery(self, *args, **kwargs): return self._register_component(MockComponent("Gallery", *args, **kwargs))
+    def ImageEditor(self, *args, **kwargs): return self._register_component(MockComponent("Image", *args, **kwargs))
+    def Text(self, *args, **kwargs): return self.Textbox(*args, **kwargs)
+    def Files(self, *args, **kwargs): return self.File(*args, **kwargs) 
+    def update(self, *args, **kwargs): return None
+    def on(self, *args, **kwargs): return MockComponent("Dependency", *args, **kwargs)
+    def Error(self, *args, **kwargs): raise Exception(f"Gradio Error: {args}")
+    def Info(self, *args, **kwargs): print(f"Gradio Info: {args}")
+    def Warning(self, *args, **kwargs): print(f"Gradio Warning: {args}")
+
+class MockAdvancedMediaGallery:
+    def __init__(self, *args, **kwargs):
+        self.gallery = MockComponent("Gallery", label=kwargs.get("label", "Gallery"))
+    def mount(self, *args, **kwargs): pass
+    def get_toggable_elements(self): return []
+
+class MockAudioGallery:
+    def __init__(self, *args, **kwargs): pass
+    def get_state(self):
+        return [MockComponent("State", value=[]), MockComponent("State", value=-1), MockComponent("State", value=0)]
+    @staticmethod
+    def get_javascript(): return ""
+
+class MockPluginModule: pass
 class MockPluginManager:
     def __init__(self, *args, **kwargs): pass
     def discover_plugins(self, *args, **kwargs): return []
-    def load_plugins_from_directory(self, *args, **kwargs): pass
-    def inject_globals(self, *args, **kwargs): pass
-    def get_all_plugins(self, *args, **kwargs): return {}
+    def get_custom_js(self): return ""
     def run_component_insertion(self, *args, **kwargs): pass
-    def setup_ui(self, *args, **kwargs): return {}
-
 class MockWAN2GPApplication:
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs): self.plugin_manager = MockPluginManager()
+    def initialize_plugins(self, *args, **kwargs): pass
+    def setup_ui_tabs(self, *args, **kwargs): pass
+    def run_component_insertion(self, locals_dict): pass
+class MockApp:
+    def __init__(self):
         self.plugin_manager = MockPluginManager()
     def initialize_plugins(self, *args, **kwargs): pass
     def setup_ui_tabs(self, *args, **kwargs): pass
     def run_component_insertion(self, *args, **kwargs): pass
 
-mock_plugin_module = MockPluginModule()
-mock_plugin_module.PluginManager = MockPluginManager
-mock_plugin_module.WAN2GPApplication = MockWAN2GPApplication
-mock_plugin_module.SYSTEM_PLUGINS = []
-sys.modules['shared.utils.plugins'] = mock_plugin_module
+mock_gradio = MockGradioModule()
+sys.modules['gradio'] = mock_gradio
+sys.modules['gradio.gallery'] = mock_gradio
+sys.modules['shared.gradio.gallery'] = mock_gallery = MockGradioModule()
+mock_gallery.AdvancedMediaGallery = MockAdvancedMediaGallery
+
+sys.modules['shared.gradio.audio_gallery'] = mock_audio_gallery = MockGradioModule()
+mock_audio_gallery.AudioGallery = MockAudioGallery
+
+mock_plugin_utils = MockPluginModule()
+mock_plugin_utils.PluginManager = MockPluginManager
+mock_plugin_utils.WAN2GPApplication = MockWAN2GPApplication
+mock_plugin_utils.SYSTEM_PLUGINS = []
+sys.modules['shared.utils.plugins'] = mock_plugin_utils
 
 wgp = None
 root_dir = Path(__file__).parent.parent.parent
@@ -100,6 +211,213 @@ def working_directory(path):
         yield
     finally:
         os.chdir(old_cwd)
+
+class DynamicUiBuilder(QObject):
+    def __init__(self, main_widget):
+        super().__init__()
+        self.main = main_widget
+        self.widget_registry = {}
+        self.id_to_name = {}
+
+    def build_advanced_tab(self, model_type):
+        mock_gradio.start_capture()
+
+        old_advanced = wgp.advanced
+        wgp.advanced = True
+        
+        ui_defaults = wgp.get_default_settings(model_type)
+        mock_state = {
+            "model_type": model_type,
+            "advanced": True,
+            "gen": {"queue": []},
+            "loras_presets": [],
+            "loras": [],
+            "last_model_per_family": {},
+            "last_model_per_type": {},
+            "last_resolution_per_group": {}
+        }
+        
+        try:
+            with working_directory(wan2gp_dir):
+                locals_dict = wgp.generate_video_tab(
+                    update_form=False,
+                    state_dict=mock_state,
+                    ui_defaults=ui_defaults,
+                    tab_id='generate',
+                    model_family=MockComponent("Dropdown"),
+                    model_base_type_choice=MockComponent("Dropdown"),
+                    model_choice=MockComponent("Dropdown"),
+                    header=MockComponent("Markdown"),
+                    main=MockComponent("Blocks"),
+                    main_tabs=MockComponent("Tabs")
+                )
+
+            self.id_to_name.clear()
+            for name, obj in locals_dict.items():
+                if isinstance(obj, MockComponent):
+                    self.id_to_name[obj.id] = name
+
+            def find_advanced_node(nodes):
+                for node in nodes:
+                    ref_name = self.id_to_name.get(node.id)
+
+                    if ref_name == 'advanced_row' and node.type_name == 'Tabs':
+                        return node
+
+                    if node.type_name == 'Tabs':
+                        labels = [c.args[0] if c.args else c.kwargs.get('label') for c in node.children if c.type_name=='Tab']
+                        if "General" in labels and "Loras" in labels:
+                            return node
+
+                    res = find_advanced_node(node.children)
+                    if res: return res
+                return None
+
+            root_components = mock_gradio.stop_capture()
+            advanced_root_node = find_advanced_node(root_components)
+
+            if not advanced_root_node:
+                print("[DynamicUI] Could not locate Advanced Options root in wgp structure.")
+                return None
+
+            advanced_root_node.visible = True
+
+            tabs_widget = QTabWidget()
+            
+            for tab_node in advanced_root_node.children:
+                if tab_node.type_name != 'Tab': continue
+                
+                tab_name = tab_node.args[0] if tab_node.args else tab_node.kwargs.get('label', "Untitled")
+                tab_page = QWidget()
+                tab_layout = QVBoxLayout(tab_page)
+
+                self._build_qt_layout(tab_node.children, tab_layout)
+                
+                tab_layout.addStretch()
+                tabs_widget.addTab(tab_page, tab_name)
+                
+            return tabs_widget
+
+        except Exception as e:
+            print(f"[DynamicUI] Exception: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        finally:
+            wgp.advanced = old_advanced
+            if mock_gradio.is_capturing: mock_gradio.stop_capture()
+
+    def _build_qt_layout(self, nodes, parent_layout):
+        for node in nodes:
+            var_name = self.id_to_name.get(node.id)
+            label = node.label or node.kwargs.get('label')
+            if var_name in ['audio_source']: continue
+            if node.type_name in ['Column', 'Row', 'Group']:
+                container = QGroupBox(label) if label else QWidget()
+                layout = QVBoxLayout(container) if node.type_name in ['Column', 'Group'] else QHBoxLayout(container)
+                layout.setContentsMargins(0,0,0,0)
+                if label: layout.setContentsMargins(5,15,5,5)
+                self._build_qt_layout(node.children, layout)
+                if not node.visible: container.hide()
+                parent_layout.addWidget(container)
+            
+            elif node.type_name == 'Accordion':
+                group = QGroupBox(label or "Options")
+                group.setCheckable(True)
+                group.setChecked(node.kwargs.get('open', False))
+                layout = QVBoxLayout(group)
+                self._build_qt_layout(node.children, layout)
+                if not node.visible: group.hide()
+                parent_layout.addWidget(group)
+
+            elif node.type_name == 'Slider':
+                if not var_name: continue
+                
+                min_val = node.minimum
+                max_val = node.maximum
+                step = node.step
+                val = node.value if node.value is not None else min_val
+                
+                is_float = isinstance(step, float) or isinstance(min_val, float)
+                scale = 100.0 if is_float else 1.0
+                precision = 2 if is_float else 0
+                if step < 0.01: scale = 1000.0; precision=3
+                elif step < 0.1: scale = 100.0; precision=2
+                elif step >= 1.0 and not is_float: scale = 1.0; precision=0
+
+                container = self.main._create_slider_with_label_dynamic(
+                    var_name, min_val, max_val, val, scale, precision, label or var_name
+                )
+                if not node.visible: container.hide()
+                parent_layout.addWidget(container)
+
+            elif node.type_name == 'Dropdown':
+                if not var_name: continue
+                combo = QComboBox()
+                for choice in node.choices:
+                    if isinstance(choice, (list, tuple)) and len(choice) == 2:
+                        combo.addItem(str(choice[0]), choice[1])
+                    else:
+                        combo.addItem(str(choice), choice)
+                
+                val = node.value
+                idx = combo.findData(val)
+                if idx == -1: idx = combo.findText(str(val))
+                if idx != -1: combo.setCurrentIndex(idx)
+                
+                self.main.dynamic_inputs_config[var_name] = {'type': 'dropdown', 'widget': combo}
+                self.main.widgets[var_name] = combo
+                
+                cont = QWidget()
+                l = QVBoxLayout(cont); l.setContentsMargins(0,0,0,0)
+                l.addWidget(QLabel(label or var_name))
+                l.addWidget(combo)
+                if not node.visible: cont.hide()
+                parent_layout.addWidget(cont)
+
+            elif node.type_name == 'Checkbox':
+                if not var_name: continue
+                cb = QCheckBox(label or var_name)
+                cb.setChecked(bool(node.value))
+                self.main.dynamic_inputs_config[var_name] = {'type': 'checkbox', 'widget': cb}
+                self.main.widgets[var_name] = cb
+                if not node.visible: cb.hide()
+                parent_layout.addWidget(cb)
+
+            elif node.type_name in ['Textbox', 'Text']:
+                if not var_name: continue
+                is_multi = node.kwargs.get('lines', 1) > 1
+                txt = QTextEdit() if is_multi else QLineEdit()
+                if is_multi: txt.setMaximumHeight(80)
+                
+                val = str(node.value) if node.value is not None else ""
+                if isinstance(txt, QLineEdit): txt.setText(val)
+                else: txt.setPlainText(val)
+                
+                if 'placeholder' in node.kwargs:
+                    txt.setPlaceholderText(node.kwargs['placeholder'])
+
+                self.main.dynamic_inputs_config[var_name] = {'type': 'text', 'widget': txt}
+                self.main.widgets[var_name] = txt
+                
+                cont = QWidget()
+                l = QVBoxLayout(cont); l.setContentsMargins(0,0,0,0)
+                l.addWidget(QLabel(label or var_name))
+                l.addWidget(txt)
+                if not node.visible: cont.hide()
+                parent_layout.addWidget(cont)
+
+            elif node.type_name in ['File', 'Audio', 'Image', 'Video']:
+                if not var_name: continue
+                container = self.main._create_file_input(var_name, label or var_name)
+                if var_name in self.main.widgets:
+                    self.main.dynamic_inputs_config[var_name] = {'type': 'file', 'widget': self.main.widgets[var_name]}
+                if not node.visible: container.hide()
+                parent_layout.addWidget(container)
+
+            if node.type_name not in ['Row', 'Column', 'Group', 'Accordion', 'Tabs', 'Tab']:
+                if node.children:
+                    self._build_qt_layout(node.children, parent_layout)
 
 class Wan2GPSetupWidget(QWidget):
     def __init__(self, plugin_instance, parent=None):
@@ -146,7 +464,6 @@ class Wan2GPSetupWidget(QWidget):
         self.select_folder_button.setEnabled(enabled)
 
 class VideoResultItemWidget(QWidget):
-    """A widget to display a generated video with a hover-to-play preview and insert button."""
     def __init__(self, video_path, plugin, parent=None):
         super().__init__(parent)
         self.video_path = video_path
@@ -377,25 +694,21 @@ class WgpDesktopPluginWidget(QWidget):
         self.full_resolution_choices = []
         self.main_config = {}
         self.processed_files = set()
+        self.dynamic_inputs_config = {}
+        self.advanced_tabs_widget = None
         
         self.load_main_config()
+        self.ui_builder = DynamicUiBuilder(self)
         self.setup_ui()
         self.apply_initial_config()
         self.connect_signals()
         self.init_wgp_state()
 
     def _get_queue_data_for_table(self, queue):
-        """
-        Takes the raw queue from wgp.py's state and formats it for the QTableWidget.
-        This replaces the functionality of the removed wgp.get_queue_table.
-        """
         data = []
-        # In wgp, the first item in the queue is the one currently being processed
-        # or the next one up. The UI should only show items *after* the current one.
         if len(queue) <= 1:
             return data
 
-        # Iterate from the second item onwards
         for item in queue[1:]:
             repeats = item.get('repeats', "1")
             prompt = item.get('prompt', "")
@@ -456,6 +769,26 @@ class WgpDesktopPluginWidget(QWidget):
         hbox.addWidget(value_edit)
         return container
 
+    def _create_slider_with_label_dynamic(self, name, min_val, max_val, initial_val, scale=1.0, precision=1, label_text=""):
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(0,0,0,0)
+        
+        label = QLabel(label_text)
+        layout.addWidget(label)
+        
+        slider_container = self._create_slider_with_label(name, int(min_val*scale), int(max_val*scale), initial_val, scale, precision)
+        
+        self.widgets[name] = self.widgets[name]
+        self.dynamic_inputs_config[name] = {
+            'type': 'slider',
+            'widget': self.widgets[name],
+            'scale': scale
+        }
+        
+        layout.addWidget(slider_container)
+        return container
+
     def _create_file_input(self, name, label_text):
         container = self.create_widget(QWidget, f"{name}_container")
         vbox = QVBoxLayout(container)
@@ -497,7 +830,6 @@ class WgpDesktopPluginWidget(QWidget):
         hbox.addWidget(clear_button)
         vbox.addWidget(input_widget)
 
-        # Preview Widget
         preview_container = self.create_widget(QWidget, f"{name}_preview_container")
         preview_hbox = QHBoxLayout(preview_container)
         preview_hbox.setContentsMargins(0, 0, 0, 0)
@@ -562,7 +894,7 @@ class WgpDesktopPluginWidget(QWidget):
                 if player:
                     player.setSource(QUrl.fromLocalFile(first_path))
 
-            else: # Audio or other
+            else:
                 preview_label = self.widgets.get(f"{name}_preview")
                 if preview_label:
                     preview_label.setText(os.path.basename(path))
@@ -648,17 +980,9 @@ class WgpDesktopPluginWidget(QWidget):
         inputs_layout.addLayout(denoising_row)
         options_layout.addWidget(inputs_group)
         self.advanced_group = self.create_widget(QGroupBox, 'advanced_group', "Advanced Options")
-        advanced_layout = QVBoxLayout(self.advanced_group)
-        advanced_tabs = self.create_widget(QTabWidget, 'advanced_tabs')
-        advanced_layout.addWidget(advanced_tabs)
-        self._setup_adv_tab_general(advanced_tabs)
-        self._setup_adv_tab_loras(advanced_tabs)
-        self._setup_adv_tab_speed(advanced_tabs)
-        self._setup_adv_tab_postproc(advanced_tabs)
-        self._setup_adv_tab_audio(advanced_tabs)
-        self._setup_adv_tab_quality(advanced_tabs)
-        self._setup_adv_tab_sliding_window(advanced_tabs)
-        self._setup_adv_tab_misc(advanced_tabs)
+        self.adv_layout = QVBoxLayout(self.advanced_group)
+        # Advanced tabs will be dynamically populated in refresh_ui_from_model_change
+        
         options_layout.addWidget(self.advanced_group)
         scroll_area.setMinimumHeight(options_widget.sizeHint().height()-260)
         btn_layout = QHBoxLayout()
@@ -714,237 +1038,6 @@ class WgpDesktopPluginWidget(QWidget):
         queue_btn_layout.addWidget(self.clear_queue_btn)
         queue_btn_layout.addWidget(self.abort_btn)
         right_layout.addLayout(queue_btn_layout)
-
-    def _setup_adv_tab_general(self, tabs):
-        tab = QWidget()
-        tabs.addTab(tab, "General")
-        layout = QFormLayout(tab)
-        self.widgets['adv_general_layout'] = layout
-        guidance_group = QGroupBox("Guidance")
-        guidance_layout = self.create_widget(QFormLayout, 'guidance_layout', guidance_group)
-        guidance_layout.addRow("Guidance (CFG):", self._create_slider_with_label('guidance_scale', 10, 200, 5.0, 10.0, 1))
-        self.widgets['guidance_phases_row_index'] = guidance_layout.rowCount()
-        guidance_layout.addRow("Guidance Phases:", self.create_widget(QComboBox, 'guidance_phases'))
-        self.widgets['model_switch_phase_row_index'] = guidance_layout.rowCount()
-        guidance_layout.addRow("Model Switch Phase:", self.create_widget(QComboBox, 'model_switch_phase'))
-        self.widgets['guidance2_row_index'] = guidance_layout.rowCount()
-        guidance_layout.addRow("Guidance 2:", self._create_slider_with_label('guidance2_scale', 10, 200, 5.0, 10.0, 1))
-        self.widgets['guidance3_row_index'] = guidance_layout.rowCount()
-        guidance_layout.addRow("Guidance 3:", self._create_slider_with_label('guidance3_scale', 10, 200, 5.0, 10.0, 1))
-        self.widgets['switch_thresh_row_index'] = guidance_layout.rowCount()
-        guidance_layout.addRow("Switch Threshold:", self._create_slider_with_label('switch_threshold', 0, 1000, 0, 1.0, 0))
-        self.widgets['switch_thresh2_row_index'] = guidance_layout.rowCount()
-        guidance_layout.addRow("Switch Threshold 2:", self._create_slider_with_label('switch_threshold2', 0, 1000, 0, 1.0, 0))
-        layout.addRow(guidance_group)
-        chatter_group = self.create_widget(QGroupBox, 'chatter_group', "Chatterbox / TTS Options")
-        chatter_layout = QFormLayout(chatter_group)
-        chatter_layout.addRow("Pace:", self._create_slider_with_label('pace', 20, 100, 0.5, 100.0, 2))
-        chatter_layout.addRow("Exaggeration:", self._create_slider_with_label('exaggeration', 25, 200, 0.5, 100.0, 2))
-        chatter_layout.addRow("Temperature:", self._create_slider_with_label('temperature', 10, 150, 0.8, 100.0, 2))
-        layout.addRow(chatter_group)
-        chatter_group.setVisible(False)
-        nag_group = self.create_widget(QGroupBox, 'nag_group', "NAG (Negative Adversarial Guidance)")
-        nag_layout = QFormLayout(nag_group)
-        nag_layout.addRow("NAG Scale:", self._create_slider_with_label('NAG_scale', 10, 200, 1.0, 10.0, 1))
-        nag_layout.addRow("NAG Tau:", self._create_slider_with_label('NAG_tau', 10, 50, 3.5, 10.0, 1))
-        nag_layout.addRow("NAG Alpha:", self._create_slider_with_label('NAG_alpha', 0, 20, 0.5, 10.0, 1))
-        layout.addRow(nag_group)
-        self.widgets['solver_row_container'] = QWidget()
-        solver_hbox = QHBoxLayout(self.widgets['solver_row_container'])
-        solver_hbox.setContentsMargins(0,0,0,0)
-        solver_hbox.addWidget(QLabel("Sampler Solver:"))
-        solver_hbox.addWidget(self.create_widget(QComboBox, 'sample_solver'))
-        layout.addRow(self.widgets['solver_row_container'])
-        self.widgets['flow_shift_row_index'] = layout.rowCount()
-        layout.addRow("Shift Scale:", self._create_slider_with_label('flow_shift', 10, 250, 3.0, 10.0, 1))
-        self.widgets['audio_guidance_row_index'] = layout.rowCount()
-        layout.addRow("Audio Guidance:", self._create_slider_with_label('audio_guidance_scale', 10, 200, 4.0, 10.0, 1))
-        
-        self.widgets['alt_guidance_row_index'] = layout.rowCount()
-        layout.addRow("Alt Guidance:", self._create_slider_with_label('alt_guidance_scale', 10, 200, 1.0, 10.0, 1))
-
-        self.widgets['repeat_generation_row_index'] = layout.rowCount()
-        layout.addRow("Repeat Generations:", self._create_slider_with_label('repeat_generation', 1, 25, 1, 1.0, 0))
-        combo = self.create_widget(QComboBox, 'multi_images_gen_type')
-        combo.addItem("Generate all combinations", 0)
-        combo.addItem("Match images and texts", 1)
-        self.widgets['multi_images_gen_type_row_index'] = layout.rowCount()
-        layout.addRow("Multi-Image Mode:", combo)
-
-    def _setup_adv_tab_loras(self, tabs):
-        tab = QWidget()
-        tabs.addTab(tab, "Loras")
-        layout = QVBoxLayout(tab)
-        layout.addWidget(QLabel("Available Loras (Ctrl+Click to select multiple):"))
-        lora_list = self.create_widget(QListWidget, 'activated_loras')
-        lora_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
-        layout.addWidget(lora_list) 
-        layout.addWidget(QLabel("Loras Multipliers:"))
-        layout.addWidget(self.create_widget(QTextEdit, 'loras_multipliers'))
-
-    def _setup_adv_tab_speed(self, tabs):
-        tab = QWidget()
-        tabs.addTab(tab, "Speed")
-        layout = QFormLayout(tab)
-        combo = self.create_widget(QComboBox, 'skip_steps_cache_type')
-        combo.addItem("None", "")
-        combo.addItem("Tea Cache", "tea")
-        combo.addItem("Mag Cache", "mag")
-        layout.addRow("Cache Type:", combo)
-        combo = self.create_widget(QComboBox, 'skip_steps_multiplier')
-        combo.addItem("x1.5 speed up", 1.5)
-        combo.addItem("x1.75 speed up", 1.75)
-        combo.addItem("x2.0 speed up", 2.0)
-        combo.addItem("x2.25 speed up", 2.25)
-        combo.addItem("x2.5 speed up", 2.5)
-        layout.addRow("Acceleration:", combo)
-        layout.addRow("Start %:", self._create_slider_with_label('skip_steps_start_step_perc', 0, 100, 0, 1.0, 0))
-
-    def _setup_adv_tab_postproc(self, tabs):
-        tab = QWidget()
-        tabs.addTab(tab, "Post-Processing")
-        layout = QFormLayout(tab)
-        combo = self.create_widget(QComboBox, 'temporal_upsampling')
-        combo.addItem("Disabled", "")
-        combo.addItem("Rife x2 frames/s", "rife2")
-        combo.addItem("Rife x4 frames/s", "rife4")
-        layout.addRow("Temporal Upsampling:", combo)
-        combo = self.create_widget(QComboBox, 'spatial_upsampling')
-        combo.addItem("Disabled", "")
-        combo.addItem("Lanczos x1.5", "lanczos1.5")
-        combo.addItem("Lanczos x2.0", "lanczos2")
-        layout.addRow("Spatial Upsampling:", combo)
-        layout.addRow("Film Grain Intensity:", self._create_slider_with_label('film_grain_intensity', 0, 100, 0, 100.0, 2))
-        layout.addRow("Film Grain Saturation:", self._create_slider_with_label('film_grain_saturation', 0, 100, 0.5, 100.0, 2))
-
-    def _setup_adv_tab_audio(self, tabs):
-        tab = QWidget()
-        tabs.addTab(tab, "Audio")
-        layout = QFormLayout(tab)
-        combo = self.create_widget(QComboBox, 'MMAudio_setting')
-        combo.addItem("Disabled", 0)
-        combo.addItem("Enabled", 1)
-        layout.addRow("MMAudio:", combo)
-        layout.addWidget(self.create_widget(QLineEdit, 'MMAudio_prompt', placeholderText="MMAudio Prompt"))
-        layout.addWidget(self.create_widget(QLineEdit, 'MMAudio_neg_prompt', placeholderText="MMAudio Negative Prompt"))
-        layout.addRow(self._create_file_input('audio_source', "Custom Soundtrack"))
-        
-        layout.addRow("Duration (s):", self._create_slider_with_label('duration_seconds', 0, 240, 0, 1.0, 0))
-        layout.addRow("Pause (s):", self._create_slider_with_label('pause_seconds', 0, 200, 0.0, 100.0, 2))
-        layout.addRow("Top-k:", self._create_slider_with_label('top_k', 0, 100, 50, 1.0, 0))
-        
-        self.widgets['audio_scale_row_index'] = layout.rowCount()
-        layout.addRow("Audio Scale:", self._create_slider_with_label('audio_scale', 0, 100, 1.0, 100.0, 2))
-
-    def _setup_adv_tab_quality(self, tabs):
-        tab = QWidget()
-        tabs.addTab(tab, "Quality")
-        layout = QVBoxLayout(tab)
-
-        slg_group = self.create_widget(QGroupBox, 'slg_group', "Skip Layer Guidance")
-        slg_layout = QFormLayout(slg_group)
-        slg_combo = self.create_widget(QComboBox, 'slg_switch')
-        slg_combo.addItem("OFF", 0)
-        slg_combo.addItem("ON", 1)
-        slg_layout.addRow("Enable SLG:", slg_combo)
-        
-        self.widgets['slg_layers'] = self.create_widget(QListWidget, 'slg_layers')
-        self.widgets['slg_layers'].setSelectionMode(QListWidget.SelectionMode.MultiSelection)
-        self.widgets['slg_layers'].setFixedHeight(100)
-        for i in range(40):
-            self.widgets['slg_layers'].addItem(str(i))
-        slg_layout.addRow("Skip Layers:", self.widgets['slg_layers'])
-
-        slg_layout.addRow("Start %:", self._create_slider_with_label('slg_start_perc', 0, 100, 10, 1.0, 0))
-        slg_layout.addRow("End %:", self._create_slider_with_label('slg_end_perc', 0, 100, 90, 1.0, 0))
-        layout.addWidget(slg_group)
-
-        general_q_group = QGroupBox("General Quality Settings")
-        general_q_layout = QFormLayout(general_q_group)
-        self.widgets['quality_form_layout'] = general_q_layout 
-
-        apg_combo = self.create_widget(QComboBox, 'apg_switch')
-        apg_combo.addItem("OFF", 0)
-        apg_combo.addItem("ON", 1)
-        self.widgets['apg_switch_row_index'] = general_q_layout.rowCount()
-        general_q_layout.addRow("Adaptive Projected Guidance:", apg_combo)
-
-        cfg_star_combo = self.create_widget(QComboBox, 'cfg_star_switch')
-        cfg_star_combo.addItem("OFF", 0)
-        cfg_star_combo.addItem("ON", 1)
-        self.widgets['cfg_star_switch_row_index'] = general_q_layout.rowCount()
-        general_q_layout.addRow("Classifier-Free Guidance Star:", cfg_star_combo)
-
-        self.widgets['cfg_zero_step_row_index'] = general_q_layout.rowCount()
-        general_q_layout.addRow("CFG Zero below Layer:", self._create_slider_with_label('cfg_zero_step', -1, 39, -1, 1.0, 0))
-
-        combo = self.create_widget(QComboBox, 'min_frames_if_references')
-        combo.addItem("Disabled (1 frame)", 1)
-        combo.addItem("Generate 5 frames", 5)
-        combo.addItem("Generate 9 frames", 9)
-        combo.addItem("Generate 13 frames", 13)
-        combo.addItem("Generate 17 frames", 17)
-        self.widgets['min_frames_if_references_row_index'] = general_q_layout.rowCount()
-        general_q_layout.addRow("Min Frames for Quality:", combo)
-
-        self.widgets['motion_amplitude_row_index'] = general_q_layout.rowCount()
-        general_q_layout.addRow("Motion Amplitude:", self._create_slider_with_label('motion_amplitude', 100, 140, 1.0, 100.0, 2))
-
-        layout.addWidget(general_q_group)
-
-        sr_group = self.create_widget(QGroupBox, 'sr_group', "Self-Refining Video Sampling (PnP)")
-        sr_layout = QFormLayout(sr_group)
-        sr_combo = self.create_widget(QComboBox, 'self_refiner_setting')
-        sr_combo.addItem("Disabled", 0)
-        sr_combo.addItem("Enabled with P1-Norm", 1)
-        sr_combo.addItem("Enabled with P2-Norm", 2)
-        sr_layout.addRow("Self Refiner:", sr_combo)
-        sr_layout.addRow("P&P Plan:", self.create_widget(QLineEdit, 'self_refiner_plan'))
-        sr_layout.addRow("Uncertainty Threshold:", self._create_slider_with_label('self_refiner_f_uncertainty', 0, 100, 0.1, 100.0, 2))
-        sr_layout.addRow("Certainty Skip %:", self._create_slider_with_label('self_refiner_certain_percentage', 0, 1000, 0.999, 1000.0, 3))
-        layout.addWidget(sr_group)
-
-    def _setup_adv_tab_sliding_window(self, tabs):
-        tab = QWidget()
-        self.widgets['sliding_window_tab_index'] = tabs.count()
-        tabs.addTab(tab, "Sliding Window")
-        layout = QFormLayout(tab)
-        layout.addRow("Window Size:", self._create_slider_with_label('sliding_window_size', 5, 257, 129, 1.0, 0))
-        layout.addRow("Overlap:", self._create_slider_with_label('sliding_window_overlap', 1, 97, 5, 1.0, 0))
-        layout.addRow("Color Correction:", self._create_slider_with_label('sliding_window_color_correction_strength', 0, 100, 0, 100.0, 2))
-        layout.addRow("Overlap Noise:", self._create_slider_with_label('sliding_window_overlap_noise', 0, 150, 20, 1.0, 0))
-        layout.addRow("Discard Last Frames:", self._create_slider_with_label('sliding_window_discard_last_frames', 0, 20, 0, 1.0, 0))
-
-    def _setup_adv_tab_misc(self, tabs):
-        tab = QWidget()
-        tabs.addTab(tab, "Misc")
-        layout = QFormLayout(tab)
-        self.widgets['misc_layout'] = layout
-        riflex_combo = self.create_widget(QComboBox, 'RIFLEx_setting')
-        riflex_combo.addItem("Auto", 0)
-        riflex_combo.addItem("Always ON", 1)
-        riflex_combo.addItem("Always OFF", 2)
-        self.widgets['riflex_row_index'] = layout.rowCount()
-        layout.addRow("RIFLEx Setting:", riflex_combo)
-        fps_combo = self.create_widget(QComboBox, 'force_fps')
-        layout.addRow("Force FPS:", fps_combo)
-        profile_combo = self.create_widget(QComboBox, 'override_profile')
-        profile_combo.addItem("Default Profile", -1)
-        for text, val in wgp.memory_profile_choices: profile_combo.addItem(text.split(':')[0], val)
-        layout.addRow("Override Memory Profile:", profile_combo)
-        
-        attn_combo = self.create_widget(QComboBox, 'override_attention')
-        attn_combo.addItem("Default Attention Mode", "")
-        for label, val in wgp.attention_modes_choices:
-             attn_combo.addItem(label.split(':')[0], val)
-        layout.addRow("Override Attention Mode:", attn_combo)
-
-        layout.addRow("Output Filename:", self.create_widget(QLineEdit, 'output_filename', placeholderText="Leave blank for auto naming"))
-
-        combo = self.create_widget(QComboBox, 'multi_prompts_gen_type')
-        combo.addItem("Generate new Video per line", 0)
-        combo.addItem("Use line for new Sliding Window", 1)
-        layout.addRow("Multi-Prompt Mode:", combo)
 
     def setup_config_tab(self):
         config_tab = QWidget()
@@ -1112,7 +1205,6 @@ class WgpDesktopPluginWidget(QWidget):
                     initial_model = next(iter(wgp.models_def))
 
             state_dict = {}
-            # Using new wgp.py logic for filename
             state_dict["model_filename"] = wgp.get_model_filename(initial_model, wgp.transformer_quantization, wgp.transformer_dtype_policy)
             state_dict["model_type"] = initial_model
             state_dict["advanced"] = wgp.advanced
@@ -1157,25 +1249,6 @@ class WgpDesktopPluginWidget(QWidget):
             model_def = wgp.get_model_def(model_type)
             base_model_type = wgp.get_base_model_type(model_type)
             model_filename = self.state.get('model_filename', '')
-
-            image_outputs = model_def.get("image_outputs", False)
-            audio_only = model_def.get("audio_only", False)
-            vace = wgp.test_vace_module(model_type)
-            t2v = base_model_type in ['t2v', 't2v_2_2']
-            i2v = wgp.test_class_i2v(model_type)
-            fantasy = base_model_type in ["fantasy"]
-            multitalk = model_def.get("multitalk_class", False)
-            any_audio_guidance = fantasy or multitalk
-            sliding_window_enabled = wgp.test_any_sliding_window(model_type)
-            recammaster = base_model_type in ["recam_1.3B"]
-            ltxv = "ltxv" in model_filename
-            diffusion_forcing = "diffusion_forcing" in model_filename
-            any_skip_layer_guidance = model_def.get("skip_layer_guidance", False)
-            any_cfg_zero = model_def.get("cfg_zero", False)
-            any_cfg_star = model_def.get("cfg_star", False)
-            any_apg = model_def.get("adaptive_projected_guidance", False)
-            v2i_switch_supported = model_def.get("v2i_switch_supported", False)
-            any_motion_amplitude = model_def.get("motion_amplitude", False) and not image_outputs
 
             self._update_generation_mode_visibility(model_def)
 
@@ -1229,287 +1302,64 @@ class WgpDesktopPluginWidget(QWidget):
             self.widgets['audio_guide2_container'].setVisible(any_audio_prompt and not one_speaker)
             self.widgets['custom_guide_container'].setVisible(custom_guide_def is not None)
 
-            guidance_layout = self.widgets['guidance_layout']
-            guidance_max = model_def.get("guidance_max_phases", 1)
-            guidance_layout.setRowVisible(self.widgets['guidance_phases_row_index'], guidance_max > 1)
+            denoising_val = ui_defaults.get("denoising_strength", 0.5)
+            self.widgets['denoising_strength'].setValue(int(denoising_val * 100))
+            self.widgets['denoising_strength_label'].setText(f"{denoising_val:.2f}")
 
-            adv_general_layout = self.widgets['adv_general_layout']
-            adv_general_layout.setRowVisible(self.widgets['flow_shift_row_index'], not image_outputs)
-            adv_general_layout.setRowVisible(self.widgets['audio_guidance_row_index'], any_audio_guidance)
-            adv_general_layout.setRowVisible(self.widgets['repeat_generation_row_index'], not image_outputs)
-            adv_general_layout.setRowVisible(self.widgets['multi_images_gen_type_row_index'], i2v)
+            if self.advanced_tabs_widget:
+                self.adv_layout.removeWidget(self.advanced_tabs_widget)
+                self.advanced_tabs_widget.deleteLater()
+                self.advanced_tabs_widget = None
             
-            self.widgets['slg_group'].setVisible(any_skip_layer_guidance)
-            quality_form_layout = self.widgets['quality_form_layout']
-            quality_form_layout.setRowVisible(self.widgets['apg_switch_row_index'], any_apg)
-            quality_form_layout.setRowVisible(self.widgets['cfg_star_switch_row_index'], any_cfg_star)
-            quality_form_layout.setRowVisible(self.widgets['cfg_zero_step_row_index'], any_cfg_zero)
-            quality_form_layout.setRowVisible(self.widgets['min_frames_if_references_row_index'], v2i_switch_supported and image_outputs)
-            quality_form_layout.setRowVisible(self.widgets['motion_amplitude_row_index'], any_motion_amplitude)
-
-            self.widgets['advanced_tabs'].setTabVisible(self.widgets['sliding_window_tab_index'], sliding_window_enabled and not image_outputs)
+            self.dynamic_inputs_config.clear()
             
-            misc_layout = self.widgets['misc_layout']
-            misc_layout.setRowVisible(self.widgets['riflex_row_index'], not (recammaster or ltxv or diffusion_forcing))
+            tabs_widget = self.ui_builder.build_advanced_tab(model_type)
+            if tabs_widget:
+                self.adv_layout.addWidget(tabs_widget)
+                self.advanced_tabs_widget = tabs_widget
+            else:
+                self.adv_layout.addWidget(QLabel("Advanced options unavailable."))
 
-            index = self.widgets['multi_images_gen_type'].findData(ui_defaults.get('multi_images_gen_type', 0))
-            if index != -1: self.widgets['multi_images_gen_type'].setCurrentIndex(index)
-
-            guidance_val = ui_defaults.get("guidance_scale", 5.0)
-            self.widgets['guidance_scale'].setValue(int(guidance_val * 10))
-            self.widgets['guidance_scale_label'].setText(f"{guidance_val:.1f}")
-
-            guidance2_val = ui_defaults.get("guidance2_scale", 5.0)
-            self.widgets['guidance2_scale'].setValue(int(guidance2_val * 10))
-            self.widgets['guidance2_scale_label'].setText(f"{guidance2_val:.1f}")
-            
-            guidance3_val = ui_defaults.get("guidance3_scale", 5.0)
-            self.widgets['guidance3_scale'].setValue(int(guidance3_val * 10))
-            self.widgets['guidance3_scale_label'].setText(f"{guidance3_val:.1f}")
-            
-            self.widgets['guidance_phases'].clear()
-            if guidance_max >= 1: self.widgets['guidance_phases'].addItem("One Phase", 1)
-            if guidance_max >= 2: self.widgets['guidance_phases'].addItem("Two Phases", 2)
-            if guidance_max >= 3: self.widgets['guidance_phases'].addItem("Three Phases", 3)
-            index = self.widgets['guidance_phases'].findData(ui_defaults.get("guidance_phases", 1))
-            if index != -1: self.widgets['guidance_phases'].setCurrentIndex(index)
-            
-            switch_thresh_val = ui_defaults.get("switch_threshold", 0)
-            self.widgets['switch_threshold'].setValue(switch_thresh_val)
-            self.widgets['switch_threshold_label'].setText(str(switch_thresh_val))
-
-            switch_thresh2_val = ui_defaults.get("switch_threshold2", 0)
-            self.widgets['switch_threshold2'].setValue(switch_thresh2_val)
-            self.widgets['switch_threshold2_label'].setText(str(switch_thresh2_val))
-
-            self.widgets['model_switch_phase'].clear()
-            self.widgets['model_switch_phase'].addItem("Phase 1-2 transition", 1)
-            self.widgets['model_switch_phase'].addItem("Phase 2-3 transition", 2)
-            index = self.widgets['model_switch_phase'].findData(ui_defaults.get("model_switch_phase", 1))
-            if index != -1: self.widgets['model_switch_phase'].setCurrentIndex(index)
-
-            pace_val = ui_defaults.get('pace', 0.5)
-            self.widgets['pace'].setValue(int(pace_val * 100))
-            self.widgets['pace_label'].setText(f"{pace_val:.2f}")
-            exaggeration_val = ui_defaults.get('exaggeration', 0.5)
-            self.widgets['exaggeration'].setValue(int(exaggeration_val * 100))
-            self.widgets['exaggeration_label'].setText(f"{exaggeration_val:.2f}")
-            temperature_val = ui_defaults.get('temperature', 0.8)
-            self.widgets['temperature'].setValue(int(temperature_val * 100))
-            self.widgets['temperature_label'].setText(f"{temperature_val:.2f}")
-
-            nag_scale_val = ui_defaults.get('NAG_scale', 1.0)
-            self.widgets['NAG_scale'].setValue(int(nag_scale_val * 10))
-            self.widgets['NAG_scale_label'].setText(f"{nag_scale_val:.1f}")
-
-            nag_tau_val = ui_defaults.get('NAG_tau', 3.5)
-            self.widgets['NAG_tau'].setValue(int(nag_tau_val * 10))
-            self.widgets['NAG_tau_label'].setText(f"{nag_tau_val:.1f}")
-            
-            nag_alpha_val = ui_defaults.get('NAG_alpha', 0.5)
-            self.widgets['NAG_alpha'].setValue(int(nag_alpha_val * 10))
-            self.widgets['NAG_alpha_label'].setText(f"{nag_alpha_val:.1f}")
-
-            self.widgets['nag_group'].setVisible(vace or t2v or i2v)
-
-            self.widgets['sample_solver'].clear()
-            sampler_choices = model_def.get("sample_solvers", [])
-            self.widgets['solver_row_container'].setVisible(bool(sampler_choices))
-            if sampler_choices:
-                for label, value in sampler_choices: self.widgets['sample_solver'].addItem(label, value)
-                solver_val = ui_defaults.get('sample_solver', sampler_choices[0][1])
-                index = self.widgets['sample_solver'].findData(solver_val)
-                if index != -1: self.widgets['sample_solver'].setCurrentIndex(index)
-
-            flow_val = ui_defaults.get("flow_shift", 3.0)
-            self.widgets['flow_shift'].setValue(int(flow_val * 10))
-            self.widgets['flow_shift_label'].setText(f"{flow_val:.1f}")
-
-            audio_guidance_val = ui_defaults.get("audio_guidance_scale", 4.0)
-            self.widgets['audio_guidance_scale'].setValue(int(audio_guidance_val * 10))
-            self.widgets['audio_guidance_scale_label'].setText(f"{audio_guidance_val:.1f}")
-            
-            alt_guidance_val = ui_defaults.get("alt_guidance_scale", 1.0)
-            self.widgets['alt_guidance_scale'].setValue(int(alt_guidance_val * 10))
-            self.widgets['alt_guidance_scale_label'].setText(f"{alt_guidance_val:.1f}")
-
-            repeat_val = ui_defaults.get("repeat_generation", 1)
-            self.widgets['repeat_generation'].setValue(repeat_val)
-            self.widgets['repeat_generation_label'].setText(str(repeat_val))
+            for var_name, config in self.dynamic_inputs_config.items():
+                widget = config['widget']
+                widget.blockSignals(True)
+                val = ui_defaults.get(var_name)
+                
+                if val is not None:
+                    if config['type'] == 'slider':
+                        scale = config.get('scale', 1.0)
+                        widget.setValue(int(val * scale))
+                    elif config['type'] == 'dropdown':
+                        idx = widget.findData(val)
+                        if idx == -1: idx = widget.findText(str(val))
+                        if idx != -1: widget.setCurrentIndex(idx)
+                    elif config['type'] == 'checkbox':
+                        widget.setChecked(bool(val))
+                    elif config['type'] == 'text':
+                        if isinstance(widget, QLineEdit): widget.setText(str(val))
+                        else: widget.setPlainText(str(val))
+                    elif config['type'] == 'file':
+                        widget.setText(str(val) if val else "")
+                widget.blockSignals(False)
 
             with working_directory(wan2gp_dir):
                 available_loras, _, _, _, _, _ = wgp.setup_loras(model_type, None, wgp.get_lora_dir(model_type), "")
             self.state['loras'] = available_loras
             self.lora_map = {os.path.basename(p): p for p in available_loras}
-            lora_list_widget = self.widgets['activated_loras']
-            lora_list_widget.clear()
-            lora_list_widget.addItems(sorted(self.lora_map.keys()))
-            selected_loras = ui_defaults.get('activated_loras', [])
-            for i in range(lora_list_widget.count()):
-                item = lora_list_widget.item(i)
-                if any(item.text() == os.path.basename(p) for p in selected_loras): item.setSelected(True)
-            self.widgets['loras_multipliers'].setText(ui_defaults.get('loras_multipliers', ''))
-
-            skip_cache_val = ui_defaults.get('skip_steps_cache_type', "")
-            index = self.widgets['skip_steps_cache_type'].findData(skip_cache_val)
-            if index != -1: self.widgets['skip_steps_cache_type'].setCurrentIndex(index)
-
-            skip_mult = ui_defaults.get('skip_steps_multiplier', 1.5)
-            index = self.widgets['skip_steps_multiplier'].findData(skip_mult)
-            if index != -1: self.widgets['skip_steps_multiplier'].setCurrentIndex(index)
-
-            skip_perc_val = ui_defaults.get('skip_steps_start_step_perc', 0)
-            self.widgets['skip_steps_start_step_perc'].setValue(skip_perc_val)
-            self.widgets['skip_steps_start_step_perc_label'].setText(str(skip_perc_val))
-
-            temp_up_val = ui_defaults.get('temporal_upsampling', "")
-            index = self.widgets['temporal_upsampling'].findData(temp_up_val)
-            if index != -1: self.widgets['temporal_upsampling'].setCurrentIndex(index)
-
-            spat_up_val = ui_defaults.get('spatial_upsampling', "")
-            index = self.widgets['spatial_upsampling'].findData(spat_up_val)
-            if index != -1: self.widgets['spatial_upsampling'].setCurrentIndex(index)
-
-            film_grain_i = ui_defaults.get('film_grain_intensity', 0)
-            self.widgets['film_grain_intensity'].setValue(int(film_grain_i * 100))
-            self.widgets['film_grain_intensity_label'].setText(f"{film_grain_i:.2f}")
-
-            film_grain_s = ui_defaults.get('film_grain_saturation', 0.5)
-            self.widgets['film_grain_saturation'].setValue(int(film_grain_s * 100))
-            self.widgets['film_grain_saturation_label'].setText(f"{film_grain_s:.2f}")
-
-            self.widgets['MMAudio_setting'].setCurrentIndex(ui_defaults.get('MMAudio_setting', 0))
-            self.widgets['MMAudio_prompt'].setText(ui_defaults.get('MMAudio_prompt', ''))
-            self.widgets['MMAudio_neg_prompt'].setText(ui_defaults.get('MMAudio_neg_prompt', ''))
-
-            duration_val = ui_defaults.get('duration_seconds', 0)
-            self.widgets['duration_seconds'].setValue(int(duration_val))
-            self.widgets['duration_seconds_label'].setText(f"{duration_val:.1f}")
-
-            pause_val = ui_defaults.get('pause_seconds', 0.0)
-            self.widgets['pause_seconds'].setValue(int(pause_val * 100))
-            self.widgets['pause_seconds_label'].setText(f"{pause_val:.2f}")
-
-            top_k_val = ui_defaults.get('top_k', 50)
-            self.widgets['top_k'].setValue(int(top_k_val))
-            self.widgets['top_k_label'].setText(f"{top_k_val:.1f}")
-
-            audio_scale_val = ui_defaults.get('audio_scale', 1.0)
-            self.widgets['audio_scale'].setValue(int(audio_scale_val * 100))
-            self.widgets['audio_scale_label'].setText(f"{audio_scale_val:.2f}")
-
-            self.widgets['slg_switch'].setCurrentIndex(ui_defaults.get('slg_switch', 0))
-
-            selected_layers = ui_defaults.get('slg_layers', [])
-            list_widget = self.widgets['slg_layers']
-            for i in range(list_widget.count()):
-                item = list_widget.item(i)
-                val = int(item.text())
-                item.setSelected(val in selected_layers)
-
-            slg_start_val = ui_defaults.get('slg_start_perc', 10)
-            self.widgets['slg_start_perc'].setValue(slg_start_val)
-            self.widgets['slg_start_perc_label'].setText(str(slg_start_val))
-            slg_end_val = ui_defaults.get('slg_end_perc', 90)
-            self.widgets['slg_end_perc'].setValue(slg_end_val)
-            self.widgets['slg_end_perc_label'].setText(str(slg_end_val))
-
-            self.widgets['apg_switch'].setCurrentIndex(ui_defaults.get('apg_switch', 0))
-            self.widgets['cfg_star_switch'].setCurrentIndex(ui_defaults.get('cfg_star_switch', 0))
-
-            cfg_zero_val = ui_defaults.get('cfg_zero_step', -1)
-            self.widgets['cfg_zero_step'].setValue(cfg_zero_val)
-            self.widgets['cfg_zero_step_label'].setText(str(cfg_zero_val))
-
-            min_frames_val = ui_defaults.get('min_frames_if_references', 1)
-            index = self.widgets['min_frames_if_references'].findData(min_frames_val)
-            if index != -1: self.widgets['min_frames_if_references'].setCurrentIndex(index)
-
-            self.widgets['motion_amplitude'].setValue(int(ui_defaults.get("motion_amplitude", 1.0) * 100))
-            self.widgets['motion_amplitude_label'].setText(f"{ui_defaults.get('motion_amplitude', 1.0):.2f}")
-
-            self.widgets['self_refiner_setting'].setCurrentIndex(ui_defaults.get("self_refiner_setting", 0))
-            self.widgets['self_refiner_plan'].setText(ui_defaults.get("self_refiner_plan", ""))
-            self.widgets['self_refiner_f_uncertainty'].setValue(int(ui_defaults.get("self_refiner_f_uncertainty", 0.1) * 100))
-            self.widgets['self_refiner_f_uncertainty_label'].setText(f"{ui_defaults.get('self_refiner_f_uncertainty', 0.1):.2f}")
-            self.widgets['self_refiner_certain_percentage'].setValue(int(ui_defaults.get("self_refiner_certain_percentage", 0.999) * 1000))
-            self.widgets['self_refiner_certain_percentage_label'].setText(f"{ui_defaults.get('self_refiner_certain_percentage', 0.999):.3f}")
-
-            self.widgets['sr_group'].setVisible(model_def.get("self_refiner", False))
-
-            self.widgets['RIFLEx_setting'].setCurrentIndex(ui_defaults.get('RIFLEx_setting', 0))
-
-            fps = wgp.get_model_fps(model_type)
-            force_fps_choices = [
-                (f"Model Default ({fps} fps)", ""), ("Auto", "auto"), ("Control Video fps", "control"),
-                ("Source Video fps", "source"), ("15", "15"), ("16", "16"), ("23", "23"),
-                ("24", "24"), ("25", "25"), ("30", "30")
-            ]
-            self.widgets['force_fps'].clear()
-            for label, value in force_fps_choices: self.widgets['force_fps'].addItem(label, value)
-            force_fps_val = ui_defaults.get('force_fps', "")
-            index = self.widgets['force_fps'].findData(force_fps_val)
-            if index != -1: self.widgets['force_fps'].setCurrentIndex(index)
-
-            override_prof_val = ui_defaults.get('override_profile', -1)
-            index = self.widgets['override_profile'].findData(override_prof_val)
-            if index != -1: self.widgets['override_profile'].setCurrentIndex(index)
             
-            override_attn_val = ui_defaults.get('override_attention', "")
-            index = self.widgets['override_attention'].findData(override_attn_val)
-            if index != -1: self.widgets['override_attention'].setCurrentIndex(index)
-
-            self.widgets['output_filename'].setText(ui_defaults.get('output_filename', ""))
-
-            self.widgets['multi_prompts_gen_type'].setCurrentIndex(ui_defaults.get('multi_prompts_gen_type', 0))
-
-            denoising_val = ui_defaults.get("denoising_strength", 0.5)
-            self.widgets['denoising_strength'].setValue(int(denoising_val * 100))
-            self.widgets['denoising_strength_label'].setText(f"{denoising_val:.2f}")
-
-            sw_size = ui_defaults.get("sliding_window_size", 129)
-            self.widgets['sliding_window_size'].setValue(sw_size)
-            self.widgets['sliding_window_size_label'].setText(str(sw_size))
-
-            sw_overlap = ui_defaults.get("sliding_window_overlap", 5)
-            self.widgets['sliding_window_overlap'].setValue(sw_overlap)
-            self.widgets['sliding_window_overlap_label'].setText(str(sw_overlap))
-
-            sw_color = ui_defaults.get("sliding_window_color_correction_strength", 0)
-            self.widgets['sliding_window_color_correction_strength'].setValue(int(sw_color * 100))
-            self.widgets['sliding_window_color_correction_strength_label'].setText(f"{sw_color:.2f}")
-
-            sw_noise = ui_defaults.get("sliding_window_overlap_noise", 20)
-            self.widgets['sliding_window_overlap_noise'].setValue(sw_noise)
-            self.widgets['sliding_window_overlap_noise_label'].setText(str(sw_noise))
-            
-            sw_discard = ui_defaults.get("sliding_window_discard_last_frames", 0)
-            self.widgets['sliding_window_discard_last_frames'].setValue(sw_discard)
-            self.widgets['sliding_window_discard_last_frames_label'].setText(str(sw_discard))
+            if 'activated_loras' in self.widgets:
+                lora_list_widget = self.widgets['activated_loras']
+                lora_list_widget.clear()
+                lora_list_widget.addItems(sorted(self.lora_map.keys()))
+                selected_loras = ui_defaults.get('activated_loras', [])
+                for i in range(lora_list_widget.count()):
+                    item = lora_list_widget.item(i)
+                    if any(item.text() == os.path.basename(p) for p in selected_loras): item.setSelected(True)
 
             for widget in self.widgets.values():
                 if hasattr(widget, 'blockSignals'): widget.blockSignals(False)
                 
-            self._update_dynamic_ui()
             self._update_input_visibility()
-
-    def _update_dynamic_ui(self):
-        phases = self.widgets['guidance_phases'].currentData() or 1
-        guidance_layout = self.widgets['guidance_layout']
-        guidance_layout.setRowVisible(self.widgets['guidance2_row_index'], phases >= 2)
-        guidance_layout.setRowVisible(self.widgets['switch_thresh_row_index'], phases >= 2)
-        guidance_layout.setRowVisible(self.widgets['guidance3_row_index'], phases >= 3)
-        guidance_layout.setRowVisible(self.widgets['switch_thresh2_row_index'], phases >= 3)
-        
-        model_switch_visible = False
-        if phases >= 3:
-            model_type = self.state.get("model_type")
-            if model_type:
-                model_def = wgp.get_model_def(model_type)
-                if model_def and model_def.get("multiple_submodels", False):
-                    model_switch_visible = True
-        
-        guidance_layout.setRowVisible(self.widgets['model_switch_phase_row_index'], model_switch_visible)
 
     def _update_generation_mode_visibility(self, model_def):
         allowed = model_def.get("image_prompt_types_allowed", "")
@@ -1560,7 +1410,6 @@ class WgpDesktopPluginWidget(QWidget):
         self.widgets['model_base_type_choice'].currentIndexChanged.connect(self._on_base_type_changed)
         self.widgets['model_choice'].currentIndexChanged.connect(self._on_model_changed)
         self.widgets['resolution_group'].currentIndexChanged.connect(self._on_resolution_group_changed)
-        self.widgets['guidance_phases'].currentIndexChanged.connect(self._update_dynamic_ui)
         self.widgets['mode_t'].toggled.connect(self._update_input_visibility)
         self.widgets['mode_s'].toggled.connect(self._update_input_visibility)
         self.widgets['mode_v'].toggled.connect(self._update_input_visibility)
@@ -1739,99 +1588,96 @@ class WgpDesktopPluginWidget(QWidget):
         full_inputs['lset_name'] = ""
         full_inputs['image_mode'] = 0
         full_inputs['mode'] = ""
-        expected_keys = { "audio_guide": None, "audio_guide2": None, "image_guide": None, "image_mask": None, "speakers_locations": "", "frames_positions": "", "keep_frames_video_guide": "", "keep_frames_video_source": "", "video_guide_outpainting": "", "switch_threshold2": 0, "model_switch_phase": 1, "batch_size": 1, "control_net_weight_alt": 1.0, "image_refs_relative_size": 50, "embedded_guidance_scale": None, "model_mode": None, "control_net_weight": 1.0, "control_net_weight2": 1.0, "mask_expand": 0, "remove_background_images_ref": 0, "prompt_enhancer": "", "pace": 0.5, "exaggeration": 0.5, "temperature": 0.8, "custom_guide": None}
-        for key, default_value in expected_keys.items():
-            if key not in full_inputs: full_inputs[key] = default_value
+
+        expected_defaults = {
+            "audio_guide": None, "audio_guide2": None, "image_guide": None, "image_mask": None, 
+            "speakers_locations": "", "frames_positions": "", "keep_frames_video_guide": "", 
+            "keep_frames_video_source": "", "video_guide_outpainting": "", "switch_threshold2": 0, 
+            "model_switch_phase": 1, "batch_size": 1, "control_net_weight_alt": 1.0, 
+            "image_refs_relative_size": 50, "embedded_guidance_scale": None, "model_mode": None, 
+            "control_net_weight": 1.0, "control_net_weight2": 1.0, "mask_expand": 0, 
+            "remove_background_images_ref": 0, "prompt_enhancer": "", "pace": 0.5, 
+            "exaggeration": 0.5, "temperature": 0.8, "custom_guide": None, "audio_source": None, 
+            "image_refs": None, "activated_loras": [], "loras_multipliers": "",
+            "duration_seconds": 0.0, "pause_seconds": 0.0, "top_k": 50
+        }
         
-        full_inputs['prompt'] = self.widgets['prompt'].toPlainText()
-        full_inputs['negative_prompt'] = self.widgets['negative_prompt'].toPlainText()
+        for key, val in expected_defaults.items():
+            if key not in full_inputs:
+                full_inputs[key] = val
+
+        for key in ['prompt', 'negative_prompt']:
+            w = self.widgets.get(key)
+            if isinstance(w, QTextEdit):
+                full_inputs[key] = w.toPlainText()
+            elif isinstance(w, QLineEdit):
+                full_inputs[key] = w.text()
+
         full_inputs['resolution'] = self.widgets['resolution'].currentData()
         full_inputs['video_length'] = self.widgets['video_length'].value()
         full_inputs['num_inference_steps'] = self.widgets['num_inference_steps'].value()
-        full_inputs['seed'] = int(self.widgets['seed'].text())
+
+        seed_w = self.widgets.get('seed')
+        if isinstance(seed_w, QSlider):
+            full_inputs['seed'] = seed_w.value()
+        elif hasattr(seed_w, 'text'):
+            try:
+                txt = seed_w.text()
+                full_inputs['seed'] = int(txt) if txt.strip() else -1
+            except (ValueError, TypeError):
+                full_inputs['seed'] = -1
+
         image_prompt_type = ""
         video_prompt_type = ""
         if self.widgets['mode_t'].isChecked(): image_prompt_type = ""
         elif self.widgets['mode_s'].isChecked(): image_prompt_type = 'S'
         elif self.widgets['mode_v'].isChecked(): image_prompt_type = 'V'
         elif self.widgets['mode_l'].isChecked(): image_prompt_type = 'L'
-        if self.widgets['image_end_checkbox'].isVisible() and self.widgets['image_end_checkbox'].isChecked(): image_prompt_type += 'E'
-        if self.widgets['control_video_checkbox'].isVisible() and self.widgets['control_video_checkbox'].isChecked(): video_prompt_type += 'V'
-        if self.widgets['ref_image_checkbox'].isVisible() and self.widgets['ref_image_checkbox'].isChecked(): video_prompt_type += 'I'
+        
+        if self.widgets['image_end_checkbox'].isVisible() and self.widgets['image_end_checkbox'].isChecked(): 
+            image_prompt_type += 'E'
+        if self.widgets['control_video_checkbox'].isVisible() and self.widgets['control_video_checkbox'].isChecked(): 
+            video_prompt_type += 'V'
+        if self.widgets['ref_image_checkbox'].isVisible() and self.widgets['ref_image_checkbox'].isChecked(): 
+            video_prompt_type += 'I'
+            
         full_inputs['image_prompt_type'] = image_prompt_type
         full_inputs['video_prompt_type'] = video_prompt_type
-        for name in ['video_source', 'image_start', 'image_end', 'video_guide', 'video_mask', 'audio_source', 'audio_guide', 'audio_guide2', 'custom_guide']:
-            if name in self.widgets: full_inputs[name] = self.widgets[name].text() or None
+
+        for name in ['video_source', 'image_start', 'image_end', 'video_guide', 'video_mask', 
+                     'audio_source', 'audio_guide', 'audio_guide2', 'custom_guide']:
+            w = self.widgets.get(name)
+            if w and hasattr(w, 'text'):
+                full_inputs[name] = w.text() or None
 
         audio_prompt_type = ""
         if full_inputs.get("audio_guide"): audio_prompt_type += "A"
         if full_inputs.get("audio_guide2"): audio_prompt_type += "B"
         full_inputs['audio_prompt_type'] = audio_prompt_type
 
-        paths = self.widgets['image_refs'].text().split(';')
-        full_inputs['image_refs'] = [p.strip() for p in paths if p.strip()] if paths and paths[0] else None
-        full_inputs['denoising_strength'] = self.widgets['denoising_strength'].value() / 100.0
-        full_inputs['guidance_scale'] = self.widgets['guidance_scale'].value() / 10.0
-        full_inputs['guidance_phases'] = self.widgets['guidance_phases'].currentData()
-        full_inputs['model_switch_phase'] = self.widgets['model_switch_phase'].currentData()
-        full_inputs['guidance2_scale'] = self.widgets['guidance2_scale'].value() / 10.0
-        full_inputs['guidance3_scale'] = self.widgets['guidance3_scale'].value() / 10.0
-        full_inputs['switch_threshold'] = self.widgets['switch_threshold'].value()
-        full_inputs['switch_threshold2'] = self.widgets['switch_threshold2'].value()
-        full_inputs['pace'] = self.widgets['pace'].value() / 100.0
-        full_inputs['exaggeration'] = self.widgets['exaggeration'].value() / 100.0
-        full_inputs['temperature'] = self.widgets['temperature'].value() / 100.0
-        full_inputs['NAG_scale'] = self.widgets['NAG_scale'].value() / 10.0
-        full_inputs['NAG_tau'] = self.widgets['NAG_tau'].value() / 10.0
-        full_inputs['NAG_alpha'] = self.widgets['NAG_alpha'].value() / 10.0
-        full_inputs['sample_solver'] = self.widgets['sample_solver'].currentData()
-        full_inputs['flow_shift'] = self.widgets['flow_shift'].value() / 10.0
-        full_inputs['audio_guidance_scale'] = self.widgets['audio_guidance_scale'].value() / 10.0
-        full_inputs['alt_guidance_scale'] = self.widgets['alt_guidance_scale'].value() / 10.0
-        full_inputs['repeat_generation'] = self.widgets['repeat_generation'].value()
-        full_inputs['multi_images_gen_type'] = self.widgets['multi_images_gen_type'].currentData()
-        selected_items = self.widgets['activated_loras'].selectedItems()
-        full_inputs['activated_loras'] = [self.lora_map[item.text()] for item in selected_items if item.text() in self.lora_map]
-        full_inputs['loras_multipliers'] = self.widgets['loras_multipliers'].toPlainText()
-        full_inputs['skip_steps_cache_type'] = self.widgets['skip_steps_cache_type'].currentData()
-        full_inputs['skip_steps_multiplier'] = self.widgets['skip_steps_multiplier'].currentData()
-        full_inputs['skip_steps_start_step_perc'] = self.widgets['skip_steps_start_step_perc'].value()
-        full_inputs['temporal_upsampling'] = self.widgets['temporal_upsampling'].currentData()
-        full_inputs['spatial_upsampling'] = self.widgets['spatial_upsampling'].currentData()
-        full_inputs['film_grain_intensity'] = self.widgets['film_grain_intensity'].value() / 100.0
-        full_inputs['film_grain_saturation'] = self.widgets['film_grain_saturation'].value() / 100.0
-        full_inputs['MMAudio_setting'] = self.widgets['MMAudio_setting'].currentData()
-        full_inputs['MMAudio_prompt'] = self.widgets['MMAudio_prompt'].text()
-        full_inputs['MMAudio_neg_prompt'] = self.widgets['MMAudio_neg_prompt'].text()
-        full_inputs['duration_seconds'] = self.widgets['duration_seconds'].value()
-        full_inputs['pause_seconds'] = self.widgets['pause_seconds'].value() / 100.0
-        full_inputs['top_k'] = self.widgets['top_k'].value()
-        full_inputs['audio_scale'] = self.widgets['audio_scale'].value() / 100.0
-        full_inputs['RIFLEx_setting'] = self.widgets['RIFLEx_setting'].currentData()
-        full_inputs['force_fps'] = self.widgets['force_fps'].currentData()
-        full_inputs['override_profile'] = self.widgets['override_profile'].currentData()
-        full_inputs['override_attention'] = self.widgets['override_attention'].currentData()
-        full_inputs['output_filename'] = self.widgets['output_filename'].text()
-        full_inputs['multi_prompts_gen_type'] = self.widgets['multi_prompts_gen_type'].currentData()
-        full_inputs['slg_switch'] = self.widgets['slg_switch'].currentData()
-        selected_items = self.widgets['slg_layers'].selectedItems()
-        full_inputs['slg_layers'] = [int(item.text()) for item in selected_items]
-        full_inputs['slg_start_perc'] = self.widgets['slg_start_perc'].value()
-        full_inputs['slg_end_perc'] = self.widgets['slg_end_perc'].value()
-        full_inputs['apg_switch'] = self.widgets['apg_switch'].currentData()
-        full_inputs['cfg_star_switch'] = self.widgets['cfg_star_switch'].currentData()
-        full_inputs['cfg_zero_step'] = self.widgets['cfg_zero_step'].value()
-        full_inputs['min_frames_if_references'] = self.widgets['min_frames_if_references'].currentData()
-        full_inputs['sliding_window_size'] = self.widgets['sliding_window_size'].value()
-        full_inputs['sliding_window_overlap'] = self.widgets['sliding_window_overlap'].value()
-        full_inputs['sliding_window_color_correction_strength'] = self.widgets['sliding_window_color_correction_strength'].value() / 100.0
-        full_inputs['sliding_window_overlap_noise'] = self.widgets['sliding_window_overlap_noise'].value()
-        full_inputs['sliding_window_discard_last_frames'] = self.widgets['sliding_window_discard_last_frames'].value()
-        full_inputs['motion_amplitude'] = self.widgets['motion_amplitude'].value() / 100.0
-        full_inputs['self_refiner_setting'] = self.widgets['self_refiner_setting'].currentData()
-        full_inputs['self_refiner_plan'] = self.widgets['self_refiner_plan'].text()
-        full_inputs['self_refiner_f_uncertainty'] = self.widgets['self_refiner_f_uncertainty'].value() / 100.0
-        full_inputs['self_refiner_certain_percentage'] = self.widgets['self_refiner_certain_percentage'].value() / 1000.0
+        refs_w = self.widgets.get('image_refs')
+        if refs_w and hasattr(refs_w, 'text'):
+            paths = refs_w.text().split(';')
+            full_inputs['image_refs'] = [p.strip() for p in paths if p.strip()] if paths and paths[0] else None
+
+        for var_name, config in self.dynamic_inputs_config.items():
+            widget = config['widget']
+            if config['type'] == 'slider':
+                scale = config.get('scale', 1.0)
+                full_inputs[var_name] = widget.value() / scale
+            elif config['type'] == 'dropdown':
+                full_inputs[var_name] = widget.currentData()
+            elif config['type'] == 'checkbox':
+                full_inputs[var_name] = 1 if widget.isChecked() else 0
+            elif config['type'] == 'text':
+                full_inputs[var_name] = widget.text() if isinstance(widget, QLineEdit) else widget.toPlainText()
+            elif config['type'] == 'file':
+                full_inputs[var_name] = widget.text() or None
+
+        if 'activated_loras' in self.widgets:
+            selected_items = self.widgets['activated_loras'].selectedItems()
+            full_inputs['activated_loras'] = [self.lora_map[item.text()] for item in selected_items if item.text() in self.lora_map]
+        
         return full_inputs
 
     def _prepare_state_for_generation(self):
@@ -1855,9 +1701,11 @@ class WgpDesktopPluginWidget(QWidget):
             
     def _add_task_to_queue(self):
         all_inputs = self.collect_inputs()
-        for key in ['type', 'settings_version', 'is_image', 'video_quality', 'image_quality', 'base_model_type']: all_inputs.pop(key, None)
-        all_inputs['state'] = self.state
-        wgp.set_model_settings(self.state, self.state['model_type'], all_inputs)
+        sig = inspect.signature(wgp.generate_video)
+        valid_keys = set(sig.parameters.keys())
+        params = {k: v for k, v in all_inputs.items() if k in valid_keys}
+        params['state'] = self.state
+        wgp.set_model_settings(self.state, self.state['model_type'], params)
         self.state["validate_success"] = 1
         wgp.process_prompt_and_add_tasks(self.state, 0, self.state['model_type'])
         self.update_queue_table()
