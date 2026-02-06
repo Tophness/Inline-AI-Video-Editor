@@ -11,12 +11,6 @@ from pathlib import Path
 from contextlib import contextmanager
 import ffmpeg
 
-# --- Start of Gradio Hijacking ---
-# This block creates a mock Gradio module. When wgp.py is imported,
-# all calls to `gr.*` will be intercepted by these mock objects,
-# preventing any UI from being built and allowing us to use the
-# backend logic directly.
-
 class MockApp:
     pass
 
@@ -77,7 +71,6 @@ mock_plugin_module.PluginManager = MockPluginManager
 mock_plugin_module.WAN2GPApplication = MockWAN2GPApplication
 mock_plugin_module.SYSTEM_PLUGINS = []
 sys.modules['shared.utils.plugins'] = mock_plugin_module
-# --- End of Gradio Hijacking ---
 
 wgp = None
 root_dir = Path(__file__).parent.parent.parent
@@ -647,13 +640,14 @@ class WgpDesktopPluginWidget(QWidget):
         inputs_layout.addWidget(self._create_file_input('video_guide', "Control Video"))
         inputs_layout.addWidget(self._create_file_input('video_mask', "Video Mask"))
         inputs_layout.addWidget(self._create_file_input('image_refs', "Reference Image(s)"))
+        inputs_layout.addWidget(self._create_file_input('audio_guide', "Audio Guide (Voice 1)"))
+        inputs_layout.addWidget(self._create_file_input('audio_guide2', "Audio Guide (Voice 2)"))
+        inputs_layout.addWidget(self._create_file_input('custom_guide', "Custom Guide"))
         denoising_row = QFormLayout()
         denoising_row.addRow("Denoising Strength:", self._create_slider_with_label('denoising_strength', 0, 100, 50, 100.0, 2))
         inputs_layout.addLayout(denoising_row)
         options_layout.addWidget(inputs_group)
         self.advanced_group = self.create_widget(QGroupBox, 'advanced_group', "Advanced Options")
-        self.advanced_group.setCheckable(True)
-        self.advanced_group.setChecked(False)
         advanced_layout = QVBoxLayout(self.advanced_group)
         advanced_tabs = self.create_widget(QTabWidget, 'advanced_tabs')
         advanced_layout.addWidget(advanced_tabs)
@@ -731,12 +725,16 @@ class WgpDesktopPluginWidget(QWidget):
         guidance_layout.addRow("Guidance (CFG):", self._create_slider_with_label('guidance_scale', 10, 200, 5.0, 10.0, 1))
         self.widgets['guidance_phases_row_index'] = guidance_layout.rowCount()
         guidance_layout.addRow("Guidance Phases:", self.create_widget(QComboBox, 'guidance_phases'))
+        self.widgets['model_switch_phase_row_index'] = guidance_layout.rowCount()
+        guidance_layout.addRow("Model Switch Phase:", self.create_widget(QComboBox, 'model_switch_phase'))
         self.widgets['guidance2_row_index'] = guidance_layout.rowCount()
         guidance_layout.addRow("Guidance 2:", self._create_slider_with_label('guidance2_scale', 10, 200, 5.0, 10.0, 1))
         self.widgets['guidance3_row_index'] = guidance_layout.rowCount()
         guidance_layout.addRow("Guidance 3:", self._create_slider_with_label('guidance3_scale', 10, 200, 5.0, 10.0, 1))
         self.widgets['switch_thresh_row_index'] = guidance_layout.rowCount()
         guidance_layout.addRow("Switch Threshold:", self._create_slider_with_label('switch_threshold', 0, 1000, 0, 1.0, 0))
+        self.widgets['switch_thresh2_row_index'] = guidance_layout.rowCount()
+        guidance_layout.addRow("Switch Threshold 2:", self._create_slider_with_label('switch_threshold2', 0, 1000, 0, 1.0, 0))
         layout.addRow(guidance_group)
         chatter_group = self.create_widget(QGroupBox, 'chatter_group', "Chatterbox / TTS Options")
         chatter_layout = QFormLayout(chatter_group)
@@ -761,6 +759,10 @@ class WgpDesktopPluginWidget(QWidget):
         layout.addRow("Shift Scale:", self._create_slider_with_label('flow_shift', 10, 250, 3.0, 10.0, 1))
         self.widgets['audio_guidance_row_index'] = layout.rowCount()
         layout.addRow("Audio Guidance:", self._create_slider_with_label('audio_guidance_scale', 10, 200, 4.0, 10.0, 1))
+        
+        self.widgets['alt_guidance_row_index'] = layout.rowCount()
+        layout.addRow("Alt Guidance:", self._create_slider_with_label('alt_guidance_scale', 10, 200, 1.0, 10.0, 1))
+
         self.widgets['repeat_generation_row_index'] = layout.rowCount()
         layout.addRow("Repeat Generations:", self._create_slider_with_label('repeat_generation', 1, 25, 1, 1.0, 0))
         combo = self.create_widget(QComboBox, 'multi_images_gen_type')
@@ -826,43 +828,81 @@ class WgpDesktopPluginWidget(QWidget):
         layout.addWidget(self.create_widget(QLineEdit, 'MMAudio_prompt', placeholderText="MMAudio Prompt"))
         layout.addWidget(self.create_widget(QLineEdit, 'MMAudio_neg_prompt', placeholderText="MMAudio Negative Prompt"))
         layout.addRow(self._create_file_input('audio_source', "Custom Soundtrack"))
+        
+        layout.addRow("Duration (s):", self._create_slider_with_label('duration_seconds', 0, 240, 0, 1.0, 0))
+        layout.addRow("Pause (s):", self._create_slider_with_label('pause_seconds', 0, 200, 0.0, 100.0, 2))
+        layout.addRow("Top-k:", self._create_slider_with_label('top_k', 0, 100, 50, 1.0, 0))
+        
+        self.widgets['audio_scale_row_index'] = layout.rowCount()
+        layout.addRow("Audio Scale:", self._create_slider_with_label('audio_scale', 0, 100, 1.0, 100.0, 2))
 
     def _setup_adv_tab_quality(self, tabs):
         tab = QWidget()
         tabs.addTab(tab, "Quality")
         layout = QVBoxLayout(tab)
+
         slg_group = self.create_widget(QGroupBox, 'slg_group', "Skip Layer Guidance")
         slg_layout = QFormLayout(slg_group)
         slg_combo = self.create_widget(QComboBox, 'slg_switch')
         slg_combo.addItem("OFF", 0)
         slg_combo.addItem("ON", 1)
         slg_layout.addRow("Enable SLG:", slg_combo)
+        
+        self.widgets['slg_layers'] = self.create_widget(QListWidget, 'slg_layers')
+        self.widgets['slg_layers'].setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        self.widgets['slg_layers'].setFixedHeight(100)
+        for i in range(40):
+            self.widgets['slg_layers'].addItem(str(i))
+        slg_layout.addRow("Skip Layers:", self.widgets['slg_layers'])
+
         slg_layout.addRow("Start %:", self._create_slider_with_label('slg_start_perc', 0, 100, 10, 1.0, 0))
         slg_layout.addRow("End %:", self._create_slider_with_label('slg_end_perc', 0, 100, 90, 1.0, 0))
         layout.addWidget(slg_group)
-        quality_form = QFormLayout()
-        self.widgets['quality_form_layout'] = quality_form
+
+        general_q_group = QGroupBox("General Quality Settings")
+        general_q_layout = QFormLayout(general_q_group)
+        self.widgets['quality_form_layout'] = general_q_layout 
+
         apg_combo = self.create_widget(QComboBox, 'apg_switch')
         apg_combo.addItem("OFF", 0)
         apg_combo.addItem("ON", 1)
-        self.widgets['apg_switch_row_index'] = quality_form.rowCount()
-        quality_form.addRow("Adaptive Projected Guidance:", apg_combo)
+        self.widgets['apg_switch_row_index'] = general_q_layout.rowCount()
+        general_q_layout.addRow("Adaptive Projected Guidance:", apg_combo)
+
         cfg_star_combo = self.create_widget(QComboBox, 'cfg_star_switch')
         cfg_star_combo.addItem("OFF", 0)
         cfg_star_combo.addItem("ON", 1)
-        self.widgets['cfg_star_switch_row_index'] = quality_form.rowCount()
-        quality_form.addRow("Classifier-Free Guidance Star:", cfg_star_combo)
-        self.widgets['cfg_zero_step_row_index'] = quality_form.rowCount()
-        quality_form.addRow("CFG Zero below Layer:", self._create_slider_with_label('cfg_zero_step', -1, 39, -1, 1.0, 0))
+        self.widgets['cfg_star_switch_row_index'] = general_q_layout.rowCount()
+        general_q_layout.addRow("Classifier-Free Guidance Star:", cfg_star_combo)
+
+        self.widgets['cfg_zero_step_row_index'] = general_q_layout.rowCount()
+        general_q_layout.addRow("CFG Zero below Layer:", self._create_slider_with_label('cfg_zero_step', -1, 39, -1, 1.0, 0))
+
         combo = self.create_widget(QComboBox, 'min_frames_if_references')
         combo.addItem("Disabled (1 frame)", 1)
         combo.addItem("Generate 5 frames", 5)
         combo.addItem("Generate 9 frames", 9)
         combo.addItem("Generate 13 frames", 13)
         combo.addItem("Generate 17 frames", 17)
-        self.widgets['min_frames_if_references_row_index'] = quality_form.rowCount()
-        quality_form.addRow("Min Frames for Quality:", combo)
-        layout.addLayout(quality_form)
+        self.widgets['min_frames_if_references_row_index'] = general_q_layout.rowCount()
+        general_q_layout.addRow("Min Frames for Quality:", combo)
+
+        self.widgets['motion_amplitude_row_index'] = general_q_layout.rowCount()
+        general_q_layout.addRow("Motion Amplitude:", self._create_slider_with_label('motion_amplitude', 100, 140, 1.0, 100.0, 2))
+
+        layout.addWidget(general_q_group)
+
+        sr_group = self.create_widget(QGroupBox, 'sr_group', "Self-Refining Video Sampling (PnP)")
+        sr_layout = QFormLayout(sr_group)
+        sr_combo = self.create_widget(QComboBox, 'self_refiner_setting')
+        sr_combo.addItem("Disabled", 0)
+        sr_combo.addItem("Enabled with P1-Norm", 1)
+        sr_combo.addItem("Enabled with P2-Norm", 2)
+        sr_layout.addRow("Self Refiner:", sr_combo)
+        sr_layout.addRow("P&P Plan:", self.create_widget(QLineEdit, 'self_refiner_plan'))
+        sr_layout.addRow("Uncertainty Threshold:", self._create_slider_with_label('self_refiner_f_uncertainty', 0, 100, 0.1, 100.0, 2))
+        sr_layout.addRow("Certainty Skip %:", self._create_slider_with_label('self_refiner_certain_percentage', 0, 1000, 0.999, 1000.0, 3))
+        layout.addWidget(sr_group)
 
     def _setup_adv_tab_sliding_window(self, tabs):
         tab = QWidget()
@@ -892,6 +932,15 @@ class WgpDesktopPluginWidget(QWidget):
         profile_combo.addItem("Default Profile", -1)
         for text, val in wgp.memory_profile_choices: profile_combo.addItem(text.split(':')[0], val)
         layout.addRow("Override Memory Profile:", profile_combo)
+        
+        attn_combo = self.create_widget(QComboBox, 'override_attention')
+        attn_combo.addItem("Default Attention Mode", "")
+        for label, val in wgp.attention_modes_choices:
+             attn_combo.addItem(label.split(':')[0], val)
+        layout.addRow("Override Attention Mode:", attn_combo)
+
+        layout.addRow("Output Filename:", self.create_widget(QLineEdit, 'output_filename', placeholderText="Leave blank for auto naming"))
+
         combo = self.create_widget(QComboBox, 'multi_prompts_gen_type')
         combo.addItem("Generate new Video per line", 0)
         combo.addItem("Use line for new Sliding Window", 1)
@@ -1003,11 +1052,11 @@ class WgpDesktopPluginWidget(QWidget):
         self._create_config_combo(form, "Transformer Quantization:", "transformer_quantization", [("Scaled Int8 (recommended)", "int8"), ("16-bit (no quantization)", "bf16")], "int8")
         self._create_config_combo(form, "Transformer Data Type:", "transformer_dtype_policy", [("Best Supported by Hardware", ""), ("FP16", "fp16"), ("BF16", "bf16")], "")
         self._create_config_combo(form, "Transformer Calculation:", "mixed_precision", [("16-bit only", "0"), ("Mixed 16/32-bit (better quality)", "1")], "0")
-        self._create_config_combo(form, "Text Encoder:", "text_encoder_quantization", [("16-bit (more RAM, better quality)", "bf16"), ("8-bit (less RAM)", "int8")], "int8")
+        self._create_config_combo(form, "Text Encoder:", "text_encoder_quantization", [("16-bit (more RAM, better quality)", "bf16"), ("8-bit (less RAM, slightly lower quality)", "int8")], "int8")
         self._create_config_combo(form, "VAE Precision:", "vae_precision", [("16-bit (faster, less VRAM)", "16"), ("32-bit (slower, better quality)", "32")], "16")
         self._create_config_combo(form, "Compile Transformer:", "compile", [("On (requires Triton)", "transformer"), ("Off", "")], "")
         self._create_config_combo(form, "DepthAnything v2 Variant:", "depth_anything_v2_variant", [("Large (more precise)", "vitl"), ("Big (faster)", "vitb")], "vitl")
-        self._create_config_combo(form, "VAE Tiling:", "vae_config", [("Auto", 0), ("Disabled", 1), ("256x256 (~8GB VRAM)", 2), ("128x128 (~6GB VRAM)", 3)], 0)
+        self._create_config_combo(form, "VAE Tiling:", "vae_config", [("Auto", 0), ("Disabled", 1), ("256x256 Tiles (~8GB VRAM)", 2), ("128x128 Tiles (~6GB VRAM)", 3)], 0)
         self._create_config_combo(form, "Boost:", "boost", [("On", 1), ("Off", 2)], 1)
         self._create_config_combo(form, "Memory Profile:", "profile", wgp.memory_profile_choices, wgp.profile_type.LowRAM_LowVRAM)
         self._create_config_slider(form, "Preload in VRAM (MB):", "preload_in_VRAM", 0, 40000, 0, 100)
@@ -1020,7 +1069,8 @@ class WgpDesktopPluginWidget(QWidget):
         tab, form = self._create_scrollable_form_tab()
         self._create_config_combo(form, "Prompt Enhancer:", "enhancer_enabled", [("Off", 0), ("Florence 2 + Llama 3.2", 1), ("Florence 2 + Joy Caption (uncensored)", 2)], 0)
         self._create_config_combo(form, "Enhancer Mode:", "enhancer_mode", [("Automatic on Generate", 0), ("On Demand Only", 1)], 0)
-        self._create_config_combo(form, "MMAudio:", "mmaudio_enabled", [("Off", 0), ("Enabled (unloaded after use)", 1), ("Enabled (persistent in RAM)", 2)], 0)
+        self._create_config_combo(form, "MMAudio Mode:", "mmaudio_mode", [("Off", 0), ("Standard", 1), ("NSFW", 2)], 0)
+        self._create_config_combo(form, "MMAudio Persistence:", "mmaudio_persistence", [("Unload after use", 1), ("Persistent in RAM", 2)], 1)
         return tab
 
     def _create_outputs_config_tab(self):
@@ -1062,6 +1112,7 @@ class WgpDesktopPluginWidget(QWidget):
                     initial_model = next(iter(wgp.models_def))
 
             state_dict = {}
+            # Using new wgp.py logic for filename
             state_dict["model_filename"] = wgp.get_model_filename(initial_model, wgp.transformer_quantization, wgp.transformer_dtype_policy)
             state_dict["model_type"] = initial_model
             state_dict["advanced"] = wgp.advanced
@@ -1070,7 +1121,6 @@ class WgpDesktopPluginWidget(QWidget):
             state_dict["last_resolution_per_group"] = wgp.server_config.get("last_resolution_per_group", {})
             state_dict["gen"] = {"queue": []}
             self.state = state_dict
-            self.advanced_group.setChecked(wgp.advanced)
             self.update_model_dropdowns(initial_model)
             self.refresh_ui_from_model_change(initial_model)
             self._update_input_visibility()
@@ -1125,6 +1175,7 @@ class WgpDesktopPluginWidget(QWidget):
             any_cfg_star = model_def.get("cfg_star", False)
             any_apg = model_def.get("adaptive_projected_guidance", False)
             v2i_switch_supported = model_def.get("v2i_switch_supported", False)
+            any_motion_amplitude = model_def.get("motion_amplitude", False) and not image_outputs
 
             self._update_generation_mode_visibility(model_def)
 
@@ -1167,8 +1218,16 @@ class WgpDesktopPluginWidget(QWidget):
             self.widgets['resolution_group'].blockSignals(False)
             self.widgets['resolution'].blockSignals(False)
 
-            for name in ['video_source', 'image_start', 'image_end', 'video_guide', 'video_mask', 'image_refs', 'audio_source']:
+            for name in ['video_source', 'image_start', 'image_end', 'video_guide', 'video_mask', 'image_refs', 'audio_source', 'audio_guide', 'audio_guide2', 'custom_guide']:
                 if name in self.widgets: self.widgets[name].clear()
+
+            any_audio_prompt = model_def.get("any_audio_prompt", False)
+            one_speaker = model_def.get("one_speaker_only", False)
+            custom_guide_def = model_def.get("custom_guide", None)
+            
+            self.widgets['audio_guide_container'].setVisible(any_audio_prompt)
+            self.widgets['audio_guide2_container'].setVisible(any_audio_prompt and not one_speaker)
+            self.widgets['custom_guide_container'].setVisible(custom_guide_def is not None)
 
             guidance_layout = self.widgets['guidance_layout']
             guidance_max = model_def.get("guidance_max_phases", 1)
@@ -1186,6 +1245,7 @@ class WgpDesktopPluginWidget(QWidget):
             quality_form_layout.setRowVisible(self.widgets['cfg_star_switch_row_index'], any_cfg_star)
             quality_form_layout.setRowVisible(self.widgets['cfg_zero_step_row_index'], any_cfg_zero)
             quality_form_layout.setRowVisible(self.widgets['min_frames_if_references_row_index'], v2i_switch_supported and image_outputs)
+            quality_form_layout.setRowVisible(self.widgets['motion_amplitude_row_index'], any_motion_amplitude)
 
             self.widgets['advanced_tabs'].setTabVisible(self.widgets['sliding_window_tab_index'], sliding_window_enabled and not image_outputs)
             
@@ -1217,6 +1277,16 @@ class WgpDesktopPluginWidget(QWidget):
             switch_thresh_val = ui_defaults.get("switch_threshold", 0)
             self.widgets['switch_threshold'].setValue(switch_thresh_val)
             self.widgets['switch_threshold_label'].setText(str(switch_thresh_val))
+
+            switch_thresh2_val = ui_defaults.get("switch_threshold2", 0)
+            self.widgets['switch_threshold2'].setValue(switch_thresh2_val)
+            self.widgets['switch_threshold2_label'].setText(str(switch_thresh2_val))
+
+            self.widgets['model_switch_phase'].clear()
+            self.widgets['model_switch_phase'].addItem("Phase 1-2 transition", 1)
+            self.widgets['model_switch_phase'].addItem("Phase 2-3 transition", 2)
+            index = self.widgets['model_switch_phase'].findData(ui_defaults.get("model_switch_phase", 1))
+            if index != -1: self.widgets['model_switch_phase'].setCurrentIndex(index)
 
             pace_val = ui_defaults.get('pace', 0.5)
             self.widgets['pace'].setValue(int(pace_val * 100))
@@ -1259,6 +1329,10 @@ class WgpDesktopPluginWidget(QWidget):
             self.widgets['audio_guidance_scale'].setValue(int(audio_guidance_val * 10))
             self.widgets['audio_guidance_scale_label'].setText(f"{audio_guidance_val:.1f}")
             
+            alt_guidance_val = ui_defaults.get("alt_guidance_scale", 1.0)
+            self.widgets['alt_guidance_scale'].setValue(int(alt_guidance_val * 10))
+            self.widgets['alt_guidance_scale_label'].setText(f"{alt_guidance_val:.1f}")
+
             repeat_val = ui_defaults.get("repeat_generation", 1)
             self.widgets['repeat_generation'].setValue(repeat_val)
             self.widgets['repeat_generation_label'].setText(str(repeat_val))
@@ -1308,7 +1382,31 @@ class WgpDesktopPluginWidget(QWidget):
             self.widgets['MMAudio_prompt'].setText(ui_defaults.get('MMAudio_prompt', ''))
             self.widgets['MMAudio_neg_prompt'].setText(ui_defaults.get('MMAudio_neg_prompt', ''))
 
+            duration_val = ui_defaults.get('duration_seconds', 0)
+            self.widgets['duration_seconds'].setValue(int(duration_val))
+            self.widgets['duration_seconds_label'].setText(f"{duration_val:.1f}")
+
+            pause_val = ui_defaults.get('pause_seconds', 0.0)
+            self.widgets['pause_seconds'].setValue(int(pause_val * 100))
+            self.widgets['pause_seconds_label'].setText(f"{pause_val:.2f}")
+
+            top_k_val = ui_defaults.get('top_k', 50)
+            self.widgets['top_k'].setValue(int(top_k_val))
+            self.widgets['top_k_label'].setText(f"{top_k_val:.1f}")
+
+            audio_scale_val = ui_defaults.get('audio_scale', 1.0)
+            self.widgets['audio_scale'].setValue(int(audio_scale_val * 100))
+            self.widgets['audio_scale_label'].setText(f"{audio_scale_val:.2f}")
+
             self.widgets['slg_switch'].setCurrentIndex(ui_defaults.get('slg_switch', 0))
+
+            selected_layers = ui_defaults.get('slg_layers', [])
+            list_widget = self.widgets['slg_layers']
+            for i in range(list_widget.count()):
+                item = list_widget.item(i)
+                val = int(item.text())
+                item.setSelected(val in selected_layers)
+
             slg_start_val = ui_defaults.get('slg_start_perc', 10)
             self.widgets['slg_start_perc'].setValue(slg_start_val)
             self.widgets['slg_start_perc_label'].setText(str(slg_start_val))
@@ -1326,6 +1424,18 @@ class WgpDesktopPluginWidget(QWidget):
             min_frames_val = ui_defaults.get('min_frames_if_references', 1)
             index = self.widgets['min_frames_if_references'].findData(min_frames_val)
             if index != -1: self.widgets['min_frames_if_references'].setCurrentIndex(index)
+
+            self.widgets['motion_amplitude'].setValue(int(ui_defaults.get("motion_amplitude", 1.0) * 100))
+            self.widgets['motion_amplitude_label'].setText(f"{ui_defaults.get('motion_amplitude', 1.0):.2f}")
+
+            self.widgets['self_refiner_setting'].setCurrentIndex(ui_defaults.get("self_refiner_setting", 0))
+            self.widgets['self_refiner_plan'].setText(ui_defaults.get("self_refiner_plan", ""))
+            self.widgets['self_refiner_f_uncertainty'].setValue(int(ui_defaults.get("self_refiner_f_uncertainty", 0.1) * 100))
+            self.widgets['self_refiner_f_uncertainty_label'].setText(f"{ui_defaults.get('self_refiner_f_uncertainty', 0.1):.2f}")
+            self.widgets['self_refiner_certain_percentage'].setValue(int(ui_defaults.get("self_refiner_certain_percentage", 0.999) * 1000))
+            self.widgets['self_refiner_certain_percentage_label'].setText(f"{ui_defaults.get('self_refiner_certain_percentage', 0.999):.3f}")
+
+            self.widgets['sr_group'].setVisible(model_def.get("self_refiner", False))
 
             self.widgets['RIFLEx_setting'].setCurrentIndex(ui_defaults.get('RIFLEx_setting', 0))
 
@@ -1345,6 +1455,12 @@ class WgpDesktopPluginWidget(QWidget):
             index = self.widgets['override_profile'].findData(override_prof_val)
             if index != -1: self.widgets['override_profile'].setCurrentIndex(index)
             
+            override_attn_val = ui_defaults.get('override_attention', "")
+            index = self.widgets['override_attention'].findData(override_attn_val)
+            if index != -1: self.widgets['override_attention'].setCurrentIndex(index)
+
+            self.widgets['output_filename'].setText(ui_defaults.get('output_filename', ""))
+
             self.widgets['multi_prompts_gen_type'].setCurrentIndex(ui_defaults.get('multi_prompts_gen_type', 0))
 
             denoising_val = ui_defaults.get("denoising_strength", 0.5)
@@ -1381,8 +1497,19 @@ class WgpDesktopPluginWidget(QWidget):
         phases = self.widgets['guidance_phases'].currentData() or 1
         guidance_layout = self.widgets['guidance_layout']
         guidance_layout.setRowVisible(self.widgets['guidance2_row_index'], phases >= 2)
-        guidance_layout.setRowVisible(self.widgets['guidance3_row_index'], phases >= 3)
         guidance_layout.setRowVisible(self.widgets['switch_thresh_row_index'], phases >= 2)
+        guidance_layout.setRowVisible(self.widgets['guidance3_row_index'], phases >= 3)
+        guidance_layout.setRowVisible(self.widgets['switch_thresh2_row_index'], phases >= 3)
+        
+        model_switch_visible = False
+        if phases >= 3:
+            model_type = self.state.get("model_type")
+            if model_type:
+                model_def = wgp.get_model_def(model_type)
+                if model_def and model_def.get("multiple_submodels", False):
+                    model_switch_visible = True
+        
+        guidance_layout.setRowVisible(self.widgets['model_switch_phase_row_index'], model_switch_visible)
 
     def _update_generation_mode_visibility(self, model_def):
         allowed = model_def.get("image_prompt_types_allowed", "")
@@ -1612,9 +1739,10 @@ class WgpDesktopPluginWidget(QWidget):
         full_inputs['lset_name'] = ""
         full_inputs['image_mode'] = 0
         full_inputs['mode'] = ""
-        expected_keys = { "audio_guide": None, "audio_guide2": None, "image_guide": None, "image_mask": None, "speakers_locations": "", "frames_positions": "", "keep_frames_video_guide": "", "keep_frames_video_source": "", "video_guide_outpainting": "", "switch_threshold2": 0, "model_switch_phase": 1, "batch_size": 1, "control_net_weight_alt": 1.0, "image_refs_relative_size": 50, "embedded_guidance_scale": None, "model_mode": None, "control_net_weight": 1.0, "control_net_weight2": 1.0, "mask_expand": 0, "remove_background_images_ref": 0, "prompt_enhancer": "", "pace": 0.5, "exaggeration": 0.5, "temperature": 0.8}
+        expected_keys = { "audio_guide": None, "audio_guide2": None, "image_guide": None, "image_mask": None, "speakers_locations": "", "frames_positions": "", "keep_frames_video_guide": "", "keep_frames_video_source": "", "video_guide_outpainting": "", "switch_threshold2": 0, "model_switch_phase": 1, "batch_size": 1, "control_net_weight_alt": 1.0, "image_refs_relative_size": 50, "embedded_guidance_scale": None, "model_mode": None, "control_net_weight": 1.0, "control_net_weight2": 1.0, "mask_expand": 0, "remove_background_images_ref": 0, "prompt_enhancer": "", "pace": 0.5, "exaggeration": 0.5, "temperature": 0.8, "custom_guide": None}
         for key, default_value in expected_keys.items():
             if key not in full_inputs: full_inputs[key] = default_value
+        
         full_inputs['prompt'] = self.widgets['prompt'].toPlainText()
         full_inputs['negative_prompt'] = self.widgets['negative_prompt'].toPlainText()
         full_inputs['resolution'] = self.widgets['resolution'].currentData()
@@ -1623,7 +1751,8 @@ class WgpDesktopPluginWidget(QWidget):
         full_inputs['seed'] = int(self.widgets['seed'].text())
         image_prompt_type = ""
         video_prompt_type = ""
-        if self.widgets['mode_s'].isChecked(): image_prompt_type = 'S'
+        if self.widgets['mode_t'].isChecked(): image_prompt_type = ""
+        elif self.widgets['mode_s'].isChecked(): image_prompt_type = 'S'
         elif self.widgets['mode_v'].isChecked(): image_prompt_type = 'V'
         elif self.widgets['mode_l'].isChecked(): image_prompt_type = 'L'
         if self.widgets['image_end_checkbox'].isVisible() and self.widgets['image_end_checkbox'].isChecked(): image_prompt_type += 'E'
@@ -1631,57 +1760,78 @@ class WgpDesktopPluginWidget(QWidget):
         if self.widgets['ref_image_checkbox'].isVisible() and self.widgets['ref_image_checkbox'].isChecked(): video_prompt_type += 'I'
         full_inputs['image_prompt_type'] = image_prompt_type
         full_inputs['video_prompt_type'] = video_prompt_type
-        for name in ['video_source', 'image_start', 'image_end', 'video_guide', 'video_mask', 'audio_source']:
+        for name in ['video_source', 'image_start', 'image_end', 'video_guide', 'video_mask', 'audio_source', 'audio_guide', 'audio_guide2', 'custom_guide']:
             if name in self.widgets: full_inputs[name] = self.widgets[name].text() or None
+
+        audio_prompt_type = ""
+        if full_inputs.get("audio_guide"): audio_prompt_type += "A"
+        if full_inputs.get("audio_guide2"): audio_prompt_type += "B"
+        full_inputs['audio_prompt_type'] = audio_prompt_type
+
         paths = self.widgets['image_refs'].text().split(';')
         full_inputs['image_refs'] = [p.strip() for p in paths if p.strip()] if paths and paths[0] else None
         full_inputs['denoising_strength'] = self.widgets['denoising_strength'].value() / 100.0
-        if self.advanced_group.isChecked():
-            full_inputs['guidance_scale'] = self.widgets['guidance_scale'].value() / 10.0
-            full_inputs['guidance_phases'] = self.widgets['guidance_phases'].currentData()
-            full_inputs['guidance2_scale'] = self.widgets['guidance2_scale'].value() / 10.0
-            full_inputs['guidance3_scale'] = self.widgets['guidance3_scale'].value() / 10.0
-            full_inputs['switch_threshold'] = self.widgets['switch_threshold'].value()
-            full_inputs['pace'] = self.widgets['pace'].value() / 100.0
-            full_inputs['exaggeration'] = self.widgets['exaggeration'].value() / 100.0
-            full_inputs['temperature'] = self.widgets['temperature'].value() / 100.0
-            full_inputs['NAG_scale'] = self.widgets['NAG_scale'].value() / 10.0
-            full_inputs['NAG_tau'] = self.widgets['NAG_tau'].value() / 10.0
-            full_inputs['NAG_alpha'] = self.widgets['NAG_alpha'].value() / 10.0
-            full_inputs['sample_solver'] = self.widgets['sample_solver'].currentData()
-            full_inputs['flow_shift'] = self.widgets['flow_shift'].value() / 10.0
-            full_inputs['audio_guidance_scale'] = self.widgets['audio_guidance_scale'].value() / 10.0
-            full_inputs['repeat_generation'] = self.widgets['repeat_generation'].value()
-            full_inputs['multi_images_gen_type'] = self.widgets['multi_images_gen_type'].currentData()
-            selected_items = self.widgets['activated_loras'].selectedItems()
-            full_inputs['activated_loras'] = [self.lora_map[item.text()] for item in selected_items if item.text() in self.lora_map]
-            full_inputs['loras_multipliers'] = self.widgets['loras_multipliers'].toPlainText()
-            full_inputs['skip_steps_cache_type'] = self.widgets['skip_steps_cache_type'].currentData()
-            full_inputs['skip_steps_multiplier'] = self.widgets['skip_steps_multiplier'].currentData()
-            full_inputs['skip_steps_start_step_perc'] = self.widgets['skip_steps_start_step_perc'].value()
-            full_inputs['temporal_upsampling'] = self.widgets['temporal_upsampling'].currentData()
-            full_inputs['spatial_upsampling'] = self.widgets['spatial_upsampling'].currentData()
-            full_inputs['film_grain_intensity'] = self.widgets['film_grain_intensity'].value() / 100.0
-            full_inputs['film_grain_saturation'] = self.widgets['film_grain_saturation'].value() / 100.0
-            full_inputs['MMAudio_setting'] = self.widgets['MMAudio_setting'].currentData()
-            full_inputs['MMAudio_prompt'] = self.widgets['MMAudio_prompt'].text()
-            full_inputs['MMAudio_neg_prompt'] = self.widgets['MMAudio_neg_prompt'].text()
-            full_inputs['RIFLEx_setting'] = self.widgets['RIFLEx_setting'].currentData()
-            full_inputs['force_fps'] = self.widgets['force_fps'].currentData()
-            full_inputs['override_profile'] = self.widgets['override_profile'].currentData()
-            full_inputs['multi_prompts_gen_type'] = self.widgets['multi_prompts_gen_type'].currentData()
-            full_inputs['slg_switch'] = self.widgets['slg_switch'].currentData()
-            full_inputs['slg_start_perc'] = self.widgets['slg_start_perc'].value()
-            full_inputs['slg_end_perc'] = self.widgets['slg_end_perc'].value()
-            full_inputs['apg_switch'] = self.widgets['apg_switch'].currentData()
-            full_inputs['cfg_star_switch'] = self.widgets['cfg_star_switch'].currentData()
-            full_inputs['cfg_zero_step'] = self.widgets['cfg_zero_step'].value()
-            full_inputs['min_frames_if_references'] = self.widgets['min_frames_if_references'].currentData()
-            full_inputs['sliding_window_size'] = self.widgets['sliding_window_size'].value()
-            full_inputs['sliding_window_overlap'] = self.widgets['sliding_window_overlap'].value()
-            full_inputs['sliding_window_color_correction_strength'] = self.widgets['sliding_window_color_correction_strength'].value() / 100.0
-            full_inputs['sliding_window_overlap_noise'] = self.widgets['sliding_window_overlap_noise'].value()
-            full_inputs['sliding_window_discard_last_frames'] = self.widgets['sliding_window_discard_last_frames'].value()
+        full_inputs['guidance_scale'] = self.widgets['guidance_scale'].value() / 10.0
+        full_inputs['guidance_phases'] = self.widgets['guidance_phases'].currentData()
+        full_inputs['model_switch_phase'] = self.widgets['model_switch_phase'].currentData()
+        full_inputs['guidance2_scale'] = self.widgets['guidance2_scale'].value() / 10.0
+        full_inputs['guidance3_scale'] = self.widgets['guidance3_scale'].value() / 10.0
+        full_inputs['switch_threshold'] = self.widgets['switch_threshold'].value()
+        full_inputs['switch_threshold2'] = self.widgets['switch_threshold2'].value()
+        full_inputs['pace'] = self.widgets['pace'].value() / 100.0
+        full_inputs['exaggeration'] = self.widgets['exaggeration'].value() / 100.0
+        full_inputs['temperature'] = self.widgets['temperature'].value() / 100.0
+        full_inputs['NAG_scale'] = self.widgets['NAG_scale'].value() / 10.0
+        full_inputs['NAG_tau'] = self.widgets['NAG_tau'].value() / 10.0
+        full_inputs['NAG_alpha'] = self.widgets['NAG_alpha'].value() / 10.0
+        full_inputs['sample_solver'] = self.widgets['sample_solver'].currentData()
+        full_inputs['flow_shift'] = self.widgets['flow_shift'].value() / 10.0
+        full_inputs['audio_guidance_scale'] = self.widgets['audio_guidance_scale'].value() / 10.0
+        full_inputs['alt_guidance_scale'] = self.widgets['alt_guidance_scale'].value() / 10.0
+        full_inputs['repeat_generation'] = self.widgets['repeat_generation'].value()
+        full_inputs['multi_images_gen_type'] = self.widgets['multi_images_gen_type'].currentData()
+        selected_items = self.widgets['activated_loras'].selectedItems()
+        full_inputs['activated_loras'] = [self.lora_map[item.text()] for item in selected_items if item.text() in self.lora_map]
+        full_inputs['loras_multipliers'] = self.widgets['loras_multipliers'].toPlainText()
+        full_inputs['skip_steps_cache_type'] = self.widgets['skip_steps_cache_type'].currentData()
+        full_inputs['skip_steps_multiplier'] = self.widgets['skip_steps_multiplier'].currentData()
+        full_inputs['skip_steps_start_step_perc'] = self.widgets['skip_steps_start_step_perc'].value()
+        full_inputs['temporal_upsampling'] = self.widgets['temporal_upsampling'].currentData()
+        full_inputs['spatial_upsampling'] = self.widgets['spatial_upsampling'].currentData()
+        full_inputs['film_grain_intensity'] = self.widgets['film_grain_intensity'].value() / 100.0
+        full_inputs['film_grain_saturation'] = self.widgets['film_grain_saturation'].value() / 100.0
+        full_inputs['MMAudio_setting'] = self.widgets['MMAudio_setting'].currentData()
+        full_inputs['MMAudio_prompt'] = self.widgets['MMAudio_prompt'].text()
+        full_inputs['MMAudio_neg_prompt'] = self.widgets['MMAudio_neg_prompt'].text()
+        full_inputs['duration_seconds'] = self.widgets['duration_seconds'].value()
+        full_inputs['pause_seconds'] = self.widgets['pause_seconds'].value() / 100.0
+        full_inputs['top_k'] = self.widgets['top_k'].value()
+        full_inputs['audio_scale'] = self.widgets['audio_scale'].value() / 100.0
+        full_inputs['RIFLEx_setting'] = self.widgets['RIFLEx_setting'].currentData()
+        full_inputs['force_fps'] = self.widgets['force_fps'].currentData()
+        full_inputs['override_profile'] = self.widgets['override_profile'].currentData()
+        full_inputs['override_attention'] = self.widgets['override_attention'].currentData()
+        full_inputs['output_filename'] = self.widgets['output_filename'].text()
+        full_inputs['multi_prompts_gen_type'] = self.widgets['multi_prompts_gen_type'].currentData()
+        full_inputs['slg_switch'] = self.widgets['slg_switch'].currentData()
+        selected_items = self.widgets['slg_layers'].selectedItems()
+        full_inputs['slg_layers'] = [int(item.text()) for item in selected_items]
+        full_inputs['slg_start_perc'] = self.widgets['slg_start_perc'].value()
+        full_inputs['slg_end_perc'] = self.widgets['slg_end_perc'].value()
+        full_inputs['apg_switch'] = self.widgets['apg_switch'].currentData()
+        full_inputs['cfg_star_switch'] = self.widgets['cfg_star_switch'].currentData()
+        full_inputs['cfg_zero_step'] = self.widgets['cfg_zero_step'].value()
+        full_inputs['min_frames_if_references'] = self.widgets['min_frames_if_references'].currentData()
+        full_inputs['sliding_window_size'] = self.widgets['sliding_window_size'].value()
+        full_inputs['sliding_window_overlap'] = self.widgets['sliding_window_overlap'].value()
+        full_inputs['sliding_window_color_correction_strength'] = self.widgets['sliding_window_color_correction_strength'].value() / 100.0
+        full_inputs['sliding_window_overlap_noise'] = self.widgets['sliding_window_overlap_noise'].value()
+        full_inputs['sliding_window_discard_last_frames'] = self.widgets['sliding_window_discard_last_frames'].value()
+        full_inputs['motion_amplitude'] = self.widgets['motion_amplitude'].value() / 100.0
+        full_inputs['self_refiner_setting'] = self.widgets['self_refiner_setting'].currentData()
+        full_inputs['self_refiner_plan'] = self.widgets['self_refiner_plan'].text()
+        full_inputs['self_refiner_f_uncertainty'] = self.widgets['self_refiner_f_uncertainty'].value() / 100.0
+        full_inputs['self_refiner_certain_percentage'] = self.widgets['self_refiner_certain_percentage'].value() / 1000.0
         return full_inputs
 
     def _prepare_state_for_generation(self):
@@ -1881,7 +2031,8 @@ class WgpDesktopPluginWidget(QWidget):
 
             ui_settings['enhancer_enabled'] = self.widgets['config_enhancer_enabled'].currentData()
             ui_settings['enhancer_mode'] = self.widgets['config_enhancer_mode'].currentData()
-            ui_settings['mmaudio_enabled'] = self.widgets['config_mmaudio_enabled'].currentData()
+            ui_settings['mmaudio_mode'] = self.widgets['config_mmaudio_mode'].currentData()
+            ui_settings['mmaudio_persistence'] = self.widgets['config_mmaudio_persistence'].currentData()
 
             ui_settings['video_output_codec'] = self.widgets['config_video_output_codec'].currentData()
             ui_settings['image_output_codec'] = self.widgets['config_image_output_codec'].currentData()
@@ -1998,8 +2149,8 @@ class Plugin(VideoEditorPlugin):
                 QApplication.processEvents()
                 torch_command = [
                     sys.executable, "-m", "pip", "install",
-                    "torch==2.7.0", "torchvision", "torchaudio",
-                    "--index-url", "https://download.pytorch.org/whl/test/cu128"
+                    "torch", "torchvision", "torchaudio",
+                    "--index-url", "https://download.pytorch.org/whl/cu130"
                 ]
                 subprocess.check_call(torch_command)
 
@@ -2068,8 +2219,8 @@ class Plugin(VideoEditorPlugin):
             QApplication.processEvents()
             torch_command = [
                 sys.executable, "-m", "pip", "install",
-                "torch==2.7.0", "torchvision", "torchaudio",
-                "--index-url", "https://download.pytorch.org/whl/test/cu128"
+                "torch", "torchvision", "torchaudio",
+                "--index-url", "https://download.pytorch.org/whl/cu130"
             ]
             subprocess.check_call(torch_command)
 

@@ -1,8 +1,10 @@
 PyQt6
 requests
 sounddevice
-GitPython
+numpy==2.1.2
+gitpython==3.1.45
 ffmpeg-python
-onnxruntime
+onnxruntime-gpu==1.22
 tqdm
-Pillow
+Pillow==11.3.0
+triton-windows
