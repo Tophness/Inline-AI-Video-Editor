@@ -28,7 +28,13 @@ class MockComponent:
         self.step = kwargs.get('step', 1)
         self.interactive = kwargs.get('interactive', True)
         self.placeholder = kwargs.get('placeholder', None)
-        self.props = kwargs
+        self.change = lambda *a, **k: self
+        self.click = lambda *a, **k: self
+        self.input = lambda *a, **k: self
+        self.select = lambda *a, **k: self
+        self.upload = lambda *a, **k: self
+        self.then = lambda *a, **k: self
+        self.mount = lambda *a, **k: self
 
     def __enter__(self):
         if hasattr(sys.modules['gradio'], '_push_context'):
@@ -94,6 +100,8 @@ class MockGradioModule:
         if not self.is_capturing: return component
         if self.context_stack:
             self.context_stack[-1].children.append(component)
+        elif self.is_capturing:
+            self.root_components.append(component)
         return component
 
     def start_capture(self):
@@ -131,6 +139,8 @@ class MockGradioModule:
     def ImageEditor(self, *args, **kwargs): return self._register_component(MockComponent("Image", *args, **kwargs))
     def Text(self, *args, **kwargs): return self.Textbox(*args, **kwargs)
     def Files(self, *args, **kwargs): return self.File(*args, **kwargs) 
+    def Blocks(self, *args, **kwargs): return MockComponent("Blocks", *args, **kwargs)
+    
     def update(self, *args, **kwargs): return None
     def on(self, *args, **kwargs): return MockComponent("Dependency", *args, **kwargs)
     def Error(self, *args, **kwargs): raise Exception(f"Gradio Error: {args}")
@@ -192,7 +202,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QTextEdit, QSlider, QCheckBox, QComboBox,
     QFileDialog, QGroupBox, QFormLayout, QTableWidget, QTableWidgetItem,
     QHeaderView, QProgressBar, QScrollArea, QListWidget, QListWidgetItem,
-    QMessageBox, QRadioButton, QSizePolicy, QMenu
+    QMessageBox, QRadioButton, QSizePolicy, QMenu, QSplitter
 )
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QUrl, QSize, QRectF, QTimer
 from PyQt6.QtGui import QPixmap, QImage, QDropEvent
@@ -289,11 +299,18 @@ class DynamicUiBuilder(QObject):
                 
                 tab_name = tab_node.args[0] if tab_node.args else tab_node.kwargs.get('label', "Untitled")
                 tab_page = QWidget()
-                tab_layout = QVBoxLayout(tab_page)
-
+                page_scroll = QScrollArea()
+                page_scroll.setWidgetResizable(True)
+                page_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+                content_widget = QWidget()
+                tab_layout = QVBoxLayout(content_widget)
+                tab_layout.setContentsMargins(5, 5, 5, 5)
                 self._build_qt_layout(tab_node.children, tab_layout)
-                
                 tab_layout.addStretch()
+                page_scroll.setWidget(content_widget)
+                wrapper_layout = QVBoxLayout(tab_page)
+                wrapper_layout.setContentsMargins(0,0,0,0)
+                wrapper_layout.addWidget(page_scroll)
                 tabs_widget.addTab(tab_page, tab_name)
                 
             return tabs_widget
@@ -311,12 +328,20 @@ class DynamicUiBuilder(QObject):
         for node in nodes:
             var_name = self.id_to_name.get(node.id)
             label = node.label or node.kwargs.get('label')
+            
             if var_name in ['audio_source']: continue
+            
             if node.type_name in ['Column', 'Row', 'Group']:
                 container = QGroupBox(label) if label else QWidget()
-                layout = QVBoxLayout(container) if node.type_name in ['Column', 'Group'] else QHBoxLayout(container)
+
+                if node.type_name == 'Row':
+                    layout = QHBoxLayout(container)
+                else:
+                    layout = QVBoxLayout(container)
+                    
                 layout.setContentsMargins(0,0,0,0)
                 if label: layout.setContentsMargins(5,15,5,5)
+                
                 self._build_qt_layout(node.children, layout)
                 if not node.visible: container.hide()
                 parent_layout.addWidget(container)
@@ -907,20 +932,30 @@ class WgpDesktopPluginWidget(QWidget):
     def setup_generator_tab(self):
         gen_tab = QWidget()
         self.tabs.addTab(gen_tab, "Video Generator")
-        gen_layout = QHBoxLayout(gen_tab)
+        tab_layout = QVBoxLayout(gen_tab)
+        tab_layout.setContentsMargins(0,0,0,0)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        tab_layout.addWidget(splitter)
         left_panel = QWidget()
         left_panel.setMinimumWidth(628)
         left_layout = QVBoxLayout(left_panel)
-        gen_layout.addWidget(left_panel, 1)
+        splitter.addWidget(left_panel)
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
-        gen_layout.addWidget(right_panel, 1)
+        splitter.addWidget(right_panel)
+        splitter.setCollapsible(0, False)
+        splitter.setCollapsible(1, False)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         left_layout.addWidget(scroll_area)
+        
         options_widget = QWidget()
         scroll_area.setWidget(options_widget)
         options_layout = QVBoxLayout(options_widget)
+        
         model_layout = QHBoxLayout()
         self.widgets['model_family'] = QComboBox()
         self.widgets['model_base_type_choice'] = QComboBox()
@@ -930,14 +965,17 @@ class WgpDesktopPluginWidget(QWidget):
         model_layout.addWidget(self.widgets['model_base_type_choice'], 3)
         model_layout.addWidget(self.widgets['model_choice'], 3)
         options_layout.addLayout(model_layout)
+        
         options_layout.addWidget(QLabel("Prompt:"))
         prompt_edit = self.create_widget(QTextEdit, 'prompt')
         prompt_edit.setMaximumHeight(prompt_edit.fontMetrics().lineSpacing() * 5 + 15)
         options_layout.addWidget(prompt_edit)
+        
         options_layout.addWidget(QLabel("Negative Prompt:"))
         neg_prompt_edit = self.create_widget(QTextEdit, 'negative_prompt')
         neg_prompt_edit.setMaximumHeight(neg_prompt_edit.fontMetrics().lineSpacing() * 3 + 15)
         options_layout.addWidget(neg_prompt_edit)
+        
         basic_group = QGroupBox("Basic Options")
         basic_layout = QFormLayout(basic_group)
         res_container = QWidget()
@@ -950,6 +988,7 @@ class WgpDesktopPluginWidget(QWidget):
         basic_layout.addRow("Inference Steps:", self._create_slider_with_label('num_inference_steps', 1, 100, 30, 1.0, 0))
         basic_layout.addRow("Seed:", self.create_widget(QLineEdit, 'seed', '-1'))
         options_layout.addWidget(basic_group)
+        
         mode_options_group = QGroupBox("Generation Mode & Input Options")
         mode_options_layout = QVBoxLayout(mode_options_group)
         mode_hbox = QHBoxLayout()
@@ -965,6 +1004,7 @@ class WgpDesktopPluginWidget(QWidget):
         options_hbox.addWidget(self.create_widget(QCheckBox, 'ref_image_checkbox', "Use Reference Image(s)"))
         mode_options_layout.addLayout(options_hbox)
         options_layout.addWidget(mode_options_group)
+        
         inputs_group = QGroupBox("Inputs")
         inputs_layout = QVBoxLayout(inputs_group)
         inputs_layout.addWidget(self._create_file_input('image_start', "Start Image"))
@@ -980,11 +1020,13 @@ class WgpDesktopPluginWidget(QWidget):
         denoising_row.addRow("Denoising Strength:", self._create_slider_with_label('denoising_strength', 0, 100, 50, 100.0, 2))
         inputs_layout.addLayout(denoising_row)
         options_layout.addWidget(inputs_group)
+        
         self.advanced_group = self.create_widget(QGroupBox, 'advanced_group', "Advanced Options")
-        self.adv_layout = QVBoxLayout(self.advanced_group)				 
-
+        self.adv_layout = QVBoxLayout(self.advanced_group)
         options_layout.addWidget(self.advanced_group)
+        
         scroll_area.setMinimumHeight(options_widget.sizeHint().height()-260)
+        
         btn_layout = QHBoxLayout()
         self.generate_btn = self.create_widget(QPushButton, 'generate_btn', "Generate")
         self.add_to_queue_btn = self.create_widget(QPushButton, 'add_to_queue_btn', "Add to Queue")
@@ -993,10 +1035,12 @@ class WgpDesktopPluginWidget(QWidget):
         btn_layout.addWidget(self.generate_btn)
         btn_layout.addWidget(self.add_to_queue_btn)
         right_layout.addLayout(btn_layout)
+        
         self.status_label = self.create_widget(QLabel, 'status_label', "Idle")
         right_layout.addWidget(self.status_label)
         self.progress_bar = self.create_widget(QProgressBar, 'progress_bar')
         right_layout.addWidget(self.progress_bar)
+        
         preview_group = self.create_widget(QGroupBox, 'preview_group', "Preview")
         preview_group.setCheckable(True)
         preview_group.setStyleSheet("QGroupBox { border: 1px solid #cccccc; }")
