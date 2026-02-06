@@ -11,6 +11,13 @@ from pathlib import Path
 from contextlib import contextmanager
 import ffmpeg
 
+class MockApp:
+    def __init__(self):
+        self.plugin_manager = MockPluginManager()
+    def initialize_plugins(self, *args, **kwargs): pass
+    def setup_ui_tabs(self, *args, **kwargs): pass
+    def run_component_insertion(self, *args, **kwargs): pass
+
 class MockComponent:
     def __init__(self, type_name="Generic", *args, **kwargs):
         self.type_name = type_name
@@ -20,6 +27,9 @@ class MockComponent:
         self.id = str(uuid.uuid4())
         self.label = kwargs.get('label', None)
         self.value = kwargs.get('value', None)
+        self.choices = kwargs.get('choices', [])
+        if not self.choices and args and isinstance(args[0], list):
+            self.choices = args[0]
         self.visible = kwargs.get('visible', True)
         self.choices = kwargs.get('choices', [])
         self.elem_id = kwargs.get('elem_id', None)
@@ -28,6 +38,7 @@ class MockComponent:
         self.step = kwargs.get('step', 1)
         self.interactive = kwargs.get('interactive', True)
         self.placeholder = kwargs.get('placeholder', None)
+        self.info = kwargs.get('info', None)
 
         self.change = lambda *a, **k: self
         self.click = lambda *a, **k: self
@@ -125,6 +136,7 @@ class MockGradioModule:
     def Textbox(self, *args, **kwargs): return self._register_component(MockComponent("Textbox", *args, **kwargs))
     def Number(self, *args, **kwargs): return self._register_component(MockComponent("Number", *args, **kwargs))
     def Checkbox(self, *args, **kwargs): return self._register_component(MockComponent("Checkbox", *args, **kwargs))
+    def CheckboxGroup(self, *args, **kwargs): return self._register_component(MockComponent("CheckboxGroup", *args, **kwargs))
     def Radio(self, *args, **kwargs): return self._register_component(MockComponent("Radio", *args, **kwargs))
     def Audio(self, *args, **kwargs): return self._register_component(MockComponent("Audio", *args, **kwargs))
     def File(self, *args, **kwargs): return self._register_component(MockComponent("File", *args, **kwargs))
@@ -180,12 +192,26 @@ class MockWAN2GPApplication:
     def setup_ui_tabs(self, *args, **kwargs): pass
     def run_component_insertion(self, locals_dict): pass
 
-class MockApp:
+class MockWAN2GPPlugin:
     def __init__(self):
-        self.plugin_manager = MockPluginManager()
-    def initialize_plugins(self, *args, **kwargs): pass
-    def setup_ui_tabs(self, *args, **kwargs): pass
-    def run_component_insertion(self, *args, **kwargs): pass
+        self.wgp_module = None 
+
+    def request_global(self, name):
+        if self.wgp_module and hasattr(self.wgp_module, name):
+            setattr(self, name, getattr(self.wgp_module, name))
+        else:
+            setattr(self, name, None)
+
+    def request_component(self, name):
+        setattr(self, name, MockComponent(elem_id=name))
+
+    def add_tab(self, tab_id, label, component_constructor):
+        component_constructor()
+
+    def get_sorted_dropdown(self, *args, **kwargs):
+        if self.wgp_module:
+            return self.wgp_module.get_sorted_dropdown(*args, **kwargs)
+        return [], [], []
 
 mock_gradio = MockGradioModule()
 sys.modules['gradio'] = mock_gradio
@@ -199,6 +225,7 @@ mock_audio_gallery.AudioGallery = MockAudioGallery
 mock_plugin_utils = MockPluginModule()
 mock_plugin_utils.PluginManager = MockPluginManager
 mock_plugin_utils.WAN2GPApplication = MockWAN2GPApplication
+mock_plugin_utils.WAN2GPPlugin = MockWAN2GPPlugin
 mock_plugin_utils.SYSTEM_PLUGINS = []
 sys.modules['shared.utils.plugins'] = mock_plugin_utils
 
@@ -211,7 +238,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QTextEdit, QSlider, QCheckBox, QComboBox,
     QFileDialog, QGroupBox, QFormLayout, QTableWidget, QTableWidgetItem,
     QHeaderView, QProgressBar, QScrollArea, QListWidget, QListWidgetItem,
-    QMessageBox, QRadioButton, QSizePolicy, QMenu, QSplitter
+    QMessageBox, QRadioButton, QSizePolicy, QMenu, QSplitter, QInputDialog
 )
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QUrl, QSize, QRectF, QTimer
 from PyQt6.QtGui import QPixmap, QImage, QDropEvent
@@ -333,25 +360,98 @@ class DynamicUiBuilder(QObject):
             wgp.advanced = old_advanced
             if mock_gradio.is_capturing: mock_gradio.stop_capture()
 
-    def _build_qt_layout(self, nodes, parent_layout):
-        for node in nodes:
-            var_name = self.id_to_name.get(node.id)
-            label = node.label or node.kwargs.get('label')
+    def build_config_tab(self):
+        """Introspects the wan2gp-configuration plugin to build the config UI."""
+        mock_gradio.start_capture()
+        config_plugin_path = wan2gp_dir / 'plugins' / 'wan2gp-configuration' / 'plugin.py'
+        
+        if not config_plugin_path.exists():
+            print(f"[DynamicUI] Config plugin not found at {config_plugin_path}")
+            return None
+
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("config_plugin", config_plugin_path)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            
+            if not hasattr(module, 'ConfigTabPlugin'):
+                print("[DynamicUI] ConfigTabPlugin class not found in plugin module.")
+                return None
+
+            plugin_instance = module.ConfigTabPlugin()
+            plugin_instance.wgp_module = wgp
+
+            with working_directory(wan2gp_dir):
+                plugin_instance.setup_ui()
+
+            self.id_to_name.clear()
+            for name, obj in plugin_instance.__dict__.items():
+                if isinstance(obj, MockComponent):
+                    self.id_to_name[obj.id] = f"config_{name.replace('_choice', '')}"
+
+            root_components = mock_gradio.stop_capture()
+
+            config_tabs_node = None
+            for comp in root_components:
+                if comp.type_name == 'Tabs':
+                    config_tabs_node = comp
+                    break
+                for child in comp.children:
+                    if child.type_name == 'Tabs':
+                        config_tabs_node = child
+                        break
+            
+            if not config_tabs_node:
+                print("[DynamicUI] Could not locate Tabs in config UI.")
+                return None
+
+            tabs_widget = QTabWidget()
+            
+            for tab_node in config_tabs_node.children:
+                if tab_node.type_name != 'Tab': continue
+                
+                tab_name = tab_node.args[0] if tab_node.args else tab_node.kwargs.get('label', "Untitled")
+                tab_page = QWidget()
+                page_scroll = QScrollArea()
+                page_scroll.setWidgetResizable(True)
+                page_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+                content_widget = QWidget()
+                tab_layout = QVBoxLayout(content_widget)
+                tab_layout.setContentsMargins(5, 5, 5, 5)
+                
+                self._build_qt_layout(tab_node.children, tab_layout, is_config=True)
+                
+                tab_layout.addStretch()
+                page_scroll.setWidget(content_widget)
+                wrapper_layout = QVBoxLayout(tab_page)
+                wrapper_layout.setContentsMargins(0,0,0,0)
+                wrapper_layout.addWidget(page_scroll)
+                tabs_widget.addTab(tab_page, tab_name)
+                
+            return tabs_widget
+
+        except Exception as e:
+            print(f"[DynamicUI] Config Exception: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+        finally:
+            if mock_gradio.is_capturing: mock_gradio.stop_capture()
+
+    def _build_qt_layout(self, nodes, parent_layout, is_config=False):
+        for node in nodes:            
+            var_name = self.id_to_name.get(node.id)            
+            label = node.label or node.kwargs.get('label', var_name)
             
             if var_name in ['audio_source']: continue
             
             if node.type_name in ['Column', 'Row', 'Group', 'Blocks']:
-                container = QGroupBox(label) if label else QWidget()
-
-                if node.type_name == 'Row':
-                    layout = QHBoxLayout(container)
-                else:
-                    layout = QVBoxLayout(container)
-                    
+                container = QGroupBox(label) if label and node.type_name != 'Blocks' else QWidget()
+                layout = QHBoxLayout(container) if node.type_name == 'Row' else QVBoxLayout(container)
                 layout.setContentsMargins(0,0,0,0)
                 if label: layout.setContentsMargins(5,15,5,5)
-                
-                self._build_qt_layout(node.children, layout)
+                self._build_qt_layout(node.children, layout, is_config)
                 if not node.visible: container.hide()
                 parent_layout.addWidget(container)
             
@@ -360,98 +460,132 @@ class DynamicUiBuilder(QObject):
                 group.setCheckable(True)
                 group.setChecked(node.kwargs.get('open', False))
                 layout = QVBoxLayout(group)
-                self._build_qt_layout(node.children, layout)
+                self._build_qt_layout(node.children, layout, is_config)
                 if not node.visible: group.hide()
                 parent_layout.addWidget(group)
 
             elif node.type_name == 'Slider':
                 if not var_name: continue
-                
-                min_val = node.minimum
-                max_val = node.maximum
-                step = node.step
-                val = node.value if node.value is not None else min_val
-                
-                is_float = isinstance(step, float) or isinstance(min_val, float)
-                scale = 100.0 if is_float else 1.0
-                precision = 2 if is_float else 0
-                if step < 0.01: scale = 1000.0; precision=3
-                elif step < 0.1: scale = 100.0; precision=2
-                elif step >= 1.0 and not is_float: scale = 1.0; precision=0
-
                 container = self.main._create_slider_with_label_dynamic(
-                    var_name, min_val, max_val, val, scale, precision, label or var_name
+                    var_name, node.minimum, node.maximum, node.value or node.minimum, 
+                    100.0 if isinstance(node.step, float) else 1.0, 
+                    2 if isinstance(node.step, float) else 0, label
                 )
-                if not node.visible: container.hide()
                 parent_layout.addWidget(container)
 
-            elif node.type_name == 'Dropdown':
+            elif node.type_name == 'Dropdown' or node.type_name == 'CheckboxGroup':
                 if not var_name: continue
-                combo = QComboBox()
-                for choice in node.choices:
-                    if isinstance(choice, (list, tuple)) and len(choice) == 2:
-                        combo.addItem(str(choice[0]), choice[1])
-                    else:
-                        combo.addItem(str(choice), choice)
+                is_multiselect = node.kwargs.get('multiselect', False) or node.type_name == 'CheckboxGroup'
                 
-                val = node.value
-                idx = combo.findData(val)
-                if idx == -1: idx = combo.findText(str(val))
-                if idx != -1: combo.setCurrentIndex(idx)
-                
-                self.main.dynamic_inputs_config[var_name] = {'type': 'dropdown', 'widget': combo}
-                self.main.widgets[var_name] = combo
-                
-                cont = QWidget()
-                l = QVBoxLayout(cont); l.setContentsMargins(0,0,0,0)
-                l.addWidget(QLabel(label or var_name))
-                l.addWidget(combo)
-                if not node.visible: cont.hide()
-                parent_layout.addWidget(cont)
+                if is_multiselect:
+                    list_widget = QListWidget()
+                    list_widget.setMinimumHeight(120)
+                    current_vals = node.value if isinstance(node.value, list) else []
+                    
+                    # Extract choices from args if not in choices attribute
+                    choices = node.choices
+                    if not choices and node.args and isinstance(node.args[0], list):
+                        choices = node.args[0]
+
+                    for choice in (choices or []):
+                        text, data = choice if isinstance(choice, (list, tuple)) else (str(choice), choice)
+                        item = QListWidgetItem(text)
+                        item.setData(Qt.ItemDataRole.UserRole, data)
+                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                        item.setCheckState(Qt.CheckState.Checked if data in current_vals else Qt.CheckState.Unchecked)
+                        list_widget.addItem(item)
+                    
+                    target_config = self.main.config_inputs_config if is_config else self.main.dynamic_inputs_config
+                    target_config[var_name] = {'type': 'checklist', 'widget': list_widget}
+                    self.main.widgets[var_name] = list_widget
+                    
+                    cont = QWidget()
+                    l = QVBoxLayout(cont); l.setContentsMargins(0,0,0,0)
+                    l.addWidget(QLabel(label))
+                    l.addWidget(list_widget)
+                    parent_layout.addWidget(cont)
+                else:
+                    combo = QComboBox()
+                    choices = node.choices or (node.args[0] if node.args and isinstance(node.args[0], list) else [])
+                    for choice in choices:
+                        text, data = choice if isinstance(choice, (list, tuple)) else (str(choice), choice)
+                        combo.addItem(text, data)
+                    idx = combo.findData(node.value)
+                    if idx != -1: combo.setCurrentIndex(idx)
+                    
+                    target_config = self.main.config_inputs_config if is_config else self.main.dynamic_inputs_config
+                    target_config[var_name] = {'type': 'dropdown', 'widget': combo}
+                    self.main.widgets[var_name] = combo
+                    
+                    cont = QWidget()
+                    l = QVBoxLayout(cont); l.setContentsMargins(0,0,0,0)
+                    l.addWidget(QLabel(label))
+                    l.addWidget(combo)
+                    parent_layout.addWidget(cont)
 
             elif node.type_name == 'Checkbox':
                 if not var_name: continue
-                cb = QCheckBox(label or var_name)
+                cb = QCheckBox(label)
                 cb.setChecked(bool(node.value))
-                self.main.dynamic_inputs_config[var_name] = {'type': 'checkbox', 'widget': cb}
+                target_config = self.main.config_inputs_config if is_config else self.main.dynamic_inputs_config
+                target_config[var_name] = {'type': 'checkbox', 'widget': cb}
                 self.main.widgets[var_name] = cb
-                if not node.visible: cb.hide()
                 parent_layout.addWidget(cb)
 
             elif node.type_name in ['Textbox', 'Text']:
                 if not var_name: continue
-                is_multi = node.kwargs.get('lines', 1) > 1
-                txt = QTextEdit() if is_multi else QLineEdit()
-                if is_multi: txt.setMaximumHeight(80)
                 
-                val = str(node.value) if node.value is not None else ""
-                if isinstance(txt, QLineEdit): txt.setText(val)
-                else: txt.setPlainText(val)
+                # Determine if we should force a list editor by checking the actual config data
+                use_list_editor = False
+                list_items = []
                 
-                if 'placeholder' in node.kwargs:
-                    txt.setPlaceholderText(node.kwargs['placeholder'])
+                if is_config:
+                    real_key = var_name.replace("config_", "")
+                    # Look up the raw value in server_config
+                    raw_val = wgp.server_config.get(real_key)
+                    if isinstance(raw_val, list):
+                        use_list_editor = True
+                        list_items = raw_val
+                
+                # Fallback to checking the node value itself
+                if not use_list_editor and isinstance(node.value, list):
+                    use_list_editor = True
+                    list_items = node.value
 
-                self.main.dynamic_inputs_config[var_name] = {'type': 'text', 'widget': txt}
-                self.main.widgets[var_name] = txt
-                
-                cont = QWidget()
-                l = QVBoxLayout(cont); l.setContentsMargins(0,0,0,0)
-                l.addWidget(QLabel(label or var_name))
-                l.addWidget(txt)
-                if not node.visible: cont.hide()
-                parent_layout.addWidget(cont)
+                if use_list_editor:
+                    editor = ListEditorWidget(label, list_items)
+                    self.main.config_inputs_config[var_name] = {'type': 'list_editor', 'widget': editor}
+                    # Register in widgets so it can be cleared/reset if needed
+                    self.main.widgets[var_name] = editor 
+                    parent_layout.addWidget(editor)
+                else:
+                    is_multi = node.kwargs.get('lines', 1) > 1
+                    txt = QTextEdit() if is_multi else QLineEdit()
+                    if is_multi: txt.setMaximumHeight(80)
+                    
+                    val = str(node.value) if node.value is not None else ""
+                    if isinstance(txt, QLineEdit): txt.setText(val)
+                    else: txt.setPlainText(val)
+                    
+                    if 'placeholder' in node.kwargs:
+                        txt.setPlaceholderText(node.kwargs['placeholder'])
+
+                    target_dict = self.main.config_inputs_config if is_config else self.main.dynamic_inputs_config
+                    target_dict[var_name] = {'type': 'text', 'widget': txt}
+                    self.main.widgets[var_name] = txt
+                    
+                    cont = QWidget()
+                    l = QVBoxLayout(cont); l.setContentsMargins(0,0,0,0)
+                    l.addWidget(QLabel(label))
+                    l.addWidget(txt)
+                    parent_layout.addWidget(cont)
 
             elif node.type_name in ['File', 'Audio', 'Image', 'Video']:
                 if not var_name: continue
-                container = self.main._create_file_input(var_name, label or var_name)
-                if var_name in self.main.widgets:
-                    self.main.dynamic_inputs_config[var_name] = {'type': 'file', 'widget': self.main.widgets[var_name]}
-                if not node.visible: container.hide()
+                container = self.main._create_file_input(var_name, label)
+                target_config = self.main.config_inputs_config if is_config else self.main.dynamic_inputs_config
+                target_config[var_name] = {'type': 'file', 'widget': self.main.widgets[var_name]}
                 parent_layout.addWidget(container)
-
-            if node.type_name not in ['Row', 'Column', 'Group', 'Accordion', 'Tabs', 'Tab', 'Blocks']:
-                if node.children:
-                    self._build_qt_layout(node.children, parent_layout)
 
 class Wan2GPSetupWidget(QWidget):
     def __init__(self, plugin_instance, parent=None):
@@ -716,6 +850,39 @@ class Worker(QObject):
         gen_thread.join()
         self.finished.emit()
 
+class ListEditorWidget(QWidget):
+    def __init__(self, label, initial_items, parent=None):
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        layout.addWidget(QLabel(label))
+        self.list_widget = QListWidget()
+        self.list_widget.addItems(initial_items if initial_items else [])
+        self.list_widget.setMaximumHeight(150)
+        layout.addWidget(self.list_widget)
+        
+        btn_layout = QHBoxLayout()
+        self.add_btn = QPushButton("+ Add")
+        self.remove_btn = QPushButton("- Remove")
+        btn_layout.addWidget(self.add_btn)
+        btn_layout.addWidget(self.remove_btn)
+        layout.addLayout(btn_layout)
+        
+        self.add_btn.clicked.connect(self.add_item)
+        self.remove_btn.clicked.connect(self.remove_item)
+        
+    def add_item(self):
+        text, ok = QInputDialog.getText(self, "Add Item", "Enter path/string:")
+        if ok and text:
+            self.list_widget.addItem(text)
+            
+    def remove_item(self):
+        for item in self.list_widget.selectedItems():
+            self.list_widget.takeItem(self.list_widget.row(item))
+
+    def get_items(self):
+        return [self.list_widget.item(i).text() for i in range(self.list_widget.count())]
 
 class WgpDesktopPluginWidget(QWidget):
     def __init__(self, plugin):
@@ -730,7 +897,9 @@ class WgpDesktopPluginWidget(QWidget):
         self.main_config = {}
         self.processed_files = set()
         self.dynamic_inputs_config = {}
+        self.config_inputs_config = {}
         self.advanced_tabs_widget = None
+        self.config_tabs_widget = None
         
         self.load_main_config()
         self.ui_builder = DynamicUiBuilder(self)
@@ -814,14 +983,7 @@ class WgpDesktopPluginWidget(QWidget):
         
         slider_container = self._create_slider_with_label(name, int(min_val*scale), int(max_val*scale), initial_val, scale, precision)
         
-        self.widgets[name] = self.widgets[name]
-        self.dynamic_inputs_config[name] = {
-            'type': 'slider',
-            'widget': self.widgets[name],
-            'scale': scale,
-            'precision': precision
-        }
-        
+        self.widgets[name] = self.widgets[name]        
         layout.addWidget(slider_container)
         return container
 
@@ -1099,13 +1261,16 @@ class WgpDesktopPluginWidget(QWidget):
         main_layout = QVBoxLayout(config_tab)
         self.config_status_label = QLabel("Apply changes for them to take effect. Some may require a restart.")
         main_layout.addWidget(self.config_status_label)
-        config_tabs = QTabWidget()
-        main_layout.addWidget(config_tabs)
-        config_tabs.addTab(self._create_general_config_tab(), "General")
-        config_tabs.addTab(self._create_performance_config_tab(), "Performance")
-        config_tabs.addTab(self._create_extensions_config_tab(), "Extensions")
-        config_tabs.addTab(self._create_outputs_config_tab(), "Outputs")
-        config_tabs.addTab(self._create_notifications_config_tab(), "Notifications")
+        
+        self.config_layout_container = QVBoxLayout()
+        main_layout.addLayout(self.config_layout_container)
+
+        self.config_tabs_widget = self.ui_builder.build_config_tab()
+        if self.config_tabs_widget:
+            self.config_layout_container.addWidget(self.config_tabs_widget)
+        else:
+            self.config_layout_container.addWidget(QLabel("Configuration options unavailable."))
+
         self.apply_config_btn = QPushButton("Apply Changes")
         self.apply_config_btn.clicked.connect(self._on_apply_config_changes)
         main_layout.addWidget(self.apply_config_btn)
@@ -1121,120 +1286,7 @@ class WgpDesktopPluginWidget(QWidget):
         scroll_area.setWidget(content_widget)
         return tab_widget, form_layout
 
-    def _create_config_combo(self, form_layout, label, key, choices, default_value):
-        combo = QComboBox()
-        for text, data in choices: combo.addItem(text, data)
-        index = combo.findData(wgp.server_config.get(key, default_value))
-        if index != -1: combo.setCurrentIndex(index)
-        self.widgets[f'config_{key}'] = combo
-        form_layout.addRow(label, combo)
 
-    def _create_config_slider(self, form_layout, label, key, min_val, max_val, default_value, step=1):
-        container = QWidget()
-        hbox = QHBoxLayout(container)
-        hbox.setContentsMargins(0,0,0,0)
-        slider = QSlider(Qt.Orientation.Horizontal)
-        slider.setRange(min_val, max_val)
-        slider.setSingleStep(step)
-        slider.setValue(wgp.server_config.get(key, default_value))
-        value_label = QLabel(str(slider.value()))
-        value_label.setMinimumWidth(40)
-        slider.valueChanged.connect(lambda v, lbl=value_label: lbl.setText(str(v)))
-        hbox.addWidget(slider)
-        hbox.addWidget(value_label)
-        self.widgets[f'config_{key}'] = slider
-        form_layout.addRow(label, container)
-
-    def _create_config_checklist(self, form_layout, label, key, choices, default_value):
-        list_widget = QListWidget()
-        list_widget.setMinimumHeight(100)
-        current_values = wgp.server_config.get(key, default_value)
-        for text, data in choices:
-            item = QListWidgetItem(text)
-            item.setData(Qt.ItemDataRole.UserRole, data)
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Checked if data in current_values else Qt.CheckState.Unchecked)
-            list_widget.addItem(item)
-        self.widgets[f'config_{key}'] = list_widget
-        form_layout.addRow(label, list_widget)
-
-    def _create_config_textbox(self, form_layout, label, key, default_value, multi_line=False):
-        if multi_line:
-            textbox = QTextEdit(default_value)
-            textbox.setAcceptRichText(False)
-        else:
-            textbox = QLineEdit(default_value)
-        self.widgets[f'config_{key}'] = textbox
-        form_layout.addRow(label, textbox)
-
-    def _create_general_config_tab(self):
-        tab, form = self._create_scrollable_form_tab()
-        _, _, dropdown_choices = wgp.get_sorted_dropdown(wgp.displayed_model_types, None, None, False)
-        self._create_config_checklist(form, "Selectable Models:", "transformer_types", dropdown_choices, wgp.transformer_types)
-        self._create_config_combo(form, "Model Hierarchy:", "model_hierarchy_type", [("Two Levels (Family > Model)", 0), ("Three Levels (Family > Base > Finetune)", 1)], 1)
-        self._create_config_combo(form, "Video Dimensions:", "fit_canvas", [("Dimensions are Pixels Budget", 0), ("Dimensions are Max Width/Height", 1), ("Dimensions are Output Width/Height (Cropped)", 2)], 0)
-        self._create_config_combo(form, "Attention Type:", "attention_mode", [("Auto (Recommended)", "auto"), ("SDPA", "sdpa"), ("Flash", "flash"), ("Xformers", "xformers"), ("Sage", "sage"), ("Sage2/2++", "sage2")], "auto")
-        self._create_config_combo(form, "Metadata Handling:", "metadata_type", [("Embed in file (Exif/Comment)", "metadata"), ("Export separate JSON", "json"), ("None", "none")], "metadata")
-        checkbox = QCheckBox()
-        checkbox.setChecked(wgp.server_config.get("embed_source_images", False))
-        self.widgets['config_embed_source_images'] = checkbox
-        form.addRow("Embed Source Images in MP4:", checkbox)
-        self._create_config_checklist(form, "RAM Loading Policy:", "preload_model_policy", [("Preload on App Launch", "P"), ("Preload on Model Switch", "S"), ("Unload when Queue is Done", "U")], [])
-        self._create_config_combo(form, "Keep Previous Videos:", "clear_file_list", [("None", 0), ("Keep last video", 1), ("Keep last 5", 5), ("Keep last 10", 10), ("Keep last 20", 20), ("Keep last 30", 30)], 5)
-        self._create_config_combo(form, "Display RAM/VRAM Stats:", "display_stats", [("Disabled", 0), ("Enabled", 1)], 0)
-        self._create_config_combo(form, "Max Frames Multiplier:", "max_frames_multiplier", [(f"x{i}", i) for i in range(1, 8)], 1)
-        checkpoints_paths_text = "\n".join(wgp.server_config.get("checkpoints_paths", wgp.fl.default_checkpoints_paths))
-        checkpoints_textbox = QTextEdit()
-        checkpoints_textbox.setPlainText(checkpoints_paths_text)
-        checkpoints_textbox.setAcceptRichText(False)
-        checkpoints_textbox.setMinimumHeight(60)
-        self.widgets['config_checkpoints_paths'] = checkpoints_textbox
-        form.addRow("Checkpoints Paths:", checkpoints_textbox)
-        self._create_config_combo(form, "UI Theme (requires restart):", "UI_theme", [("Blue Sky", "default"), ("Classic Gradio", "gradio")], "default")
-        self._create_config_combo(form, "Queue Color Scheme:", "queue_color_scheme", [("Pastel (Unique color per item)", "pastel"), ("Alternating Grey Shades", "alternating_grey")], "pastel")
-        return tab
-
-    def _create_performance_config_tab(self):
-        tab, form = self._create_scrollable_form_tab()
-        self._create_config_combo(form, "Transformer Quantization:", "transformer_quantization", [("Scaled Int8 (recommended)", "int8"), ("16-bit (no quantization)", "bf16")], "int8")
-        self._create_config_combo(form, "Transformer Data Type:", "transformer_dtype_policy", [("Best Supported by Hardware", ""), ("FP16", "fp16"), ("BF16", "bf16")], "")
-        self._create_config_combo(form, "Transformer Calculation:", "mixed_precision", [("16-bit only", "0"), ("Mixed 16/32-bit (better quality)", "1")], "0")
-        self._create_config_combo(form, "Text Encoder:", "text_encoder_quantization", [("16-bit (more RAM, better quality)", "bf16"), ("8-bit (less RAM, slightly lower quality)", "int8")], "int8")
-        self._create_config_combo(form, "VAE Precision:", "vae_precision", [("16-bit (faster, less VRAM)", "16"), ("32-bit (slower, better quality)", "32")], "16")
-        self._create_config_combo(form, "Compile Transformer:", "compile", [("On (requires Triton)", "transformer"), ("Off", "")], "")
-        self._create_config_combo(form, "DepthAnything v2 Variant:", "depth_anything_v2_variant", [("Large (more precise)", "vitl"), ("Big (faster)", "vitb")], "vitl")
-        self._create_config_combo(form, "VAE Tiling:", "vae_config", [("Auto", 0), ("Disabled", 1), ("256x256 Tiles (~8GB VRAM)", 2), ("128x128 Tiles (~6GB VRAM)", 3)], 0)
-        self._create_config_combo(form, "Boost:", "boost", [("On", 1), ("Off", 2)], 1)
-        self._create_config_combo(form, "Memory Profile:", "profile", wgp.memory_profile_choices, wgp.profile_type.LowRAM_LowVRAM)
-        self._create_config_slider(form, "Preload in VRAM (MB):", "preload_in_VRAM", 0, 40000, 0, 100)
-        release_ram_btn = QPushButton("Force Release Models from RAM")
-        release_ram_btn.clicked.connect(self._on_release_ram)
-        form.addRow(release_ram_btn)
-        return tab
-
-    def _create_extensions_config_tab(self):
-        tab, form = self._create_scrollable_form_tab()
-        self._create_config_combo(form, "Prompt Enhancer:", "enhancer_enabled", [("Off", 0), ("Florence 2 + Llama 3.2", 1), ("Florence 2 + Joy Caption (uncensored)", 2)], 0)
-        self._create_config_combo(form, "Enhancer Mode:", "enhancer_mode", [("Automatic on Generate", 0), ("On Demand Only", 1)], 0)
-        self._create_config_combo(form, "MMAudio Mode:", "mmaudio_mode", [("Off", 0), ("Standard", 1), ("NSFW", 2)], 0)
-        self._create_config_combo(form, "MMAudio Persistence:", "mmaudio_persistence", [("Unload after use", 1), ("Persistent in RAM", 2)], 1)
-        return tab
-
-    def _create_outputs_config_tab(self):
-        tab, form = self._create_scrollable_form_tab()
-        self._create_config_combo(form, "Video Codec:", "video_output_codec", [("x265 Balanced", 'libx265_28'), ("x264 Balanced", 'libx264_8'), ("x265 High Quality", 'libx265_8'), ("x264 High Quality", 'libx264_10'), ("x264 Lossless", 'libx264_lossless')], 'libx264_8')
-        self._create_config_combo(form, "Image Codec:", "image_output_codec", [("JPEG Q85", 'jpeg_85'), ("WEBP Q85", 'webp_85'), ("JPEG Q95", 'jpeg_95'), ("WEBP Q95", 'webp_95'), ("WEBP Lossless", 'webp_lossless'), ("PNG Lossless", 'png')], 'jpeg_95')
-        self._create_config_combo(form, "Audio Codec:", "audio_output_codec", [("AAC 128 kbit", 'aac_128')], 'aac_128')
-        self._create_config_textbox(form, "Video Output Folder:", "save_path", wgp.server_config.get("save_path", "outputs"))
-        self._create_config_textbox(form, "Image Output Folder:", "image_save_path", wgp.server_config.get("image_save_path", "outputs"))
-        return tab
-
-    def _create_notifications_config_tab(self):
-        tab, form = self._create_scrollable_form_tab()
-        self._create_config_combo(form, "Notification Sound:", "notification_sound_enabled", [("On", 1), ("Off", 0)], 0)
-        self._create_config_slider(form, "Sound Volume:", "notification_sound_volume", 0, 100, 50, 5)
-        return tab
-        
     def init_wgp_state(self):
         with working_directory(wan2gp_dir):
             if not wgp.models_def:
@@ -1501,6 +1553,29 @@ class WgpDesktopPluginWidget(QWidget):
         is_visible = self.main_config.get('preview_visible', True)
         self.widgets['preview_group'].setChecked(is_visible)
         self.widgets['preview_image'].setVisible(is_visible)
+
+        if hasattr(self, 'config_inputs_config'):
+            for var_name, config in self.config_inputs_config.items():
+                val = wgp.server_config.get(var_name.replace("config_", ""))
+                if val is not None:
+                    widget = config['widget']
+                    widget.blockSignals(True)
+                    if config['type'] == 'dropdown':
+                        idx = widget.findData(val)
+                        if idx != -1: widget.setCurrentIndex(idx)
+                    elif config['type'] == 'checkbox':
+                        widget.setChecked(bool(val))
+                    elif config['type'] == 'text':
+                        if isinstance(widget, QLineEdit): widget.setText(str(val))
+                        else: widget.setPlainText(str(val))
+                    elif config['type'] == 'checklist':
+                        if isinstance(val, list):
+                            for i in range(widget.count()):
+                                item = widget.item(i)
+                                item.setCheckState(Qt.CheckState.Checked if item.data(Qt.ItemDataRole.UserRole) in val else Qt.CheckState.Unchecked)
+                    elif config['type'] == 'slider':
+                        widget.setValue(int(val))
+                    widget.blockSignals(False)
 
     def _on_preview_toggled(self, checked):
         self.widgets['preview_image'].setVisible(checked)
@@ -1916,49 +1991,28 @@ class WgpDesktopPluginWidget(QWidget):
 
         try:
             ui_settings = {}
-            list_widget = self.widgets['config_transformer_types']
-            ui_settings['transformer_types'] = [list_widget.item(i).data(Qt.ItemDataRole.UserRole) for i in range(list_widget.count()) if list_widget.item(i).checkState() == Qt.CheckState.Checked]
-            list_widget = self.widgets['config_preload_model_policy']
-            ui_settings['preload_model_policy'] = [list_widget.item(i).data(Qt.ItemDataRole.UserRole) for i in range(list_widget.count()) if list_widget.item(i).checkState() == Qt.CheckState.Checked]
-
-            ui_settings['model_hierarchy_type'] = self.widgets['config_model_hierarchy_type'].currentData()
-            ui_settings['fit_canvas'] = self.widgets['config_fit_canvas'].currentData()
-            ui_settings['attention_mode'] = self.widgets['config_attention_mode'].currentData()
-            ui_settings['metadata_type'] = self.widgets['config_metadata_type'].currentData()
-            ui_settings['clear_file_list'] = self.widgets['config_clear_file_list'].currentData()
-            ui_settings['display_stats'] = self.widgets['config_display_stats'].currentData()
-            ui_settings['max_frames_multiplier'] = self.widgets['config_max_frames_multiplier'].currentData()
-            ui_settings['checkpoints_paths'] = [p.strip() for p in self.widgets['config_checkpoints_paths'].toPlainText().replace("\r", "").split("\n") if p.strip()]
-            ui_settings['UI_theme'] = self.widgets['config_UI_theme'].currentData()
-            ui_settings['queue_color_scheme'] = self.widgets['config_queue_color_scheme'].currentData()
-
-            ui_settings['transformer_quantization'] = self.widgets['config_transformer_quantization'].currentData()
-            ui_settings['transformer_dtype_policy'] = self.widgets['config_transformer_dtype_policy'].currentData()
-            ui_settings['mixed_precision'] = self.widgets['config_mixed_precision'].currentData()
-            ui_settings['text_encoder_quantization'] = self.widgets['config_text_encoder_quantization'].currentData()
-            ui_settings['vae_precision'] = self.widgets['config_vae_precision'].currentData()
-            ui_settings['compile'] = self.widgets['config_compile'].currentData()
-            ui_settings['depth_anything_v2_variant'] = self.widgets['config_depth_anything_v2_variant'].currentData()
-            ui_settings['vae_config'] = self.widgets['config_vae_config'].currentData()
-            ui_settings['boost'] = self.widgets['config_boost'].currentData()
-            ui_settings['profile'] = self.widgets['config_profile'].currentData()
-            ui_settings['preload_in_VRAM'] = self.widgets['config_preload_in_VRAM'].value()
-
-            ui_settings['enhancer_enabled'] = self.widgets['config_enhancer_enabled'].currentData()
-            ui_settings['enhancer_mode'] = self.widgets['config_enhancer_mode'].currentData()
-            ui_settings['mmaudio_mode'] = self.widgets['config_mmaudio_mode'].currentData()
-            ui_settings['mmaudio_persistence'] = self.widgets['config_mmaudio_persistence'].currentData()
-
-            ui_settings['video_output_codec'] = self.widgets['config_video_output_codec'].currentData()
-            ui_settings['image_output_codec'] = self.widgets['config_image_output_codec'].currentData()
-            ui_settings['audio_output_codec'] = self.widgets['config_audio_output_codec'].currentData()
-            ui_settings['embed_source_images'] = self.widgets['config_embed_source_images'].isChecked()
-            ui_settings['save_path'] = self.widgets['config_save_path'].text()
-            ui_settings['image_save_path'] = self.widgets['config_image_save_path'].text()
-
-            ui_settings['notification_sound_enabled'] = self.widgets['config_notification_sound_enabled'].currentData()
-            ui_settings['notification_sound_volume'] = self.widgets['config_notification_sound_volume'].value()
-
+            for var_name, config in self.config_inputs_config.items():
+                real_key = var_name.replace("config_", "")
+                widget = config['widget']
+                
+                if config['type'] == 'dropdown':
+                    ui_settings[real_key] = widget.currentData()
+                elif config['type'] == 'checkbox':
+                    ui_settings[real_key] = widget.isChecked()
+                elif config['type'] == 'text':
+                    ui_settings[real_key] = widget.text() if isinstance(widget, QLineEdit) else widget.toPlainText()
+                elif config['type'] == 'slider':
+                    ui_settings[real_key] = widget.value()
+                elif config['type'] == 'list_editor':
+                    ui_settings[real_key] = widget.get_items()
+                elif config['type'] == 'checklist':
+                    selected_items = []
+                    for i in range(widget.count()):
+                        item = widget.item(i)
+                        if item.checkState() == Qt.CheckState.Checked:
+                            selected_items.append(item.data(Qt.ItemDataRole.UserRole))
+                    ui_settings[real_key] = selected_items
+            
             ui_settings['last_model_type'] = self.state["model_type"]
             ui_settings['last_model_per_family'] = self.state["last_model_per_family"]
             ui_settings['last_model_per_type'] = self.state["last_model_per_type"]
@@ -1966,20 +2020,13 @@ class WgpDesktopPluginWidget(QWidget):
             ui_settings['last_resolution_choice'] = self.widgets['resolution'].currentData()
             ui_settings['last_resolution_per_group'] = self.state["last_resolution_per_group"]
 
-            wgp.fl.set_checkpoints_paths(ui_settings['checkpoints_paths'])
-            wgp.three_levels_hierarchy = ui_settings["model_hierarchy_type"] == 1
-            wgp.attention_mode = ui_settings["attention_mode"]
-            wgp.default_profile = ui_settings["profile"]
-            wgp.compile = ui_settings["compile"]
-            wgp.text_encoder_quantization = ui_settings["text_encoder_quantization"]
-            wgp.vae_config = ui_settings["vae_config"]
-            wgp.boost = ui_settings["boost"]
-            wgp.save_path = ui_settings["save_path"]
-            wgp.image_save_path = ui_settings["image_save_path"]
-            wgp.preload_model_policy = ui_settings["preload_model_policy"]
-            wgp.transformer_quantization = ui_settings["transformer_quantization"]
-            wgp.transformer_dtype_policy = ui_settings["transformer_dtype_policy"]
-            wgp.transformer_types = ui_settings["transformer_types"]
+            if 'checkpoints_paths' in ui_settings:
+                wgp.fl.set_checkpoints_paths(ui_settings['checkpoints_paths'])
+            
+            for key, value in ui_settings.items():
+                if hasattr(wgp, key):
+                    setattr(wgp, key, value)
+            
             wgp.reload_needed = True
 
             with working_directory(wan2gp_dir):
