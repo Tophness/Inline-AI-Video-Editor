@@ -1311,7 +1311,12 @@ class WgpDesktopPluginWidget(QWidget):
 
             self.widgets['prompt'].setText(ui_defaults.get("prompt", ""))
             self.widgets['negative_prompt'].setText(ui_defaults.get("negative_prompt", ""))
-            self.widgets['seed'].setText(str(ui_defaults.get("seed", -1)))
+            seed_val = ui_defaults.get("seed", -1)
+            seed_widget = self.widgets.get('seed')
+            if isinstance(seed_widget, QLineEdit):
+                seed_widget.setText(str(seed_val))
+            elif isinstance(seed_widget, QSlider):
+                seed_widget.setValue(int(seed_val))
             
             video_length_val = ui_defaults.get("video_length", 81)
             self.widgets['video_length'].setValue(video_length_val)
@@ -1820,9 +1825,14 @@ class WgpDesktopPluginWidget(QWidget):
         self.update_queue_table()
         file_list = self.state.get('gen', {}).get('file_list', [])
         for file_path in file_list:
-            if file_path not in self.processed_files:
-                self.add_result_item(file_path)
-                self.processed_files.add(file_path)
+            if not os.path.isabs(file_path):
+                abs_path = os.path.normpath(os.path.join(wan2gp_dir, file_path))
+            else:
+                abs_path = file_path
+
+            if abs_path not in self.processed_files:
+                self.add_result_item(abs_path)
+                self.processed_files.add(abs_path)
 
     def add_result_item(self, video_path):
         item_widget = VideoResultItemWidget(video_path, self.plugin)
