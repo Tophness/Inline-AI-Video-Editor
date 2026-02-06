@@ -28,6 +28,7 @@ class MockComponent:
         self.step = kwargs.get('step', 1)
         self.interactive = kwargs.get('interactive', True)
         self.placeholder = kwargs.get('placeholder', None)
+
         self.change = lambda *a, **k: self
         self.click = lambda *a, **k: self
         self.input = lambda *a, **k: self
@@ -143,6 +144,7 @@ class MockGradioModule:
     
     def update(self, *args, **kwargs): return None
     def on(self, *args, **kwargs): return MockComponent("Dependency", *args, **kwargs)
+
     def Error(self, *args, **kwargs): raise Exception(f"Gradio Error: {args}")
     def Info(self, *args, **kwargs): print(f"Gradio Info: {args}")
     def Warning(self, *args, **kwargs): print(f"Gradio Warning: {args}")
@@ -166,11 +168,17 @@ class MockPluginManager:
     def discover_plugins(self, *args, **kwargs): return []
     def get_custom_js(self): return ""
     def run_component_insertion(self, *args, **kwargs): pass
+    def load_plugins_from_directory(self, *args, **kwargs): pass
+    def inject_globals(self, *args, **kwargs): pass
+    def get_all_plugins(self, *args, **kwargs): return {}
+    def setup_ui(self, *args, **kwargs): return {}
+
 class MockWAN2GPApplication:
     def __init__(self, *args, **kwargs): self.plugin_manager = MockPluginManager()
     def initialize_plugins(self, *args, **kwargs): pass
     def setup_ui_tabs(self, *args, **kwargs): pass
     def run_component_insertion(self, locals_dict): pass
+
 class MockApp:
     def __init__(self):
         self.plugin_manager = MockPluginManager()
@@ -331,7 +339,7 @@ class DynamicUiBuilder(QObject):
             
             if var_name in ['audio_source']: continue
             
-            if node.type_name in ['Column', 'Row', 'Group']:
+            if node.type_name in ['Column', 'Row', 'Group', 'Blocks']:
                 container = QGroupBox(label) if label else QWidget()
 
                 if node.type_name == 'Row':
@@ -440,7 +448,7 @@ class DynamicUiBuilder(QObject):
                 if not node.visible: container.hide()
                 parent_layout.addWidget(container)
 
-            if node.type_name not in ['Row', 'Column', 'Group', 'Accordion', 'Tabs', 'Tab']:
+            if node.type_name not in ['Row', 'Column', 'Group', 'Accordion', 'Tabs', 'Tab', 'Blocks']:
                 if node.children:
                     self._build_qt_layout(node.children, parent_layout)
 
@@ -809,7 +817,8 @@ class WgpDesktopPluginWidget(QWidget):
         self.dynamic_inputs_config[name] = {
             'type': 'slider',
             'widget': self.widgets[name],
-            'scale': scale
+            'scale': scale,
+            'precision': precision
         }
         
         layout.addWidget(slider_container)
@@ -1706,7 +1715,12 @@ class WgpDesktopPluginWidget(QWidget):
             widget = config['widget']
             if config['type'] == 'slider':
                 scale = config.get('scale', 1.0)
-                full_inputs[var_name] = widget.value() / scale
+                precision = config.get('precision', 0)
+                val = widget.value() / scale
+                if precision == 0:
+                    full_inputs[var_name] = int(round(val))
+                else:
+                    full_inputs[var_name] = val
             elif config['type'] == 'dropdown':
                 full_inputs[var_name] = widget.currentData()
             elif config['type'] == 'checkbox':
