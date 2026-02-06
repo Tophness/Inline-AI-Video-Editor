@@ -984,6 +984,7 @@ class WgpDesktopPluginWidget(QWidget):
         self.adv_layout = QVBoxLayout(self.advanced_group)				 
 
         options_layout.addWidget(self.advanced_group)
+        scroll_area.setMinimumHeight(options_widget.sizeHint().height()-260)
         btn_layout = QHBoxLayout()
         self.generate_btn = self.create_widget(QPushButton, 'generate_btn', "Generate")
         self.add_to_queue_btn = self.create_widget(QPushButton, 'add_to_queue_btn', "Add to Queue")
