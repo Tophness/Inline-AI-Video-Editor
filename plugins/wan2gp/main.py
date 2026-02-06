@@ -1670,7 +1670,7 @@ class WgpDesktopPluginWidget(QWidget):
         seed_w = self.widgets.get('seed')
         if isinstance(seed_w, QSlider):
             full_inputs['seed'] = seed_w.value()
-        elif hasattr(seed_w, 'text'):
+        elif isinstance(seed_w, QLineEdit):
             try:
                 txt = seed_w.text()
                 full_inputs['seed'] = int(txt) if txt.strip() else -1
