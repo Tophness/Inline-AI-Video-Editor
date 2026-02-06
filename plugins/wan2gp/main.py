@@ -172,6 +172,7 @@ class MockPluginManager:
     def inject_globals(self, *args, **kwargs): pass
     def get_all_plugins(self, *args, **kwargs): return {}
     def setup_ui(self, *args, **kwargs): return {}
+    def run_data_hooks(self, hook_name, configs=None, **kwargs): return configs
 
 class MockWAN2GPApplication:
     def __init__(self, *args, **kwargs): self.plugin_manager = MockPluginManager()
