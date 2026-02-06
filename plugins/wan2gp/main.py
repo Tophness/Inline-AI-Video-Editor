@@ -481,8 +481,6 @@ class DynamicUiBuilder(QObject):
                     list_widget = QListWidget()
                     list_widget.setMinimumHeight(120)
                     current_vals = node.value if isinstance(node.value, list) else []
-                    
-                    # Extract choices from args if not in choices attribute
                     choices = node.choices
                     if not choices and node.args and isinstance(node.args[0], list):
                         choices = node.args[0]
@@ -534,20 +532,16 @@ class DynamicUiBuilder(QObject):
 
             elif node.type_name in ['Textbox', 'Text']:
                 if not var_name: continue
-                
-                # Determine if we should force a list editor by checking the actual config data
                 use_list_editor = False
                 list_items = []
                 
                 if is_config:
                     real_key = var_name.replace("config_", "")
-                    # Look up the raw value in server_config
                     raw_val = wgp.server_config.get(real_key)
                     if isinstance(raw_val, list):
                         use_list_editor = True
                         list_items = raw_val
-                
-                # Fallback to checking the node value itself
+
                 if not use_list_editor and isinstance(node.value, list):
                     use_list_editor = True
                     list_items = node.value
@@ -555,7 +549,6 @@ class DynamicUiBuilder(QObject):
                 if use_list_editor:
                     editor = ListEditorWidget(label, list_items)
                     self.main.config_inputs_config[var_name] = {'type': 'list_editor', 'widget': editor}
-                    # Register in widgets so it can be cleared/reset if needed
                     self.main.widgets[var_name] = editor 
                     parent_layout.addWidget(editor)
                 else:
@@ -1417,7 +1410,6 @@ class WgpDesktopPluginWidget(QWidget):
             self.widgets['denoising_strength'].setValue(int(denoising_val * 100))
             self.widgets['denoising_strength_label'].setText(f"{denoising_val:.2f}")
 
-            # Rebuild Dynamic Advanced Tabs
             if self.advanced_tabs_widget:
                 self.adv_layout.removeWidget(self.advanced_tabs_widget)
                 self.advanced_tabs_widget.deleteLater()
