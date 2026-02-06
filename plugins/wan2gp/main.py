@@ -464,6 +464,7 @@ class Wan2GPSetupWidget(QWidget):
         self.select_folder_button.setEnabled(enabled)
 
 class VideoResultItemWidget(QWidget):
+    """A widget to display a generated video with a hover-to-play preview and insert button."""
     def __init__(self, video_path, plugin, parent=None):
         super().__init__(parent)
         self.video_path = video_path
@@ -980,11 +981,9 @@ class WgpDesktopPluginWidget(QWidget):
         inputs_layout.addLayout(denoising_row)
         options_layout.addWidget(inputs_group)
         self.advanced_group = self.create_widget(QGroupBox, 'advanced_group', "Advanced Options")
-        self.adv_layout = QVBoxLayout(self.advanced_group)
-        # Advanced tabs will be dynamically populated in refresh_ui_from_model_change
-        
+        self.adv_layout = QVBoxLayout(self.advanced_group)				 
+
         options_layout.addWidget(self.advanced_group)
-        scroll_area.setMinimumHeight(options_widget.sizeHint().height()-260)
         btn_layout = QHBoxLayout()
         self.generate_btn = self.create_widget(QPushButton, 'generate_btn', "Generate")
         self.add_to_queue_btn = self.create_widget(QPushButton, 'add_to_queue_btn', "Add to Queue")
@@ -1306,6 +1305,7 @@ class WgpDesktopPluginWidget(QWidget):
             self.widgets['denoising_strength'].setValue(int(denoising_val * 100))
             self.widgets['denoising_strength_label'].setText(f"{denoising_val:.2f}")
 
+            # Rebuild Dynamic Advanced Tabs
             if self.advanced_tabs_widget:
                 self.adv_layout.removeWidget(self.advanced_tabs_widget)
                 self.advanced_tabs_widget.deleteLater()
@@ -1584,27 +1584,17 @@ class WgpDesktopPluginWidget(QWidget):
                 print(f"Warning: Could not find resolution '{best_res_value}' in dropdown after group change.")
 
     def collect_inputs(self):
-        full_inputs = wgp.get_current_model_settings(self.state).copy()
+        with working_directory(wan2gp_dir):
+             full_inputs = wgp.get_default_settings(self.state['model_type']).copy()
+
+        sig = inspect.signature(wgp.generate_video)
+        for param in sig.parameters:
+            if param not in full_inputs and param not in ['task', 'send_cmd', 'plugin_data', 'state']:
+                full_inputs[param] = None
+
         full_inputs['lset_name'] = ""
         full_inputs['image_mode'] = 0
         full_inputs['mode'] = ""
-
-        expected_defaults = {
-            "audio_guide": None, "audio_guide2": None, "image_guide": None, "image_mask": None, 
-            "speakers_locations": "", "frames_positions": "", "keep_frames_video_guide": "", 
-            "keep_frames_video_source": "", "video_guide_outpainting": "", "switch_threshold2": 0, 
-            "model_switch_phase": 1, "batch_size": 1, "control_net_weight_alt": 1.0, 
-            "image_refs_relative_size": 50, "embedded_guidance_scale": None, "model_mode": None, 
-            "control_net_weight": 1.0, "control_net_weight2": 1.0, "mask_expand": 0, 
-            "remove_background_images_ref": 0, "prompt_enhancer": "", "pace": 0.5, 
-            "exaggeration": 0.5, "temperature": 0.8, "custom_guide": None, "audio_source": None, 
-            "image_refs": None, "activated_loras": [], "loras_multipliers": "",
-            "duration_seconds": 0.0, "pause_seconds": 0.0, "top_k": 50
-        }
-        
-        for key, val in expected_defaults.items():
-            if key not in full_inputs:
-                full_inputs[key] = val
 
         for key in ['prompt', 'negative_prompt']:
             w = self.widgets.get(key)
@@ -1660,6 +1650,13 @@ class WgpDesktopPluginWidget(QWidget):
             paths = refs_w.text().split(';')
             full_inputs['image_refs'] = [p.strip() for p in paths if p.strip()] if paths and paths[0] else None
 
+        full_inputs['denoising_strength'] = self.widgets['denoising_strength'].value() / 100.0
+
+        full_inputs['activated_loras'] = []
+        if 'activated_loras' in self.widgets:
+            selected_items = self.widgets['activated_loras'].selectedItems()
+            full_inputs['activated_loras'] = [self.lora_map[item.text()] for item in selected_items if item.text() in self.lora_map]
+
         for var_name, config in self.dynamic_inputs_config.items():
             widget = config['widget']
             if config['type'] == 'slider':
@@ -1674,10 +1671,10 @@ class WgpDesktopPluginWidget(QWidget):
             elif config['type'] == 'file':
                 full_inputs[var_name] = widget.text() or None
 
-        if 'activated_loras' in self.widgets:
-            selected_items = self.widgets['activated_loras'].selectedItems()
-            full_inputs['activated_loras'] = [self.lora_map[item.text()] for item in selected_items if item.text() in self.lora_map]
-        
+        for list_key in ['activated_loras', 'image_refs', 'slg_layers']:
+            if list_key in full_inputs and full_inputs[list_key] is None:
+                full_inputs[list_key] = []
+
         return full_inputs
 
     def _prepare_state_for_generation(self):
