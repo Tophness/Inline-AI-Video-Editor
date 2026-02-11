@@ -1,6 +1,6 @@
 # Inline AI Video Editor
 
-A simple, non-linear video editor built with Python, PyQt6, and FFmpeg. It provides a multi-track timeline, a media preview window, and basic clip manipulation capabilities, all wrapped in a dockable user interface. The editor is designed to be extensible through a plugin system.
+A cross-platform non-linear video editor built with Python, PyQt6, and FFmpeg. It provides a multi-track timeline, a media preview window, and clip manipulation capabilities, wrapped in a dockable user interface. The editor is designed to be extensible through a plugin system.
 
 ## Features
 
