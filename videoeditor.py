@@ -8,17 +8,23 @@ import json
 import ffmpeg
 import copy
 import tempfile
+import math
+import shlex
+import threading
+import numpy as np
 from plugins import PluginManager, ManagePluginsDialog
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QFileDialog, QLabel,
                              QScrollArea, QFrame, QProgressBar, QDialog,
                              QCheckBox, QDialogButtonBox, QMenu, QSplitter, QDockWidget,
                              QListWidget, QListWidgetItem, QMessageBox, QComboBox,
-                             QFormLayout, QGroupBox, QLineEdit, QSlider)
+                             QFormLayout, QGroupBox, QLineEdit, QSlider, QSpinBox,
+                             QDoubleSpinBox, QToolTip)
 from PyQt6.QtGui import (QPainter, QColor, QPen, QFont, QFontMetrics, QMouseEvent, QAction,
-                         QPixmap, QImage, QDrag, QCursor, QKeyEvent, QIcon, QTransform)
+                         QPixmap, QImage, QDrag, QCursor, QKeyEvent, QIcon, QTransform,
+                         QPainterPath)
 from PyQt6.QtCore import (Qt, QPoint, QRect, QRectF, QSize, QPointF, QObject, QThread,
-                          pyqtSignal, QTimer, QByteArray, QMimeData, QEvent)
+                          pyqtSignal, QTimer, QByteArray, QMimeData, QEvent, QLineF)
 
 from undo import UndoStack, TimelineStateChangeCommand, MoveClipsCommand
 from playback import PlaybackManager
@@ -27,47 +33,47 @@ from encoding import Encoder
 CONTAINER_PRESETS = {
     'mp4': {
         'vcodec': 'libx264', 'acodec': 'aac', 
-        'allowed_vcodecs': ['libx264', 'libx265', 'mpeg4'],
-        'allowed_acodecs': ['aac', 'libmp3lame'],
+        'allowed_vcodecs': ['libx264', 'libx265', 'mpeg4', 'copy'],
+        'allowed_acodecs': ['aac', 'libmp3lame', 'copy'],
         'v_bitrate': '5M', 'a_bitrate': '192k'
     },
     'matroska': {
         'vcodec': 'libx264', 'acodec': 'aac',
-        'allowed_vcodecs': ['libx264', 'libx265', 'libvpx-vp9'],
-        'allowed_acodecs': ['aac', 'libopus', 'libvorbis', 'flac'],
+        'allowed_vcodecs': ['libx264', 'libx265', 'libvpx-vp9', 'copy'],
+        'allowed_acodecs': ['aac', 'libopus', 'libvorbis', 'flac', 'copy'],
         'v_bitrate': '5M', 'a_bitrate': '192k'
     },
     'mov': {
         'vcodec': 'libx264', 'acodec': 'aac',
-        'allowed_vcodecs': ['libx264', 'prores_ks', 'mpeg4'],
-        'allowed_acodecs': ['aac', 'pcm_s16le'],
+        'allowed_vcodecs': ['libx264', 'prores_ks', 'mpeg4', 'copy'],
+        'allowed_acodecs': ['aac', 'pcm_s16le', 'copy'],
         'v_bitrate': '8M', 'a_bitrate': '256k'
     },
     'avi': {
         'vcodec': 'mpeg4', 'acodec': 'libmp3lame',
-        'allowed_vcodecs': ['mpeg4', 'msmpeg4'],
-        'allowed_acodecs': ['libmp3lame'],
+        'allowed_vcodecs': ['mpeg4', 'msmpeg4', 'copy'],
+        'allowed_acodecs': ['libmp3lame', 'copy'],
         'v_bitrate': '5M', 'a_bitrate': '192k'
     },
     'webm': {
         'vcodec': 'libvpx-vp9', 'acodec': 'libopus',
-        'allowed_vcodecs': ['libvpx-vp9'],
-        'allowed_acodecs': ['libopus', 'libvorbis'],
+        'allowed_vcodecs': ['libvpx-vp9', 'copy'],
+        'allowed_acodecs': ['libopus', 'libvorbis', 'copy'],
         'v_bitrate': '4M', 'a_bitrate': '192k'
     },
     'wav': {
         'vcodec': None, 'acodec': 'pcm_s16le',
-        'allowed_vcodecs': [], 'allowed_acodecs': ['pcm_s16le', 'pcm_s24le'],
+        'allowed_vcodecs': [], 'allowed_acodecs': ['pcm_s16le', 'pcm_s24le', 'copy'],
         'v_bitrate': None, 'a_bitrate': None
     },
     'mp3': {
         'vcodec': None, 'acodec': 'libmp3lame',
-        'allowed_vcodecs': [], 'allowed_acodecs': ['libmp3lame'],
+        'allowed_vcodecs': [], 'allowed_acodecs': ['libmp3lame', 'copy'],
         'v_bitrate': None, 'a_bitrate': '192k'
     },
     'flac': {
         'vcodec': None, 'acodec': 'flac',
-        'allowed_vcodecs': [], 'allowed_acodecs': ['flac'],
+        'allowed_vcodecs': [], 'allowed_acodecs': ['flac', 'copy'],
         'v_bitrate': None, 'a_bitrate': None
     },
     'gif': {
@@ -77,7 +83,7 @@ CONTAINER_PRESETS = {
     },
     'oga': { # Using oga for ogg audio
         'vcodec': None, 'acodec': 'libvorbis',
-        'allowed_vcodecs': [], 'allowed_acodecs': ['libvorbis', 'libopus'],
+        'allowed_vcodecs': [], 'allowed_acodecs': ['libvorbis', 'libopus', 'copy'],
         'v_bitrate': None, 'a_bitrate': '192k'
     }
 }
@@ -179,8 +185,8 @@ def get_available_codecs(codec_type='video'):
         else: _cached_audio_codecs = {}
         return {}
 
-    video_codecs = {}
-    audio_codecs = {}
+    video_codecs = {'copy': 'Direct Stream Copy'}
+    audio_codecs = {'copy': 'Direct Stream Copy'}
     lines = output.split('\n')
     
     header_found = False
@@ -259,9 +265,152 @@ def _parse_timecode_string_to_ms(tc_string):
         return 0
     return 0
 
+class WaveformCache(QObject):
+    waveform_ready = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._cache = {}
+        self._loading = set()
+        self._lock = threading.Lock()
+
+    def request_waveform(self, source_path):
+        with self._lock:
+            if source_path in self._cache:
+                return self._cache[source_path]
+            if source_path in self._loading:
+                return None
+            self._loading.add(source_path)
+
+        threading.Thread(target=self._extract_worker, args=(source_path,), daemon=True).start()
+        return None
+
+    def _extract_worker(self, source_path):
+        try:
+            startupinfo = None
+            if hasattr(subprocess, 'STARTUPINFO'):
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+
+            cmd = [
+                'ffmpeg', '-v', 'error', '-i', source_path,
+                '-vn', '-ac', '1', '-ar', '4000', '-f', 'f32le', '-'
+            ]
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, startupinfo=startupinfo
+            )
+            raw_bytes, _ = proc.communicate()
+            if not raw_bytes:
+                peaks = np.zeros((1, 2), dtype=np.float32)
+            else:
+                arr = np.frombuffer(raw_bytes, dtype=np.float32)
+                bucket_size = 20
+                num_buckets = len(arr) // bucket_size
+                if num_buckets > 0:
+                    reshaped = arr[:num_buckets * bucket_size].reshape(num_buckets, bucket_size)
+                    mins = reshaped.min(axis=1)
+                    maxs = reshaped.max(axis=1)
+                    peaks = np.column_stack([mins, maxs])
+                else:
+                    peaks = np.zeros((1, 2), dtype=np.float32)
+
+            with self._lock:
+                self._cache[source_path] = peaks
+                self._loading.discard(source_path)
+
+            self.waveform_ready.emit(source_path)
+        except Exception as e:
+            print(f"Waveform error for {source_path}: {e}")
+            with self._lock:
+                self._cache[source_path] = np.zeros((1, 2), dtype=np.float32)
+                self._loading.discard(source_path)
+
+class KeyframeCache(QObject):
+    keyframes_ready = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._cache = {}
+        self._loading = set()
+        self._lock = threading.Lock()
+
+    def get_keyframes(self, source_path, sync=False):
+        with self._lock:
+            if source_path in self._cache:
+                return self._cache[source_path]
+            if not sync and source_path in self._loading:
+                return None
+            self._loading.add(source_path)
+
+        if sync:
+            self._extract_worker(source_path)
+            with self._lock:
+                return self._cache.get(source_path, [0])
+        else:
+            threading.Thread(target=self._extract_worker, args=(source_path,), daemon=True).start()
+            return None
+
+    def _extract_worker(self, source_path):
+        kf_list = []
+        try:
+            startupinfo = None
+            if hasattr(subprocess, 'STARTUPINFO'):
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+
+            ffprobe_exe = 'ffprobe'
+            if os.name == 'nt' and os.path.exists('ffprobe.exe'):
+                ffprobe_exe = os.path.abspath('ffprobe.exe')
+
+            cmd = [
+                ffprobe_exe, '-v', 'error',
+                '-select_streams', 'v:0',
+                '-skip_frame', 'nokey',
+                '-show_entries', 'frame=pkt_pts_time',
+                '-of', 'csv=p=0',
+                source_path
+            ]
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, startupinfo=startupinfo, text=True, errors='ignore')
+            stdout, _ = proc.communicate()
+            if proc.returncode == 0 and stdout:
+                for line in stdout.strip().splitlines():
+                    val = line.strip().split(',')[0].strip()
+                    try:
+                        pts_s = float(val)
+                        kf_list.append(int(round(pts_s * 1000.0)))
+                    except ValueError:
+                        continue
+        except Exception:
+            pass
+
+        if not kf_list:
+            try:
+                import av
+                with av.open(source_path) as container:
+                    if container.streams.video:
+                        st = container.streams.video[0]
+                        tb = float(st.time_base) if st.time_base else 1.0 / 25.0
+                        for packet in container.demux(st):
+                            if packet.is_keyframe and packet.pts is not None:
+                                kf_list.append(int(round(packet.pts * tb * 1000.0)))
+            except Exception:
+                pass
+
+        if not kf_list:
+            kf_list = [0]
+
+        kf_list = sorted(list(set(kf_list)))
+        with self._lock:
+            self._cache[source_path] = kf_list
+            self._loading.discard(source_path)
+
+        self.keyframes_ready.emit(source_path)
+
 class TimelineClip:
-    def __init__(self, source_path, timeline_start_ms, clip_start_ms, duration_ms, track_index, track_type, media_type, group_id):
-        self.id = str(uuid.uuid4())
+    def __init__(self, source_path, timeline_start_ms, clip_start_ms, duration_ms, track_index, track_type, media_type, group_id, effects=None, id=None):
+        self.id = id if id else str(uuid.uuid4())
         self.source_path = source_path
         self.timeline_start_ms = int(timeline_start_ms)
         self.clip_start_ms = int(clip_start_ms)
@@ -270,10 +419,25 @@ class TimelineClip:
         self.track_type = track_type
         self.media_type = media_type
         self.group_id = group_id
+        self.effects = copy.deepcopy(effects) if effects else {}
 
     @property
     def timeline_end_ms(self):
         return self.timeline_start_ms + self.duration_ms
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "source_path": self.source_path,
+            "timeline_start_ms": self.timeline_start_ms,
+            "clip_start_ms": self.clip_start_ms,
+            "duration_ms": self.duration_ms,
+            "track_index": self.track_index,
+            "track_type": self.track_type,
+            "media_type": self.media_type,
+            "group_id": self.group_id,
+            "effects": copy.deepcopy(self.effects)
+        }
 
 class Timeline:
     def __init__(self):
@@ -288,6 +452,598 @@ class Timeline:
     def get_total_duration(self):
         if not self.clips: return 0
         return max(c.timeline_end_ms for c in self.clips)
+
+class EffectsDialog(QDialog):
+    def __init__(self, clip, parent=None):
+        super().__init__(parent)
+        self.clip = clip
+        self.main_window = parent
+        self.setWindowTitle(f"Effects - {os.path.basename(clip.source_path)}")
+        self.setMinimumSize(560, 360)
+
+        main_layout = QVBoxLayout(self)
+        lists_layout = QHBoxLayout()
+
+        cat_box = QGroupBox("Categories")
+        cat_layout = QVBoxLayout(cat_box)
+        self.cat_list = QListWidget()
+        self.cat_list.addItem("Transform")
+        self.cat_list.setCurrentRow(0)
+        cat_layout.addWidget(self.cat_list)
+        lists_layout.addWidget(cat_box, 1)
+
+        avail_box = QGroupBox("Available Effects")
+        avail_layout = QVBoxLayout(avail_box)
+        self.avail_list = QListWidget()
+        self.avail_list.addItem("Crop")
+        self.avail_list.setCurrentRow(0)
+        self.avail_list.itemDoubleClicked.connect(self.configure_selected_available)
+        avail_layout.addWidget(self.avail_list)
+        
+        add_btn = QPushButton("Add Effect")
+        add_btn.clicked.connect(self.configure_selected_available)
+        avail_layout.addWidget(add_btn)
+        lists_layout.addWidget(avail_box, 1)
+
+        applied_box = QGroupBox("Applied Effects")
+        applied_layout = QVBoxLayout(applied_box)
+        self.applied_list = QListWidget()
+        applied_layout.addWidget(self.applied_list)
+        lists_layout.addWidget(applied_box, 1)
+
+        main_layout.addLayout(lists_layout)
+
+        bottom_layout = QHBoxLayout()
+        bottom_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        bottom_layout.addWidget(close_btn)
+        main_layout.addLayout(bottom_layout)
+
+        self.refresh_applied_list()
+
+    def refresh_applied_list(self):
+        self.applied_list.clear()
+        if not hasattr(self.clip, 'effects') or not self.clip.effects:
+            item = QListWidgetItem("No effects applied")
+            item.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.applied_list.addItem(item)
+            return
+
+        for fx_name, fx_data in list(self.clip.effects.items()):
+            item_widget = QWidget()
+            h_layout = QHBoxLayout(item_widget)
+            h_layout.setContentsMargins(4, 2, 4, 2)
+            
+            desc = fx_name.capitalize()
+            if fx_name == 'crop' and isinstance(fx_data, dict):
+                desc = f"Crop ({fx_data.get('w',0)}x{fx_data.get('h',0)} at {fx_data.get('x',0)},{fx_data.get('y',0)})"
+            
+            lbl = QLabel(desc)
+            h_layout.addWidget(lbl, 1)
+
+            edit_btn = QPushButton("Edit")
+            edit_btn.setFixedWidth(45)
+            edit_btn.clicked.connect(lambda _, n=fx_name: self.edit_applied_effect(n))
+            h_layout.addWidget(edit_btn)
+
+            remove_btn = QPushButton("X")
+            remove_btn.setFixedWidth(26)
+            remove_btn.setStyleSheet("color: #ff5555; font-weight: bold;")
+            remove_btn.clicked.connect(lambda _, n=fx_name: self.remove_applied_effect(n))
+            h_layout.addWidget(remove_btn)
+
+            list_item = QListWidgetItem(self.applied_list)
+            list_item.setSizeHint(item_widget.sizeHint())
+            self.applied_list.addItem(list_item)
+            self.applied_list.setItemWidget(list_item, item_widget)
+
+    def remove_applied_effect(self, fx_name):
+        if fx_name in self.clip.effects:
+            del self.clip.effects[fx_name]
+            self.refresh_applied_list()
+            self.main_window.update_project_resolution_from_timeline()
+            self.main_window.timeline_widget.update()
+            self.main_window.playback_manager.seek_to_frame(self.main_window.timeline_widget.playhead_pos_ms)
+
+    def edit_applied_effect(self, fx_name):
+        if fx_name == "crop":
+            self.accept()
+            self.main_window.activate_crop_tool(self.clip)
+
+    def configure_selected_available(self):
+        item = self.avail_list.currentItem()
+        if item and item.text() == "Crop":
+            self.accept()
+            self.main_window.activate_crop_tool(self.clip)
+
+class CropControlBar(QWidget):
+    def __init__(self, overlay, parent=None):
+        super().__init__(parent)
+        self.overlay = overlay
+        self.setObjectName("crop_control_bar")
+        self.setStyleSheet("""
+            QWidget#crop_control_bar {
+                background-color: rgba(30, 30, 30, 240);
+                border: 1px solid #555;
+                border-radius: 4px;
+            }
+            QLabel { color: #DDD; font-size: 11px; }
+            QSpinBox, QComboBox {
+                background-color: #222;
+                color: #FFF;
+                border: 1px solid #555;
+                padding: 2px 4px;
+                border-radius: 2px;
+                font-size: 11px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #222;
+                color: #FFF;
+                selection-background-color: #444;
+                selection-color: #FFF;
+                border: 1px solid #555;
+            }
+            QPushButton {
+                background-color: #444;
+                color: #FFF;
+                border: 1px solid #666;
+                padding: 4px 8px;
+                border-radius: 2px;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #555; }
+        """)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(6)
+
+        title_lbl = QLabel("<b>Crop Effect:</b>")
+        layout.addWidget(title_lbl)
+
+        auto_btn = QPushButton("Auto Detect")
+        auto_btn.setToolTip("Automatically detect and crop out black letterbox/pillarbox borders")
+        auto_btn.clicked.connect(self.overlay.auto_detect_black_borders)
+        layout.addWidget(auto_btn)
+
+        layout.addWidget(QLabel("X:"))
+        self.x_spin = QSpinBox()
+        self.x_spin.setRange(0, 32768)
+        self.x_spin.valueChanged.connect(self.on_spin_changed)
+        layout.addWidget(self.x_spin)
+
+        layout.addWidget(QLabel("Y:"))
+        self.y_spin = QSpinBox()
+        self.y_spin.setRange(0, 32768)
+        self.y_spin.valueChanged.connect(self.on_spin_changed)
+        layout.addWidget(self.y_spin)
+
+        layout.addWidget(QLabel("W:"))
+        self.w_spin = QSpinBox()
+        self.w_spin.setRange(16, 32768)
+        self.w_spin.valueChanged.connect(self.on_spin_changed)
+        layout.addWidget(self.w_spin)
+
+        layout.addWidget(QLabel("H:"))
+        self.h_spin = QSpinBox()
+        self.h_spin.setRange(16, 32768)
+        self.h_spin.valueChanged.connect(self.on_spin_changed)
+        layout.addWidget(self.h_spin)
+
+        layout.addWidget(QLabel("Lock Aspect:"))
+        self.aspect_combo = QComboBox()
+        self.aspect_combo.addItems(["Free", "Original", "16:9", "4:3", "1:1", "9:16"])
+        self.aspect_combo.currentTextChanged.connect(self.on_aspect_changed)
+        layout.addWidget(self.aspect_combo)
+
+        layout.addStretch()
+
+        reset_btn = QPushButton("Reset")
+        reset_btn.clicked.connect(self.overlay.reset_crop)
+        layout.addWidget(reset_btn)
+
+        apply_btn = QPushButton("Apply")
+        apply_btn.setStyleSheet("background-color: #2e7d32; font-weight: bold; color: #FFF;")
+        apply_btn.clicked.connect(self.overlay.apply_crop)
+        layout.addWidget(apply_btn)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet("background-color: #883333; color: #FFF;")
+        cancel_btn.clicked.connect(self.overlay.cancel_crop)
+        layout.addWidget(cancel_btn)
+
+    def set_values(self, x, y, w, h):
+        self.x_spin.blockSignals(True)
+        self.y_spin.blockSignals(True)
+        self.w_spin.blockSignals(True)
+        self.h_spin.blockSignals(True)
+
+        self.x_spin.setValue(int(x))
+        self.y_spin.setValue(int(y))
+        self.w_spin.setValue(int(w))
+        self.h_spin.setValue(int(h))
+
+        self.x_spin.blockSignals(False)
+        self.y_spin.blockSignals(False)
+        self.w_spin.blockSignals(False)
+        self.h_spin.blockSignals(False)
+
+    def on_spin_changed(self):
+        self.overlay.update_crop_from_controls(
+            self.x_spin.value(),
+            self.y_spin.value(),
+            self.w_spin.value(),
+            self.h_spin.value()
+        )
+
+    def on_aspect_changed(self, text):
+        self.overlay.set_aspect_ratio_mode(text)
+
+class CropOverlayWidget(QWidget):
+    HANDLE_SIZE = 12
+    EDGE_HANDLE_SIZE = 10
+
+    def __init__(self, clip, main_window, parent=None):
+        super().__init__(parent)
+        self.clip = clip
+        self.main_window = main_window
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        self.initial_crop = copy.deepcopy(self.clip.effects.get('crop'))
+
+        source_props = self.main_window.media_properties.get(clip.source_path, {})
+        self.video_width = source_props.get('width', self.main_window.project_width)
+        self.video_height = source_props.get('height', self.main_window.project_height)
+
+        if self.initial_crop and all(k in self.initial_crop for k in ('x', 'y', 'w', 'h')):
+            self.crop_x = int(self.initial_crop['x'])
+            self.crop_y = int(self.initial_crop['y'])
+            self.crop_w = int(self.initial_crop['w'])
+            self.crop_h = int(self.initial_crop['h'])
+        else:
+            self.crop_x = 0
+            self.crop_y = 0
+            self.crop_w = self.video_width
+            self.crop_h = self.video_height
+
+        self.active_handle = None
+        self.drag_start_pos = QPointF()
+        self.drag_start_crop = (self.crop_x, self.crop_y, self.crop_w, self.crop_h)
+        self.aspect_mode = "Free"
+        self.locked_aspect = 1.0
+
+        self.control_bar = CropControlBar(self, self)
+        self.control_bar.set_values(self.crop_x, self.crop_y, self.crop_w, self.crop_h)
+        self.control_bar.show()
+
+        self.main_window.playback_manager.bypass_crop = True
+        self.main_window.playback_manager.seek_to_frame(self.main_window.timeline_widget.playhead_pos_ms)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.control_bar.setGeometry(10, 10, self.width() - 20, 36)
+
+    def set_aspect_ratio_mode(self, mode):
+        self.aspect_mode = mode
+        if mode == "Original":
+            self.locked_aspect = self.video_width / max(1.0, float(self.video_height))
+        elif mode == "16:9":
+            self.locked_aspect = 16.0 / 9.0
+        elif mode == "4:3":
+            self.locked_aspect = 4.0 / 3.0
+        elif mode == "1:1":
+            self.locked_aspect = 1.0
+        elif mode == "9:16":
+            self.locked_aspect = 9.0 / 16.0
+        else:
+            self.locked_aspect = 1.0
+
+        if mode != "Free":
+            new_h = int(round(self.crop_w / self.locked_aspect))
+            if self.crop_y + new_h > self.video_height:
+                new_h = self.video_height - self.crop_y
+                self.crop_w = int(round(new_h * self.locked_aspect))
+            self.crop_h = max(16, new_h)
+            self._sync_crop_visuals()
+
+    def auto_detect_black_borders(self):
+        try:
+            import cv2
+            cap = cv2.VideoCapture(self.clip.source_path)
+            if not cap.isOpened():
+                return
+            clip_time_sec = (
+                self.main_window.timeline_widget.playhead_pos_ms
+                - self.clip.timeline_start_ms
+                + self.clip.clip_start_ms
+            ) / 1000.0
+            cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, clip_time_sec * 1000.0))
+            ret, frame = cap.read()
+            cap.release()
+            if not ret or frame is None:
+                return
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            h, w = gray.shape
+
+            non_black = np.where(gray > 16)
+            if len(non_black[0]) == 0 or len(non_black[1]) == 0:
+                return
+
+            top = int(np.min(non_black[0]))
+            bottom = int(np.max(non_black[0]))
+            left = int(np.min(non_black[1]))
+            right = int(np.max(non_black[1]))
+
+            crop_x = (left // 2) * 2
+            crop_y = (top // 2) * 2
+            crop_w = max(16, (((right - left + 1) // 2) * 2))
+            crop_h = max(16, (((bottom - top + 1) // 2) * 2))
+
+            self.crop_x = min(w - 16, max(0, crop_x))
+            self.crop_y = min(h - 16, max(0, crop_y))
+            self.crop_w = min(w - self.crop_x, crop_w)
+            self.crop_h = min(h - self.crop_y, crop_h)
+
+            self._sync_crop_visuals()
+        except Exception as e:
+            print(f"Auto-crop detection error: {e}")
+
+    def reset_crop(self):
+        self.crop_x = 0
+        self.crop_y = 0
+        self.crop_w = self.video_width
+        self.crop_h = self.video_height
+        self._sync_crop_visuals()
+
+    def apply_crop(self):
+        self.crop_x = (self.crop_x // 2) * 2
+        self.crop_y = (self.crop_y // 2) * 2
+        self.crop_w = (self.crop_w // 2) * 2
+        self.crop_h = (self.crop_h // 2) * 2
+        self.clip.effects['crop'] = {
+            'x': self.crop_x,
+            'y': self.crop_y,
+            'w': self.crop_w,
+            'h': self.crop_h
+        }
+        self.main_window.playback_manager.bypass_crop = False
+        self.main_window.update_project_resolution_from_timeline()
+        self.main_window.deactivate_crop_tool()
+
+    def cancel_crop(self):
+        if self.initial_crop is not None:
+            self.clip.effects['crop'] = copy.deepcopy(self.initial_crop)
+        else:
+            self.clip.effects.pop('crop', None)
+        self.main_window.playback_manager.bypass_crop = False
+        self.main_window.deactivate_crop_tool()
+
+    def _get_video_display_rect(self):
+        pw = float(self.width())
+        ph = float(self.height())
+        vw = float(self.video_width)
+        vh = float(self.video_height)
+
+        if vw <= 0 or vh <= 0 or pw <= 0 or ph <= 0:
+            return QRectF(0, 0, pw, ph)
+
+        scale = min(pw / vw, ph / vh)
+        disp_w = vw * scale
+        disp_h = vh * scale
+        disp_x = (pw - disp_w) / 2.0
+        disp_y = (ph - disp_h) / 2.0
+        return QRectF(disp_x, disp_y, disp_w, disp_h)
+
+    def _video_to_screen(self, vx, vy, vw, vh):
+        d_rect = self._get_video_display_rect()
+        scale_x = d_rect.width() / float(self.video_width)
+        scale_y = d_rect.height() / float(self.video_height)
+        sx = d_rect.left() + vx * scale_x
+        sy = d_rect.top() + vy * scale_y
+        sw = vw * scale_x
+        sh = vh * scale_y
+        return QRectF(sx, sy, sw, sh)
+
+    def _screen_to_video(self, sx, sy):
+        d_rect = self._get_video_display_rect()
+        scale_x = float(self.video_width) / max(1.0, d_rect.width())
+        scale_y = float(self.video_height) / max(1.0, d_rect.height())
+        vx = (sx - d_rect.left()) * scale_x
+        vy = (sy - d_rect.top()) * scale_y
+        return vx, vy
+
+    def _get_handles(self, rect):
+        hs = self.HANDLE_SIZE
+        ehs = self.EDGE_HANDLE_SIZE
+        l, r, t, b = rect.left(), rect.right(), rect.top(), rect.bottom()
+        cx, cy = rect.center().x(), rect.center().y()
+
+        return {
+            'tl': QRectF(l - hs / 2, t - hs / 2, hs, hs),
+            'tr': QRectF(r - hs / 2, t - hs / 2, hs, hs),
+            'bl': QRectF(l - hs / 2, b - hs / 2, hs, hs),
+            'br': QRectF(r - hs / 2, b - hs / 2, hs, hs),
+            'top': QRectF(cx - ehs / 2, t - ehs / 2, ehs, ehs),
+            'bottom': QRectF(cx - ehs / 2, b - ehs / 2, ehs, ehs),
+            'left': QRectF(l - ehs / 2, cy - ehs / 2, ehs, ehs),
+            'right': QRectF(r - ehs / 2, cy - ehs / 2, ehs, ehs),
+        }
+
+    def _hit_test(self, pos):
+        s_rect = self._video_to_screen(self.crop_x, self.crop_y, self.crop_w, self.crop_h)
+        handles = self._get_handles(s_rect)
+        for name, h_rect in handles.items():
+            if h_rect.contains(pos):
+                return name
+        if s_rect.contains(pos):
+            return 'inside'
+        return None
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        d_rect = self._get_video_display_rect()
+        s_rect = self._video_to_screen(self.crop_x, self.crop_y, self.crop_w, self.crop_h)
+
+        mask_path = QPainterPath()
+        mask_path.addRect(d_rect)
+        mask_path.addRect(s_rect)
+        painter.fillPath(mask_path, QColor(0, 0, 0, 140))
+
+        dash_pen = QPen(QColor(255, 40, 40), 2, Qt.PenStyle.DashLine)
+        painter.setPen(dash_pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(s_rect)
+
+        handles = self._get_handles(s_rect)
+        for name, h_rect in handles.items():
+            if name in ('tl', 'tr', 'bl', 'br'):
+                painter.setPen(QPen(QColor(255, 255, 255), 1.5))
+                painter.setBrush(QColor(255, 40, 40))
+                painter.drawRect(h_rect)
+            else:
+                painter.setPen(QPen(QColor(255, 40, 40), 1.5))
+                painter.setBrush(QColor(255, 255, 255))
+                painter.drawRect(h_rect)
+
+    def mousePressEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton:
+            handle = self._hit_test(event.position())
+            if handle:
+                self.active_handle = handle
+                self.drag_start_pos = event.position()
+                self.drag_start_crop = (self.crop_x, self.crop_y, self.crop_w, self.crop_h)
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent):
+        if self.active_handle:
+            d_rect = self._get_video_display_rect()
+            scale_x = float(self.video_width) / max(1.0, d_rect.width())
+            scale_y = float(self.video_height) / max(1.0, d_rect.height())
+
+            dx = (event.position().x() - self.drag_start_pos.x()) * scale_x
+            dy = (event.position().y() - self.drag_start_pos.y()) * scale_y
+
+            ox, oy, ow, oh = self.drag_start_crop
+            shift_pressed = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            lock_ratio = (self.aspect_mode != "Free") or shift_pressed
+            aspect = self.locked_aspect if self.aspect_mode != "Free" else (ow / max(1.0, float(oh)))
+
+            nx, ny, nw, nh = ox, oy, ow, oh
+
+            if self.active_handle == 'inside':
+                nx = max(0, min(self.video_width - ow, int(round(ox + dx))))
+                ny = max(0, min(self.video_height - oh, int(round(oy + dy))))
+            elif self.active_handle == 'br':
+                nw = max(16, min(self.video_width - ox, int(round(ow + dx))))
+                if lock_ratio:
+                    nh = int(round(nw / aspect))
+                    if oy + nh > self.video_height:
+                        nh = self.video_height - oy
+                        nw = int(round(nh * aspect))
+                else:
+                    nh = max(16, min(self.video_height - oy, int(round(oh + dy))))
+            elif self.active_handle == 'tl':
+                nw = max(16, min(ox + ow, int(round(ow - dx))))
+                nx = ox + ow - nw
+                if lock_ratio:
+                    nh = int(round(nw / aspect))
+                    ny = oy + oh - nh
+                    if ny < 0:
+                        ny = 0
+                        nh = oy + oh
+                        nw = int(round(nh * aspect))
+                        nx = ox + ow - nw
+                else:
+                    nh = max(16, min(oy + oh, int(round(oh - dy))))
+                    ny = oy + oh - nh
+            elif self.active_handle == 'tr':
+                nw = max(16, min(self.video_width - ox, int(round(ow + dx))))
+                if lock_ratio:
+                    nh = int(round(nw / aspect))
+                    ny = oy + oh - nh
+                    if ny < 0:
+                        ny = 0
+                        nh = oy + oh
+                        nw = int(round(nh * aspect))
+                else:
+                    nh = max(16, min(oy + oh, int(round(oh - dy))))
+                    ny = oy + oh - nh
+            elif self.active_handle == 'bl':
+                nw = max(16, min(ox + ow, int(round(ow - dx))))
+                nx = ox + ow - nw
+                if lock_ratio:
+                    nh = int(round(nw / aspect))
+                    if oy + nh > self.video_height:
+                        nh = self.video_height - oy
+                        nw = int(round(nh * aspect))
+                        nx = ox + ow - nw
+                else:
+                    nh = max(16, min(self.video_height - oy, int(round(oh + dy))))
+            elif self.active_handle == 'top':
+                nh = max(16, min(oy + oh, int(round(oh - dy))))
+                ny = oy + oh - nh
+            elif self.active_handle == 'bottom':
+                nh = max(16, min(self.video_height - oy, int(round(oh + dy))))
+            elif self.active_handle == 'left':
+                nw = max(16, min(ox + ow, int(round(ow - dx))))
+                nx = ox + ow - nw
+            elif self.active_handle == 'right':
+                nw = max(16, min(self.video_width - ox, int(round(ow + dx))))
+
+            self.crop_x = int(nx)
+            self.crop_y = int(ny)
+            self.crop_w = int(nw)
+            self.crop_h = int(nh)
+
+            self._sync_crop_visuals()
+            event.accept()
+            return
+
+        handle = self._hit_test(event.position())
+        if handle in ('tl', 'br'):
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif handle in ('tr', 'bl'):
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        elif handle in ('top', 'bottom'):
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        elif handle in ('left', 'right'):
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif handle == 'inside':
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+        else:
+            self.unsetCursor()
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent):
+        if event.button() == Qt.MouseButton.LeftButton and self.active_handle:
+            self.active_handle = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def update_crop_from_controls(self, x, y, w, h):
+        self.crop_x = max(0, min(self.video_width - 16, int(x)))
+        self.crop_y = max(0, min(self.video_height - 16, int(y)))
+        self.crop_w = max(16, min(self.video_width - self.crop_x, int(w)))
+        self.crop_h = max(16, min(self.video_height - self.crop_y, int(h)))
+        self._sync_crop_visuals()
+
+    def _sync_crop_visuals(self):
+        self.crop_x = (self.crop_x // 2) * 2
+        self.crop_y = (self.crop_y // 2) * 2
+        self.crop_w = (self.crop_w // 2) * 2
+        self.crop_h = (self.crop_h // 2) * 2
+
+        self.control_bar.set_values(self.crop_x, self.crop_y, self.crop_w, self.crop_h)
+        self.update()
 
 class TimelineWidget(QWidget):
     TIMESCALE_HEIGHT = 30
@@ -326,6 +1082,12 @@ class TimelineWidget(QWidget):
         self.max_pixels_per_ms = 1.0
         self.project_fps = 25.0
         self.set_project_fps(project_fps)
+
+        self.waveform_cache = WaveformCache()
+        self.waveform_cache.waveform_ready.connect(lambda _: self.update())
+
+        self.keyframe_cache = KeyframeCache()
+        self.keyframe_cache.keyframes_ready.connect(lambda _: self.update())
 
         self.setMinimumHeight(300)
         self.setMouseTracking(True)
@@ -492,7 +1254,6 @@ class TimelineWidget(QWidget):
         
         painter.restore()
         
-    
     def _format_timecode(self, total_ms, interval_ms):
         if abs(total_ms) < 1: total_ms = 0
         sign = "-" if total_ms < 0 else ""
@@ -500,12 +1261,11 @@ class TimelineWidget(QWidget):
         
         seconds = total_ms / 1000.0
 
-        # Frame-based formatting for high zoom
         is_frame_based = interval_ms < (1000.0 / self.project_fps) * 5
         if is_frame_based:
             total_frames = int(round(seconds * self.project_fps))
             fps_int = int(round(self.project_fps))
-            if fps_int == 0: fps_int = 25 # Avoid division by zero
+            if fps_int == 0: fps_int = 25
             s_frames = total_frames % fps_int
             total_seconds_from_frames = total_frames // fps_int
             h_fr = total_seconds_from_frames // 3600
@@ -516,7 +1276,6 @@ class TimelineWidget(QWidget):
             if m_fr > 0: return f"{sign}{m_fr}:{s_fr:02d}:{s_frames:02d}"
             return f"{sign}{s_fr}:{s_frames:02d}"
 
-        # Sub-second formatting
         if interval_ms < 1000:
             precision = 2 if interval_ms < 100 else 1
             s_float = seconds % 60
@@ -530,7 +1289,6 @@ class TimelineWidget(QWidget):
             if '.' in val: val = val.rstrip('0').rstrip('.')
             return f"{sign}{val}s"
 
-        # Seconds and M:SS formatting
         if interval_ms < 60000:
             rounded_seconds = int(round(seconds))
             h = rounded_seconds // 3600
@@ -540,14 +1298,11 @@ class TimelineWidget(QWidget):
             if h > 0:
                 return f"{sign}{h}:{m:02d}:{s:02d}"
             
-            # Use "Xs" format for times under a minute
             if rounded_seconds < 60:
                 return f"{sign}{rounded_seconds}s"
             
-            # Use "M:SS" format for times over a minute
             return f"{sign}{m}:{s:02d}"
         
-        # Minute and Hh:MMm formatting for low zoom
         h = int(seconds / 3600)
         m = int((seconds % 3600) / 60)
 
@@ -616,6 +1371,28 @@ class TimelineWidget(QWidget):
                     label_x = self.HEADER_WIDTH
                 painter.drawText(label_x, self.TIMESCALE_HEIGHT - 14, label)
 
+        for clip in self.timeline.clips:
+            if clip.track_type == 'video' and clip.media_type != 'subtitle':
+                kfs = self.keyframe_cache.get_keyframes(clip.source_path)
+                if kfs:
+                    painter.save()
+                    painter.setPen(QPen(QColor(255, 180, 0), 1))
+                    painter.setBrush(QColor(255, 195, 0))
+                    for kf in kfs:
+                        if clip.clip_start_ms <= kf <= clip.clip_start_ms + clip.duration_ms:
+                            t_tl = clip.timeline_start_ms + (kf - clip.clip_start_ms)
+                            kx = self.ms_to_x(t_tl)
+                            if self.HEADER_WIDTH <= kx <= self.width():
+                                diamond = QPainterPath()
+                                cy = self.TIMESCALE_HEIGHT - 5
+                                diamond.moveTo(kx, cy - 4)
+                                diamond.lineTo(kx + 3, cy)
+                                diamond.lineTo(kx, cy + 4)
+                                diamond.lineTo(kx - 3, cy)
+                                diamond.closeSubpath()
+                                painter.drawPath(diamond)
+                    painter.restore()
+
         painter.restore()
 
     def get_clip_rect(self, clip):
@@ -631,6 +1408,59 @@ class TimelineWidget(QWidget):
         clip_height = self.TRACK_HEIGHT - 10
         y += (self.TRACK_HEIGHT - clip_height) / 2
         return QRectF(x, y, w, clip_height)
+
+    def _draw_waveform(self, painter, clip, clip_rect):
+        peaks = self.waveform_cache.request_waveform(clip.source_path)
+        if peaks is None or len(peaks) == 0:
+            return
+
+        x_left = int(clip_rect.left())
+        x_right = int(clip_rect.right())
+        width_px = x_right - x_left
+        if width_px <= 0:
+            return
+
+        y_center = clip_rect.center().y()
+        max_amp = (clip_rect.height() - 6) * 0.45
+        bucket_duration_ms = 5.0
+        
+        lines = []
+        for px in range(width_px):
+            cur_x = x_left + px
+            if cur_x < self.HEADER_WIDTH or cur_x > self.width():
+                continue
+
+            ms_start = clip.clip_start_ms + (px / self.pixels_per_ms)
+            ms_end = clip.clip_start_ms + ((px + 1) / self.pixels_per_ms)
+
+            b_start = max(0, int(ms_start / bucket_duration_ms))
+            b_end = min(len(peaks), int(math.ceil(ms_end / bucket_duration_ms)))
+
+            if b_start >= len(peaks):
+                break
+            if b_end <= b_start:
+                b_end = b_start + 1
+
+            slice_peaks = peaks[b_start:b_end]
+            if len(slice_peaks) == 0:
+                continue
+
+            min_val = float(slice_peaks[:, 0].min())
+            max_val = float(slice_peaks[:, 1].max())
+
+            min_val = max(-1.0, min(1.0, min_val))
+            max_val = max(-1.0, min(1.0, max_val))
+
+            y_top = y_center - max(0.04, max_val) * max_amp
+            y_bot = y_center - min(-0.04, min_val) * max_amp
+
+            lines.append(QLineF(cur_x, y_top, cur_x, y_bot))
+
+        if lines:
+            painter.save()
+            painter.setPen(QPen(QColor(160, 210, 255, 200), 1))
+            painter.drawLines(lines)
+            painter.restore()
 
     def draw_tracks_and_clips(self, painter):
         painter.save()
@@ -680,24 +1510,33 @@ class TimelineWidget(QWidget):
             elif clip.media_type == 'subtitle':
                 base_color = QColor("#D9A022")
             elif clip.track_type == 'audio':
-                base_color = QColor("#48C")
+                base_color = QColor("#284b63")
             
             color = QColor("#5A9") if self.dragging_clip and self.dragging_clip.id == clip.id else base_color
             painter.fillRect(clip_rect, color)
+
+            if clip.track_type == 'audio':
+                self._draw_waveform(painter, clip, clip_rect)
+
+            if clip.track_type == 'video' and clip.media_type != 'subtitle':
+                has_fx = bool(clip.effects)
+                fx_rect = QRectF(clip_rect.left() + 4, clip_rect.bottom() - 17, 24, 13)
+                painter.save()
+                btn_color = QColor("#2e7d32") if has_fx else QColor("#2b2b2b")
+                border_color = QColor("#4caf50") if has_fx else QColor("#777777")
+                painter.setBrush(btn_color)
+                painter.setPen(QPen(border_color, 1))
+                painter.drawRoundedRect(fx_rect, 2, 2)
+                painter.setFont(QFont("Arial", 7, QFont.Weight.Bold))
+                painter.setPen(QColor("#FFFFFF"))
+                painter.drawText(fx_rect, Qt.AlignmentFlag.AlignCenter, "FX")
+                painter.restore()
 
             if clip.id in self.selected_clips:
                 pen = QPen(QColor(255, 255, 0, 220), 2)
                 painter.setPen(pen)
                 painter.drawRect(clip_rect)
 
-            painter.setPen(QPen(QColor("#FFF"), 1))
-            font = QFont("Arial", 10)
-            painter.setFont(font)
-            text = os.path.basename(clip.source_path)
-            font_metrics = QFontMetrics(font)
-            text_width = font_metrics.horizontalAdvance(text)
-            if text_width > clip_rect.width() - 10: text = font_metrics.elidedText(text, Qt.TextElideMode.ElideRight, int(clip_rect.width() - 10))
-            painter.drawText(QPoint(int(clip_rect.left() + 5), int(clip_rect.center().y() + 5)), text)
         painter.restore()
 
     def draw_selections(self, painter):
@@ -807,6 +1646,14 @@ class TimelineWidget(QWidget):
 
         if event.button() == Qt.MouseButton.LeftButton:
             self.setFocus()
+
+            for clip in reversed(self.timeline.clips):
+                if clip.track_type == 'video' and clip.media_type != 'subtitle':
+                    clip_rect = self.get_clip_rect(clip)
+                    fx_btn_rect = QRectF(clip_rect.left() + 4, clip_rect.bottom() - 17, 24, 13)
+                    if fx_btn_rect.contains(QPointF(event.pos())):
+                        self.window().open_effects_dialog(clip)
+                        return
 
             self.dragging_clip = None
             self.dragging_linked_clip = None
@@ -939,7 +1786,7 @@ class TimelineWidget(QWidget):
             if self.resize_selection_edge == 'left':
                 new_start = current_ms
                 new_end = original_end
-            else: # right
+            else:
                 new_start = original_start
                 new_end = current_ms
 
@@ -1070,6 +1917,23 @@ class TimelineWidget(QWidget):
                         break
             if not cursor_set:
                 self.unsetCursor()
+
+            hovered_clip = None
+            for clip in reversed(self.timeline.clips):
+                if self.get_clip_rect(clip).contains(QPointF(event.pos())):
+                    hovered_clip = clip
+                    break
+
+            if hovered_clip:
+                clip_dur_sec = hovered_clip.duration_ms / 1000.0
+                tip = f"{os.path.basename(hovered_clip.source_path)}\nDuration: {clip_dur_sec:.2f}s"
+                if hovered_clip.effects:
+                    fx_names = list(hovered_clip.effects.keys())
+                    tip += f"\nEffects: {', '.join(fx_names)}"
+                clip_rect = self.get_clip_rect(hovered_clip).toRect()
+                QToolTip.showText(event.globalPosition().toPoint(), tip, self, clip_rect)
+            else:
+                QToolTip.hideText()
 
         if self.creating_selection_region:
             current_ms = self.x_to_ms(event.pos().x())
@@ -1231,6 +2095,10 @@ class TimelineWidget(QWidget):
             self.drag_start_state = None
             
             self.update()
+
+    def leaveEvent(self, event):
+        QToolTip.hideText()
+        super().leaveEvent(event)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasFormat('application/x-vnd.video.filepath') or event.mimeData().hasUrls():
@@ -1507,6 +2375,11 @@ class TimelineWidget(QWidget):
         if clip_at_pos:
             if not menu.isEmpty(): menu.addSeparator()
 
+            if clip_at_pos.track_type == 'video' and clip_at_pos.media_type != 'subtitle':
+                effects_action = menu.addAction("Effects...")
+                effects_action.triggered.connect(lambda: self.window().open_effects_dialog(clip_at_pos))
+                menu.addSeparator()
+
             linked_clip = next((c for c in self.timeline.clips if c.group_id == clip_at_pos.group_id and c.id != clip_at_pos.id), None)
             if linked_clip:
                 unlink_action = menu.addAction("Unlink Audio Track")
@@ -1549,7 +2422,6 @@ class TimelineWidget(QWidget):
         else:
             super().keyPressEvent(event)
 
-    
 class SettingsDialog(QDialog):
     def __init__(self, parent_settings, parent=None):
         super().__init__(parent)
@@ -1589,13 +2461,14 @@ class SettingsDialog(QDialog):
         }
 
 class ExportDialog(QDialog):
-    def __init__(self, default_path, parent=None):
+    def __init__(self, default_path, initial_settings=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Export Settings")
-        self.setMinimumWidth(550)
+        self.setMinimumWidth(580)
 
-        self.video_bitrate_options = ["500k", "1M", "2.5M", "5M", "8M", "15M", "Custom..."]
-        self.audio_bitrate_options = ["96k", "128k", "192k", "256k", "320k", "Custom..."]
+        self.initial_settings = initial_settings or {}
+        self.video_bitrate_options = ["Lossless (QP 0 / CRF 1)", "500k", "1M", "2.5M", "5M", "8M", "15M", "Custom..."]
+        self.audio_bitrate_options = ["384k", "320k", "256k", "192k", "128k", "96k", "Custom..."]
         self.display_ext_map = {'matroska': 'mkv', 'oga': 'ogg'}
 
         self.layout = QVBoxLayout(self)
@@ -1605,8 +2478,25 @@ class ExportDialog(QDialog):
 
         self._setup_ui()
         
-        self.path_edit.setText(default_path)
+        self.path_edit.setText(self.initial_settings.get("output_path", default_path))
+        init_w = int(self.initial_settings.get("width") or 1280)
+        init_h = int(self.initial_settings.get("height") or 720)
+        self.res_width_spin.setValue((init_w // 2) * 2)
+        self.res_height_spin.setValue((init_h // 2) * 2)
+
         self.on_advanced_toggled(False)
+        self._apply_initial_settings()
+
+    def on_res_preset_changed(self, text):
+        if "1920x1080" in text:
+            self.res_width_spin.setValue(1920)
+            self.res_height_spin.setValue(1080)
+        elif "1280x720" in text:
+            self.res_width_spin.setValue(1280)
+            self.res_height_spin.setValue(720)
+        elif "3840x2160" in text:
+            self.res_width_spin.setValue(3840)
+            self.res_height_spin.setValue(2160)
 
     def _setup_ui(self):
         output_group = QGroupBox("Output File")
@@ -1618,6 +2508,48 @@ class ExportDialog(QDialog):
         output_layout.addWidget(browse_button)
         output_group.setLayout(output_layout)
         self.layout.addWidget(output_group)
+
+        profile_group = QGroupBox("Quick Profile Preset")
+        profile_layout = QFormLayout()
+        self.winner_profile_combo = QComboBox()
+        self.winner_profile_combo.addItems([
+            "Custom (Use settings below)",
+            "Winner 1: Direct Stream Copy (Instant, 0 Re-encode, Clean Edit-Lists)",
+            "Winner 2: Lossless HEVC / H.265 (QP 0, Full Audio, Zero Freeze)",
+            "Winner 3: Lossless H.264 (CRF 1, High Profile, Max Compatibility)"
+        ])
+        self.winner_profile_combo.currentIndexChanged.connect(self.on_winner_profile_selected)
+        profile_layout.addRow("Preset Profile:", self.winner_profile_combo)
+        profile_group.setLayout(profile_layout)
+        self.layout.addWidget(profile_group)
+
+        res_group = QGroupBox("Resolution")
+        res_layout = QFormLayout()
+        res_fields_layout = QHBoxLayout()
+        self.res_width_spin = QSpinBox()
+        self.res_width_spin.setRange(16, 7680)
+        self.res_width_spin.setSingleStep(2)
+        self.res_height_spin = QSpinBox()
+        self.res_height_spin.setRange(16, 4320)
+        self.res_height_spin.setSingleStep(2)
+        res_fields_layout.addWidget(QLabel("W:"))
+        res_fields_layout.addWidget(self.res_width_spin)
+        res_fields_layout.addWidget(QLabel("H:"))
+        res_fields_layout.addWidget(self.res_height_spin)
+
+        self.res_preset_combo = QComboBox()
+        self.res_preset_combo.addItems([
+            "Current Project Resolution",
+            "1920x1080 (1080p FHD)",
+            "1280x720 (720p HD)",
+            "3840x2160 (4K UHD)",
+            "Custom"
+        ])
+        self.res_preset_combo.currentTextChanged.connect(self.on_res_preset_changed)
+        res_layout.addRow("Preset:", self.res_preset_combo)
+        res_layout.addRow("Dimensions:", res_fields_layout)
+        res_group.setLayout(res_layout)
+        self.layout.addWidget(res_group)
 
         self.container_combo = QComboBox()
         self.container_combo.currentIndexChanged.connect(self.on_container_changed)
@@ -1633,6 +2565,7 @@ class ExportDialog(QDialog):
         self.video_group = QGroupBox("Video Settings")
         video_layout = QFormLayout()
         self.video_codec_combo = QComboBox()
+        self.video_codec_combo.currentIndexChanged.connect(self.on_vcodec_changed)
         video_layout.addRow("Video Codec:", self.video_codec_combo)
         self.v_bitrate_combo = QComboBox()
         self.v_bitrate_combo.addItems(self.video_bitrate_options)
@@ -1642,12 +2575,18 @@ class ExportDialog(QDialog):
         self.v_bitrate_combo.currentTextChanged.connect(self.on_v_bitrate_changed)
         video_layout.addRow("Video Bitrate:", self.v_bitrate_combo)
         video_layout.addRow(self.v_bitrate_custom_edit)
+
+        self.cfr_mode_cb = QCheckBox("Force Constant Frame Rate (CFR / -fps_mode cfr)")
+        self.cfr_mode_cb.setChecked(True)
+        video_layout.addRow(self.cfr_mode_cb)
+
         self.video_group.setLayout(video_layout)
         self.layout.addWidget(self.video_group)
 
         self.audio_group = QGroupBox("Audio Settings")
         audio_layout = QFormLayout()
         self.audio_codec_combo = QComboBox()
+        self.audio_codec_combo.currentIndexChanged.connect(self.on_acodec_changed)
         audio_layout.addRow("Audio Codec:", self.audio_codec_combo)
         self.a_bitrate_combo = QComboBox()
         self.a_bitrate_combo.addItems(self.audio_bitrate_options)
@@ -1657,13 +2596,179 @@ class ExportDialog(QDialog):
         self.a_bitrate_combo.currentTextChanged.connect(self.on_a_bitrate_changed)
         audio_layout.addRow("Audio Bitrate:", self.a_bitrate_combo)
         audio_layout.addRow(self.a_bitrate_custom_edit)
+
+        self.audio_sample_rate_combo = QComboBox()
+        self.audio_sample_rate_combo.addItems(["Keep Original", "32000 Hz (MiniMax-H3)", "44100 Hz", "48000 Hz"])
+        audio_layout.addRow("Audio Sample Rate:", self.audio_sample_rate_combo)
+
         self.audio_group.setLayout(audio_layout)
         self.layout.addWidget(self.audio_group)
+
+        self.sync_group = QGroupBox("Audio Resample & Timestamp Alignment (aresample)")
+        sync_layout = QFormLayout()
+
+        self.aresample_first_pts_cb = QCheckBox("Align First Audio PTS to 0 (first_pts=0)")
+        self.aresample_first_pts_cb.setChecked(True)
+        sync_layout.addRow(self.aresample_first_pts_cb)
+
+        self.aresample_async_spin = QSpinBox()
+        self.aresample_async_spin.setRange(0, 100000)
+        self.aresample_async_spin.setValue(1000)
+        self.aresample_async_spin.setSpecialValueText("Disabled (0)")
+        sync_layout.addRow("Async Stretch/Squeeze Rate (async):", self.aresample_async_spin)
+
+        self.aresample_hard_comp_spin = QDoubleSpinBox()
+        self.aresample_hard_comp_spin.setRange(0.0, 10.0)
+        self.aresample_hard_comp_spin.setSingleStep(0.01)
+        self.aresample_hard_comp_spin.setDecimals(4)
+        self.aresample_hard_comp_spin.setValue(0.1000)
+        self.aresample_hard_comp_spin.setSpecialValueText("Disabled (0.0)")
+        sync_layout.addRow("Min Hard Compensation Threshold (min_hard_comp in s):", self.aresample_hard_comp_spin)
+
+        self.avoid_negative_ts_cb = QCheckBox("Avoid Negative Timestamps (-avoid_negative_ts make_zero)")
+        self.avoid_negative_ts_cb.setChecked(False)
+        sync_layout.addRow(self.avoid_negative_ts_cb)
+
+        self.use_editlist_cb = QCheckBox("Enable MP4 Edit Lists (-use_editlist 1 / Clean Sample 0 Audio)")
+        self.use_editlist_cb.setChecked(True)
+        sync_layout.addRow(self.use_editlist_cb)
+
+        self.sync_group.setLayout(sync_layout)
+        self.layout.addWidget(self.sync_group)
+
+        custom_group = QGroupBox("Additional FFmpeg Arguments")
+        custom_layout = QVBoxLayout()
+        self.custom_args_edit = QLineEdit()
+        self.custom_args_edit.setPlaceholderText("e.g., -x265-params qp=0 -preset medium")
+        custom_layout.addWidget(self.custom_args_edit)
+        custom_group.setLayout(custom_layout)
+        self.layout.addWidget(custom_group)
 
         self.button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
         self.layout.addWidget(self.button_box)
+
+    def _apply_initial_settings(self):
+        s = self.initial_settings
+        if not s:
+            return
+
+        container = s.get("container")
+        if container:
+            idx = self.container_combo.findData(container)
+            if idx != -1: self.container_combo.setCurrentIndex(idx)
+
+        vcodec = s.get("vcodec")
+        if vcodec:
+            idx = self.video_codec_combo.findData(vcodec)
+            if idx != -1: self.video_codec_combo.setCurrentIndex(idx)
+
+        acodec = s.get("acodec")
+        if acodec:
+            idx = self.audio_codec_combo.findData(acodec)
+            if idx != -1: self.audio_codec_combo.setCurrentIndex(idx)
+
+        if "v_bitrate" in s and s["v_bitrate"]:
+            b = str(s["v_bitrate"])
+            idx = self.v_bitrate_combo.findText(b)
+            if idx != -1:
+                self.v_bitrate_combo.setCurrentIndex(idx)
+            else:
+                self.v_bitrate_combo.setCurrentText("Custom...")
+                self.v_bitrate_custom_edit.setText(b)
+
+        if "a_bitrate" in s and s["a_bitrate"]:
+            b = str(s["a_bitrate"])
+            idx = self.a_bitrate_combo.findText(b)
+            if idx != -1:
+                self.a_bitrate_combo.setCurrentIndex(idx)
+            else:
+                self.a_bitrate_combo.setCurrentText("Custom...")
+                self.a_bitrate_custom_edit.setText(b)
+
+        if "sync_audio_first_frame" in s:
+            self.aresample_first_pts_cb.setChecked(bool(s["sync_audio_first_frame"]))
+        if "aresample_first_pts" in s:
+            self.aresample_first_pts_cb.setChecked(bool(s["aresample_first_pts"]))
+        if "aresample_async" in s:
+            self.aresample_async_spin.setValue(int(s["aresample_async"]))
+        if "aresample_min_hard_comp" in s:
+            self.aresample_hard_comp_spin.setValue(float(s["aresample_min_hard_comp"]))
+        if "cfr_mode" in s:
+            self.cfr_mode_cb.setChecked(bool(s["cfr_mode"]))
+        if "avoid_negative_ts" in s:
+            self.avoid_negative_ts_cb.setChecked(bool(s["avoid_negative_ts"]))
+
+        if "audio_sample_rate" in s and s["audio_sample_rate"]:
+            sr_str = str(s["audio_sample_rate"])
+            for i in range(self.audio_sample_rate_combo.count()):
+                if sr_str in self.audio_sample_rate_combo.itemText(i):
+                    self.audio_sample_rate_combo.setCurrentIndex(i)
+                    break
+
+        if "custom_ffmpeg_args" in s:
+            self.custom_args_edit.setText(str(s["custom_ffmpeg_args"]))
+
+    def on_winner_profile_selected(self, index):
+        if index == 1:
+            mp4_idx = self.container_combo.findData("mp4")
+            if mp4_idx != -1: self.container_combo.setCurrentIndex(mp4_idx)
+            v_idx = self.video_codec_combo.findData("copy")
+            if v_idx != -1: self.video_codec_combo.setCurrentIndex(v_idx)
+            a_idx = self.audio_codec_combo.findData("copy")
+            if a_idx != -1: self.audio_codec_combo.setCurrentIndex(a_idx)
+            self.avoid_negative_ts_cb.setChecked(False)
+            self.use_editlist_cb.setChecked(True)
+            self.custom_args_edit.setText("")
+        elif index == 2:
+            mp4_idx = self.container_combo.findData("mp4")
+            if mp4_idx != -1: self.container_combo.setCurrentIndex(mp4_idx)
+            v_idx = self.video_codec_combo.findData("libx265")
+            if v_idx != -1: self.video_codec_combo.setCurrentIndex(v_idx)
+            b_idx = self.v_bitrate_combo.findText("Lossless (QP 0 / CRF 1)")
+            if b_idx != -1: self.v_bitrate_combo.setCurrentIndex(b_idx)
+            a_idx = self.audio_codec_combo.findData("aac")
+            if a_idx != -1: self.audio_codec_combo.setCurrentIndex(a_idx)
+            ab_idx = self.a_bitrate_combo.findText("384k")
+            if ab_idx != -1: self.a_bitrate_combo.setCurrentIndex(ab_idx)
+            self.aresample_first_pts_cb.setChecked(True)
+            self.aresample_async_spin.setValue(1000)
+            self.aresample_hard_comp_spin.setValue(0.1000)
+            self.avoid_negative_ts_cb.setChecked(False)
+            self.use_editlist_cb.setChecked(True)
+            self.custom_args_edit.setText("-x265-params qp=0")
+        elif index == 3:
+            mp4_idx = self.container_combo.findData("mp4")
+            if mp4_idx != -1: self.container_combo.setCurrentIndex(mp4_idx)
+            v_idx = self.video_codec_combo.findData("libx264")
+            if v_idx != -1: self.video_codec_combo.setCurrentIndex(v_idx)
+            b_idx = self.v_bitrate_combo.findText("Lossless (QP 0 / CRF 1)")
+            if b_idx != -1: self.v_bitrate_combo.setCurrentIndex(b_idx)
+            a_idx = self.audio_codec_combo.findData("aac")
+            if a_idx != -1: self.audio_codec_combo.setCurrentIndex(a_idx)
+            ab_idx = self.a_bitrate_combo.findText("384k")
+            if ab_idx != -1: self.a_bitrate_combo.setCurrentIndex(ab_idx)
+            self.aresample_first_pts_cb.setChecked(True)
+            self.aresample_async_spin.setValue(1000)
+            self.aresample_hard_comp_spin.setValue(0.1000)
+            self.avoid_negative_ts_cb.setChecked(False)
+            self.use_editlist_cb.setChecked(True)
+            self.custom_args_edit.setText("")
+
+    def on_vcodec_changed(self, index):
+        vcodec = self.video_codec_combo.currentData()
+        is_copy = (vcodec == 'copy')
+        self.v_bitrate_combo.setEnabled(not is_copy)
+        self.v_bitrate_custom_edit.setEnabled(not is_copy)
+
+    def on_acodec_changed(self, index):
+        acodec = self.audio_codec_combo.currentData()
+        is_copy = (acodec == 'copy')
+        self.a_bitrate_combo.setEnabled(not is_copy)
+        self.a_bitrate_custom_edit.setEnabled(not is_copy)
+        self.audio_sample_rate_combo.setEnabled(not is_copy)
+        self.sync_group.setEnabled(not is_copy)
 
     def _populate_combo(self, combo, data_dict, filter_keys=None):
         current_selection = combo.currentData()
@@ -1776,13 +2881,34 @@ class ExportDialog(QDialog):
         a_bitrate = self.a_bitrate_combo.currentText()
         if a_bitrate == "Custom...": a_bitrate = self.a_bitrate_custom_edit.text()
 
+        sr_text = self.audio_sample_rate_combo.currentText()
+        sample_rate = None
+        if "32000" in sr_text:
+            sample_rate = 32000
+        elif "44100" in sr_text:
+            sample_rate = 44100
+        elif "48000" in sr_text:
+            sample_rate = 48000
+
+        out_w = (self.res_width_spin.value() // 2) * 2
+        out_h = (self.res_height_spin.value() // 2) * 2
         return {
             "output_path": self.path_edit.text(),
+            "width": out_w,
+            "height": out_h,
             "container": self.container_combo.currentData(),
             "vcodec": self.video_codec_combo.currentData() if self.video_group.isEnabled() else None,
             "v_bitrate": v_bitrate if self.v_bitrate_combo.isEnabled() else None,
             "acodec": self.audio_codec_combo.currentData() if self.audio_group.isEnabled() else None,
             "a_bitrate": a_bitrate if self.a_bitrate_combo.isEnabled() else None,
+            "cfr_mode": self.cfr_mode_cb.isChecked(),
+            "audio_sample_rate": sample_rate,
+            "aresample_first_pts": self.aresample_first_pts_cb.isChecked(),
+            "aresample_async": self.aresample_async_spin.value(),
+            "aresample_min_hard_comp": self.aresample_hard_comp_spin.value(),
+            "avoid_negative_ts": self.avoid_negative_ts_cb.isChecked(),
+            "use_editlist": self.use_editlist_cb.isChecked(),
+            "custom_ffmpeg_args": self.custom_args_edit.text().strip(),
         }
 
 class MediaListWidget(QListWidget):
@@ -1901,6 +3027,7 @@ class MainWindow(QMainWindow):
         self.media_properties = {}
         self.current_project_path = None
         self.last_export_path = None
+        self.last_export_settings = None
         self.settings = {}
         self.settings_file = "settings.json"
         self.is_shutting_down = False
@@ -1919,6 +3046,7 @@ class MainWindow(QMainWindow):
 
         self.scale_to_fit = True
         self.current_preview_pixmap = None
+        self.crop_overlay = None
 
         self._setup_ui()
         self._connect_signals()
@@ -1937,6 +3065,8 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._update_preview_display()
+        if self.crop_overlay:
+            self.crop_overlay.setGeometry(self.preview_widget.rect())
 
     def _get_current_timeline_state(self):
         return (
@@ -2167,6 +3297,9 @@ class MainWindow(QMainWindow):
     def _toggle_scale_to_fit(self, checked):
         self.scale_to_fit = checked
         self._update_preview_display()
+        if self.crop_overlay:
+            self.crop_overlay.setGeometry(self.preview_widget.rect())
+            self.crop_overlay.update()
 
     def on_timeline_changed_by_undo(self):
         self.prune_empty_tracks()
@@ -2305,7 +3438,6 @@ class MainWindow(QMainWindow):
         settings_action = QAction("Se&ttings...", self); settings_action.triggered.connect(self.open_settings_dialog)
         exit_action = QAction("E&xit", self); exit_action.triggered.connect(self.close)
         file_menu.addAction(new_action); file_menu.addAction(open_action); file_menu.addSeparator()
-        file_menu.addAction(new_action); file_menu.addAction(open_action); file_menu.addSeparator()
         file_menu.addAction(self.save_action)
         file_menu.addAction(save_as_action)
         file_menu.addSeparator()
@@ -2323,6 +3455,12 @@ class MainWindow(QMainWindow):
         split_action = QAction("Split Clip at Playhead", self); split_action.triggered.connect(self.split_clip_at_playhead)
         edit_menu.addAction(split_action)
         self.update_undo_redo_actions()
+
+        effects_menu = menu_bar.addMenu("&Effects")
+        transform_menu = effects_menu.addMenu("&Transform")
+        crop_action = QAction("&Crop...", self)
+        crop_action.triggered.connect(self.open_crop_for_current_clip)
+        transform_menu.addAction(crop_action)
         
         plugins_menu = menu_bar.addMenu("&Plugins")
         for name, data in self.plugin_manager.plugins.items():
@@ -2349,6 +3487,42 @@ class MainWindow(QMainWindow):
 
             data['action'] = action
             self.windows_menu.addAction(action)
+
+    def open_effects_dialog(self, clip):
+        dialog = EffectsDialog(clip, self)
+        dialog.exec()
+
+    def open_crop_for_current_clip(self):
+        clip = None
+        if self.timeline_widget.selected_clips:
+            clip = next((c for c in self.timeline.clips if c.id in self.timeline_widget.selected_clips and c.track_type == 'video' and c.media_type != 'subtitle'), None)
+        if not clip:
+            playhead_ms = self.timeline_widget.playhead_pos_ms
+            clip = next((c for c in sorted(self.timeline.clips, key=lambda x: x.track_index, reverse=True)
+                         if c.track_type == 'video' and c.media_type != 'subtitle' and c.timeline_start_ms <= playhead_ms < c.timeline_end_ms), None)
+
+        if not clip:
+            clip = next((c for c in self.timeline.clips if c.track_type == 'video' and c.media_type != 'subtitle'), None)
+
+        if clip:
+            self.activate_crop_tool(clip)
+        else:
+            QMessageBox.information(self, "Crop Effect", "Please select a video clip on the timeline or place the playhead over one.")
+
+    def activate_crop_tool(self, clip):
+        self.deactivate_crop_tool()
+        self.crop_overlay = CropOverlayWidget(clip, self, parent=self.preview_widget)
+        self.crop_overlay.setGeometry(self.preview_widget.rect())
+        self.crop_overlay.show()
+
+    def deactivate_crop_tool(self):
+        if self.crop_overlay:
+            self.playback_manager.bypass_crop = False
+            self.crop_overlay.hide()
+            self.crop_overlay.deleteLater()
+            self.crop_overlay = None
+            self.playback_manager.seek_to_frame(self.timeline_widget.playhead_pos_ms)
+            self.timeline_widget.update()
         
     def _re_index_video_to_temp_file(self, original_path):
         self.status_label.setText(f"File may be corrupt or missing an index. Attempting to rebuild, please wait...")
@@ -2476,6 +3650,32 @@ class MainWindow(QMainWindow):
             print(f"Failed to probe file {os.path.basename(file_path)}: {e}")
             return None
 
+    def update_project_resolution_from_timeline(self):
+        video_clips = [c for c in self.timeline.clips if c.track_type == 'video' and c.media_type != 'subtitle']
+        if not video_clips:
+            return
+
+        max_w = 0
+        max_h = 0
+        for c in video_clips:
+            crop = getattr(c, 'effects', {}).get('crop')
+            if crop and all(k in crop for k in ('w', 'h')):
+                cw = int(crop['w'])
+                ch = int(crop['h'])
+            else:
+                props = self.media_properties.get(c.source_path, {})
+                cw = props.get('width', 0)
+                ch = props.get('height', 0)
+
+            if cw > max_w:
+                max_w = cw
+            if ch > max_h:
+                max_h = ch
+
+        if max_w > 0 and max_h > 0:
+            self.project_width = (max_w // 2) * 2
+            self.project_height = (max_h // 2) * 2
+            self._update_preview_display()
 
     def _update_project_properties_from_clip(self, source_path):
         try:
@@ -2483,28 +3683,12 @@ class MainWindow(QMainWindow):
             if not media_info or media_info['media_type'] not in ['video', 'image']:
                 return False
 
-            new_w = media_info.get('width')
-            new_h = media_info.get('height')
             new_fps = media_info.get('fps')
-            
-            if not new_w or not new_h:
-                return False
-
-            is_first_video = not any(c.media_type in ['video', 'image'] for c in self.timeline.clips if c.source_path != source_path)
-            
-            if is_first_video:
-                self.project_width = new_w
-                self.project_height = new_h
-                if new_fps: self.project_fps = new_fps
+            if new_fps and not any(c.media_type in ['video', 'image'] for c in self.timeline.clips if c.source_path != source_path):
+                self.project_fps = new_fps
                 self.timeline_widget.set_project_fps(self.project_fps)
-                print(f"Project properties set from first clip: {self.project_width}x{self.project_height} @ {self.project_fps:.2f} FPS")
-            else:
-                current_area = self.project_width * self.project_height
-                new_area = new_w * new_h
-                if new_area > current_area:
-                    self.project_width = new_w
-                    self.project_height = new_h
-                    print(f"Project resolution updated to: {self.project_width}x{self.project_height}")
+
+            self.update_project_resolution_from_timeline()
             return True
         except Exception as e:
             print(f"Could not probe for project properties: {e}")
@@ -2525,24 +3709,23 @@ class MainWindow(QMainWindow):
             return (None, 0, 0)
         try:
             if clip_at_time.media_type == 'image':
-                out, _ = (
-                    ffmpeg
-                    .input(clip_at_time.source_path)
-                    .filter('scale', w, h, force_original_aspect_ratio='decrease')
-                    .filter('pad', w, h, '(ow-iw)/2', '(oh-ih)/2', 'black')
-                    .output('pipe:', vframes=1, format='rawvideo', pix_fmt='rgb24')
-                    .run(capture_stdout=True, quiet=True)
-                )
+                node = ffmpeg.input(clip_at_time.source_path)
             else:
                 clip_time_sec = (time_ms - clip_at_time.timeline_start_ms + clip_at_time.clip_start_ms) / 1000.0
-                out, _ = (
-                    ffmpeg
-                    .input(clip_at_time.source_path, ss=f"{clip_time_sec:.6f}")
-                    .filter('scale', w, h, force_original_aspect_ratio='decrease')
-                    .filter('pad', w, h, '(ow-iw)/2', '(oh-ih)/2', 'black')
-                    .output('pipe:', vframes=1, format='rawvideo', pix_fmt='rgb24')
-                    .run(capture_stdout=True, quiet=True)
-                )
+                node = ffmpeg.input(clip_at_time.source_path, ss=f"{clip_time_sec:.6f}")
+
+            crop = getattr(clip_at_time, 'effects', {}).get('crop')
+            v_node = node.video
+            if crop and all(k in crop for k in ('x', 'y', 'w', 'h')):
+                v_node = v_node.filter('crop', w=crop['w'], h=crop['h'], x=crop['x'], y=crop['y'])
+
+            out, _ = (
+                v_node
+                .filter('scale', w, h, force_original_aspect_ratio='decrease')
+                .filter('pad', w, h, '(ow-iw)/2', '(oh-ih)/2', 'black')
+                .output('pipe:', vframes=1, format='rawvideo', pix_fmt='rgb24')
+                .run(capture_stdout=True, quiet=True)
+            )
             return (out, self.project_width, self.project_height)
         except ffmpeg.Error as e:
             print(f"Error extracting frame data for plugin: {e.stderr}")
@@ -2573,6 +3756,10 @@ class MainWindow(QMainWindow):
             self.preview_scroll_area.setWidgetResizable(False)
             self.preview_widget.setPixmap(pixmap_to_show)
             self.preview_widget.adjustSize()
+
+        if self.crop_overlay:
+            self.crop_overlay.setGeometry(self.preview_widget.rect())
+            self.crop_overlay.update()
 
     def toggle_playback(self):
         if not self.timeline.clips:
@@ -2694,10 +3881,12 @@ class MainWindow(QMainWindow):
 
     def new_project(self):
         self.playback_manager.stop()
+        self.deactivate_crop_tool()
         self.timeline.clips.clear(); self.timeline.num_video_tracks = 1; self.timeline.num_audio_tracks = 1
         self.media_pool.clear(); self.media_properties.clear(); self.project_media_widget.clear_list()
         self.current_project_path = None
         self.last_export_path = None
+        self.last_export_settings = None
         self.project_fps = 25.0
         self.project_width = 1280
         self.project_height = 720
@@ -2720,9 +3909,10 @@ class MainWindow(QMainWindow):
     def _write_project_to_file(self, path):
         project_data = {
             "media_pool": self.media_pool,
-            "clips": [{"source_path": c.source_path, "timeline_start_ms": c.timeline_start_ms, "clip_start_ms": c.clip_start_ms, "duration_ms": c.duration_ms, "track_index": c.track_index, "track_type": c.track_type, "media_type": c.media_type, "group_id": c.group_id} for c in self.timeline.clips],
+            "clips": [c.to_dict() for c in self.timeline.clips],
             "selection_regions": self.timeline_widget.selection_regions,
             "last_export_path": self.last_export_path,
+            "export_settings": self.last_export_settings,
             "settings": {
                 "num_video_tracks": self.timeline.num_video_tracks,
                 "num_audio_tracks": self.timeline.num_audio_tracks,
@@ -2765,6 +3955,7 @@ class MainWindow(QMainWindow):
             self.project_fps = project_settings.get("project_fps", 25.0)
             self.timeline_widget.set_project_fps(self.project_fps)
             self.last_export_path = project_data.get("last_export_path")
+            self.last_export_settings = project_data.get("export_settings")
             self.timeline_widget.selection_regions = project_data.get("selection_regions", [])
 
             media_pool_paths = project_data.get("media_pool", [])
@@ -2925,7 +4116,7 @@ class MainWindow(QMainWindow):
         if file_paths:
             self._add_media_files_to_project(file_paths)
 
-    def _add_clip_to_timeline(self, source_path, timeline_start_ms, duration_ms, media_type, clip_start_ms=0, video_track_index=None, audio_track_index=None):
+    def _add_clip_to_timeline(self, source_path, timeline_start_ms, duration_ms, media_type, clip_start_ms=0, video_track_index=None, audio_track_index=None, effects=None):
         media_info = self.media_properties.get(source_path)
         if not media_info:
             self.status_label.setText(f"Cannot add clip, missing properties for {os.path.basename(source_path)}")
@@ -2942,7 +4133,7 @@ class MainWindow(QMainWindow):
         if video_track_index is not None:
              if video_track_index > self.timeline.num_video_tracks:
                  self.timeline.num_video_tracks = video_track_index
-             video_clip = TimelineClip(path_for_clip, timeline_start_ms, clip_start_ms, duration_ms, video_track_index, 'video', media_type, group_id)
+             video_clip = TimelineClip(path_for_clip, timeline_start_ms, clip_start_ms, duration_ms, video_track_index, 'video', media_type, group_id, effects=effects)
              self.timeline.add_clip(video_clip)
         
         if audio_track_index is not None:
@@ -2956,14 +4147,23 @@ class MainWindow(QMainWindow):
         command.undo()
         self.undo_stack.push(command)
 
-
     def _split_at_time(self, clip_to_split, time_ms, new_group_id=None):
         if not (clip_to_split.timeline_start_ms < time_ms < clip_to_split.timeline_end_ms): return False
         split_point = time_ms - clip_to_split.timeline_start_ms
         orig_dur = clip_to_split.duration_ms
         group_id_for_new_clip = new_group_id if new_group_id is not None else clip_to_split.group_id
         
-        new_clip = TimelineClip(clip_to_split.source_path, time_ms, clip_to_split.clip_start_ms + split_point, orig_dur - split_point, clip_to_split.track_index, clip_to_split.track_type, clip_to_split.media_type, group_id_for_new_clip)
+        new_clip = TimelineClip(
+            clip_to_split.source_path,
+            time_ms,
+            clip_to_split.clip_start_ms + split_point,
+            orig_dur - split_point,
+            clip_to_split.track_index,
+            clip_to_split.track_type,
+            clip_to_split.media_type,
+            group_id_for_new_clip,
+            effects=copy.deepcopy(clip_to_split.effects)
+        )
         clip_to_split.duration_ms = split_point
         self.timeline.add_clip(new_clip)
         return True
@@ -2993,7 +4193,6 @@ class MainWindow(QMainWindow):
             self.undo_stack.push(command)
         else:
             self.status_label.setText("Failed to split clip.")
-
 
     def delete_clip(self, clip_to_delete):
         self.delete_clips([clip_to_delete])
@@ -3220,7 +4419,6 @@ class MainWindow(QMainWindow):
             self.timeline_widget.clear_all_regions()
         self._perform_complex_timeline_change("Delete All Regions", action)
 
-
     def export_video(self):
         if not self.timeline.clips:
             self.status_label.setText("Timeline is empty.")
@@ -3244,19 +4442,54 @@ class MainWindow(QMainWindow):
             default_path = "output.mp4"
 
         default_path = os.path.normpath(default_path)
+        self.update_project_resolution_from_timeline()
 
-        dialog = ExportDialog(default_path, self)
+        init_settings = dict(self.last_export_settings or {})
+        init_settings["width"] = self.project_width
+        init_settings["height"] = self.project_height
+
+        dialog = ExportDialog(default_path, initial_settings=init_settings, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             self.status_label.setText("Export canceled.")
             return
 
         export_settings = dialog.get_export_settings()
+        self.project_width = int(export_settings.get("width", self.project_width))
+        self.project_height = int(export_settings.get("height", self.project_height))
         output_path = export_settings["output_path"]
         if not output_path:
             self.status_label.setText("Export failed: No output path specified.")
             return
 
+        if export_settings.get("vcodec") == "copy":
+            video_clips = [c for c in self.timeline.clips if c.track_type == 'video' and c.media_type != 'subtitle']
+            if video_clips:
+                clip = video_clips[0]
+                if clip.clip_start_ms > 0:
+                    kfs = self.timeline_widget.keyframe_cache.get_keyframes(clip.source_path, sync=True)
+                    if kfs:
+                        nearest_kf = min(kfs, key=lambda k: abs(k - clip.clip_start_ms))
+                        diff_ms = clip.clip_start_ms - nearest_kf
+                        frame_tolerance = int(round(1000.0 / self.project_fps))
+
+                        if abs(diff_ms) > frame_tolerance:
+                            direction = "after" if diff_ms > 0 else "before"
+                            reply = QMessageBox.warning(
+                                self,
+                                "Direct Copy Keyframe Warning",
+                                f"The cut at the start of '{os.path.basename(clip.source_path)}' ({clip.clip_start_ms / 1000.0:.3f}s) is not on a keyframe.\n\n"
+                                f"Nearest keyframe is at {nearest_kf / 1000.0:.3f}s ({abs(diff_ms)} ms {direction} your cut point).\n\n"
+                                f"In Direct Stream Copy mode, video can only start on a keyframe. Your cut before this keyframe will be ignored and the video will start from {nearest_kf / 1000.0:.3f}s.\n\n"
+                                f"Do you want to proceed with Direct Copy anyway?",
+                                QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
+                                QMessageBox.StandardButton.Cancel
+                            )
+                            if reply != QMessageBox.StandardButton.Ok:
+                                self.status_label.setText("Export canceled.")
+                                return
+
         self.last_export_path = output_path
+        self.last_export_settings = export_settings
 
         project_settings = {
             'width': self.project_width,
@@ -3315,16 +4548,22 @@ class MainWindow(QMainWindow):
 
     def eventFilter(self, source, event):
         if source is self.preview_widget and event.type() == QEvent.Type.MouseButtonDblClick:
-            self.toggle_fullscreen_preview()
+            if not self.crop_overlay:
+                self.toggle_fullscreen_preview()
             return True
         return super().eventFilter(source, event)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Escape and self.isFullScreen():
-            self.toggle_fullscreen_preview()
-            event.accept()
-        else:
-            super().keyPressEvent(event)
+        if event.key() == Qt.Key.Key_Escape:
+            if self.crop_overlay:
+                self.crop_overlay.cancel_crop()
+                event.accept()
+                return
+            elif self.isFullScreen():
+                self.toggle_fullscreen_preview()
+                event.accept()
+                return
+        super().keyPressEvent(event)
 
     def toggle_fullscreen_preview(self):
         controls_widget = self.centralWidget().findChild(QWidget, "controls_widget")

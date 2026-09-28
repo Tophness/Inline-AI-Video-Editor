@@ -5,6 +5,7 @@ import threading
 import time
 from queue import Queue, Empty
 import subprocess
+import copy
 from PyQt6.QtCore import QObject, pyqtSignal, QTimer
 from PyQt6.QtGui import QImage, QPixmap, QColor
 
@@ -95,7 +96,6 @@ class PlaybackManager(QObject):
                         p.kill() # Force kill if terminate fails
                     except Exception as ke:
                         print(f"Error killing process: {ke}")
-
 
         self.video_reader_thread = None
         self.audio_reader_thread = None
@@ -215,6 +215,10 @@ class PlaybackManager(QObject):
 
                     final_node = video_node.video
 
+                    crop = getattr(video_clip_at_time, 'effects', {}).get('crop')
+                    if crop and all(k in crop for k in ('x', 'y', 'w', 'h')):
+                        final_node = final_node.filter('crop', w=crop['w'], h=crop['h'], x=crop['x'], y=crop['y'])
+
                     if subtitle_clip_at_time:
                         sub_seek_sec = (time_ms - subtitle_clip_at_time.timeline_start_ms + subtitle_clip_at_time.clip_start_ms) / 1000.0
 
@@ -228,7 +232,7 @@ class PlaybackManager(QObject):
                                     .run(capture_stdout=True, quiet=True))
 
                     if out:
-                        image = QImage(out, w, h, QImage.Format.Format_RGB888)
+                        image = QImage(out, w, h, w * 3, QImage.Format.Format_RGB888)
                         pixmap = QPixmap.fromImage(image)
 
                 except ffmpeg.Error as e:
@@ -271,6 +275,7 @@ class PlaybackManager(QObject):
                 self.timeline_start_ms = t_start
                 self.media_type = c.media_type
                 self.clip_start_ms = c.clip_start_ms + (t_start - c.timeline_start_ms)
+                self.effects = copy.deepcopy(getattr(c, 'effects', {}))
 
             @property
             def timeline_end_ms(self):
@@ -311,6 +316,16 @@ class PlaybackManager(QObject):
             segment_node = input_stream.video
             if segment_clip.media_type == 'image':
                 segment_node = segment_node.filter('loop', loop=-1, size=1, start=0).filter('setpts', 'N/(FRAME_RATE*TB)').filter('trim', duration=clip_duration_ms / 1000.0)
+
+            crop = getattr(segment_clip, 'effects', {}).get('crop')
+            if crop and all(k in crop for k in ('x', 'y', 'w', 'h')):
+                segment_node = segment_node.filter('crop', w=crop['w'], h=crop['h'], x=crop['x'], y=crop['y'])
+
+            segment_node = (
+                segment_node
+                .filter('scale', w, h, force_original_aspect_ratio='decrease')
+                .filter('pad', w, h, '(ow-iw)/2', '(oh-ih)/2', 'black')
+            )
 
             segment_midpoint_ms = segment_clip.timeline_start_ms + (segment_clip.duration_ms / 2)
             active_sub_clip = next((sc for sc in subtitle_clips if sc.timeline_start_ms <= segment_midpoint_ms < sc.timeline_end_ms), None)
@@ -507,31 +522,28 @@ class PlaybackManager(QObject):
         if self.video_queue:
             while not self.video_queue.empty():
                 try:
-                    # Peek at the next frame
                     if self.video_queue.queue[0] is None: 
-                        self.stop() # End of stream
+                        self.stop()
                         break
                     _, frame_pts = self.video_queue.queue[0]
                     
                     if frame_pts <= current_pos_ms:
                         frame_bytes, frame_pts = self.video_queue.get_nowait()
-                        if frame_bytes is None: # Should be caught by peek, but for safety
+                        if frame_bytes is None:
                              self.stop()
                              break
                         self.last_video_pts_ms = frame_pts
                         _, _, proj_settings = self.get_timeline_data()
                         w, h = proj_settings['width'], proj_settings['height']
-                        img = QImage(frame_bytes, w, h, QImage.Format.Format_RGB888)
+                        img = QImage(frame_bytes, w, h, w * 3, QImage.Format.Format_RGB888)
                         self.new_frame.emit(QPixmap.fromImage(img))
                     else:
-                        # Frame is in the future, wait for next loop
                         break
                 except Empty:
                     break
                 except IndexError:
-                    break # Queue might be empty between check and access
+                    break
 
-        # --- Update Stats ---
         vq_size = self.video_queue.qsize() if self.video_queue else 0
         vq_max = self.video_queue.maxsize if self.video_queue else 0
         aq_size = self.audio_queue.qsize() if self.audio_queue else 0
