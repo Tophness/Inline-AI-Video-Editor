@@ -136,33 +136,59 @@ class Encoder(QObject):
                 stream_args.append(v_in.video)
                 output_args['vcodec'] = 'copy'
             elif vcodec:
-                final_video = ffmpeg.input(f'color=c=black:s={w}x{h}:r={fps}:d={total_dur_sec}', f='lavfi')
+                if len(all_video_clips) == 1 and all_video_clips[0].timeline_start_ms == 0 and not all_subtitle_clips:
+                    single_v_clip = all_video_clips[0]
+                    clip_start_sec = single_v_clip.clip_start_ms / 1000.0
+                    clip_dur_sec = single_v_clip.duration_ms / 1000.0
 
-                for clip in all_video_clips:
-                    if clip.media_type == 'image':
-                        clip_input = ffmpeg.input(clip.source_path, loop=1, framerate=fps)
+                    if single_v_clip.media_type == 'image':
+                        clip_input = ffmpeg.input(single_v_clip.source_path, loop=1, framerate=fps)
+                        v_layer = clip_input.video.filter('trim', duration=f"{clip_dur_sec:.6f}").filter('setpts', 'PTS-STARTPTS')
                     else:
-                        clip_input = ffmpeg.input(clip.source_path)
+                        clip_input = ffmpeg.input(single_v_clip.source_path, ss=f"{clip_start_sec:.6f}", t=f"{clip_dur_sec:.6f}")
+                        v_layer = clip_input.video.filter('setpts', 'PTS-STARTPTS')
 
-                    timeline_start_sec = clip.timeline_start_ms / 1000.0
-                    clip_start_sec = clip.clip_start_ms / 1000.0
-                    time_shift_sec = timeline_start_sec - clip_start_sec
-
-                    v_layer = clip_input.video.setpts(f'PTS+{time_shift_sec}/TB')
-                    crop = getattr(clip, 'effects', {}).get('crop')
+                    crop = getattr(single_v_clip, 'effects', {}).get('crop')
                     if crop and all(k in crop for k in ('x', 'y', 'w', 'h')):
                         v_layer = v_layer.filter('crop', w=crop['w'], h=crop['h'], x=crop['x'], y=crop['y'])
 
-                    timed_layer = (
+                    final_video = (
                         v_layer
                         .filter('scale', w, h, force_original_aspect_ratio='decrease')
                         .filter('pad', w, h, '(ow-iw)/2', '(oh-ih)/2', 'black')
                     )
+                else:
+                    final_video = ffmpeg.input(f'color=c=black:s={w}x{h}:r={fps}:d={total_dur_sec}', f='lavfi')
 
-                    timeline_end_sec = (clip.timeline_start_ms + clip.duration_ms) / 1000.0
-                    enable_expression = f'between(t,{timeline_start_sec:.6f},{timeline_end_sec:.6f})'
+                    for clip in all_video_clips:
+                        timeline_start_sec = clip.timeline_start_ms / 1000.0
+                        clip_start_sec = clip.clip_start_ms / 1000.0
+                        clip_dur_sec = clip.duration_ms / 1000.0
 
-                    final_video = ffmpeg.overlay(final_video, timed_layer, enable=enable_expression, eof_action='pass')
+                        if clip.media_type == 'image':
+                            clip_input = ffmpeg.input(clip.source_path, loop=1, framerate=fps)
+                            v_layer = clip_input.video.filter('trim', duration=f"{clip_dur_sec:.6f}").filter('setpts', 'PTS-STARTPTS')
+                        else:
+                            clip_input = ffmpeg.input(clip.source_path, ss=f"{clip_start_sec:.6f}", t=f"{clip_dur_sec:.6f}")
+                            v_layer = clip_input.video.filter('setpts', 'PTS-STARTPTS')
+
+                        crop = getattr(clip, 'effects', {}).get('crop')
+                        if crop and all(k in crop for k in ('x', 'y', 'w', 'h')):
+                            v_layer = v_layer.filter('crop', w=crop['w'], h=crop['h'], x=crop['x'], y=crop['y'])
+
+                        timed_layer = (
+                            v_layer
+                            .filter('scale', w, h, force_original_aspect_ratio='decrease')
+                            .filter('pad', w, h, '(ow-iw)/2', '(oh-ih)/2', 'black')
+                        )
+
+                        if timeline_start_sec > 0:
+                            timed_layer = timed_layer.filter('setpts', f'PTS+{timeline_start_sec}/TB')
+
+                        timeline_end_sec = (clip.timeline_start_ms + clip.duration_ms) / 1000.0
+                        enable_expression = f'between(t,{timeline_start_sec:.6f},{timeline_end_sec:.6f})'
+
+                        final_video = ffmpeg.overlay(final_video, timed_layer, enable=enable_expression, eof_action='endall')
 
                 for sub_clip in all_subtitle_clips:                
                     timeline_start_sec = sub_clip.timeline_start_ms / 1000.0
@@ -219,8 +245,8 @@ class Encoder(QObject):
 
                         clip_start_sec = clip.clip_start_ms / 1000.0
                         clip_duration_sec = clip.duration_ms / 1000.0
-                        audio_source_node = ffmpeg.input(clip.source_path)
-                        a_seg = audio_source_node.audio.filter('atrim', start=clip_start_sec, duration=clip_duration_sec).filter('asetpts', 'PTS-STARTPTS')
+                        audio_source_node = ffmpeg.input(clip.source_path, ss=f"{clip_start_sec:.6f}", t=f"{clip_duration_sec:.6f}")
+                        a_seg = audio_source_node.audio.filter('asetpts', 'PTS-STARTPTS')
                         track_segments.append(a_seg)
                         last_end_ms = clip.timeline_start_ms + clip.duration_ms
 

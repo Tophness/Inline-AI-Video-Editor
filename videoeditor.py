@@ -24,7 +24,7 @@ from PyQt6.QtGui import (QPainter, QColor, QPen, QFont, QFontMetrics, QMouseEven
                          QPixmap, QImage, QDrag, QCursor, QKeyEvent, QIcon, QTransform,
                          QPainterPath)
 from PyQt6.QtCore import (Qt, QPoint, QRect, QRectF, QSize, QPointF, QObject, QThread,
-                          pyqtSignal, QTimer, QByteArray, QMimeData, QEvent, QLineF)
+                          pyqtSignal, QTimer, QByteArray, QMimeData, QEvent, QLineF, QEventLoop)
 
 from undo import UndoStack, TimelineStateChangeCommand, MoveClipsCommand
 from playback import PlaybackManager
@@ -81,7 +81,7 @@ CONTAINER_PRESETS = {
         'allowed_vcodecs': ['gif'], 'allowed_acodecs': [],
         'v_bitrate': None, 'a_bitrate': None
     },
-    'oga': { # Using oga for ogg audio
+    'oga': {
         'vcodec': None, 'acodec': 'libvorbis',
         'allowed_vcodecs': [], 'allowed_acodecs': ['libvorbis', 'libopus', 'copy'],
         'v_bitrate': None, 'a_bitrate': '192k'
@@ -221,8 +221,6 @@ def _get_subtitle_duration_ms(file_path):
     try:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
-            
-            # SRT format: 00:00:20,123 --> 00:00:22,456
             srt_matches = re.findall(r'\d{2}:\d{2}:\d{2},\d{3}\s+-->\s+(\d{2}):(\d{2}):(\d{2}),(\d{3})', content)
             if srt_matches:
                 for h, m, s, ms in srt_matches:
@@ -231,7 +229,6 @@ def _get_subtitle_duration_ms(file_path):
                         last_time_ms = time_ms
                 return last_time_ms
 
-            # ASS format: Dialogue: 0,0:00:07.84,0:00:10.25,...
             ass_matches = re.findall(r'Dialogue:.+?,(\d):(\d{2}):(\d{2})\.(\d{2}),(\d):(\d{2}):(\d{2})\.(\d{2})', content)
             if ass_matches:
                  for _, _, _, _, h, m, s, cs in ass_matches:
@@ -242,28 +239,7 @@ def _get_subtitle_duration_ms(file_path):
     except Exception as e:
         print(f"Could not parse subtitle duration for {os.path.basename(file_path)}: {e}")
     
-    return 5000 # Fallback to 5 seconds if parsing fails or file is empty
-
-def _parse_timecode_string_to_ms(tc_string):
-    if not isinstance(tc_string, str):
-        return 0
-    
-    parts = tc_string.split(':')
-    try:
-        if len(parts) == 3:
-            h = int(parts[0])
-            m = int(parts[1])
-            s_parts = parts[2].split('.')
-            s = int(s_parts[0])
-            ms = 0
-            if len(s_parts) > 1:
-                ms_str = s_parts[1]
-                ms = int((ms_str + '000')[:3])
-            
-            return (h * 3600 + m * 60 + s) * 1000 + ms
-    except (ValueError, IndexError):
-        return 0
-    return 0
+    return 5000
 
 class WaveformCache(QObject):
     waveform_ready = pyqtSignal(str)
@@ -409,9 +385,10 @@ class KeyframeCache(QObject):
         self.keyframes_ready.emit(source_path)
 
 class TimelineClip:
-    def __init__(self, source_path, timeline_start_ms, clip_start_ms, duration_ms, track_index, track_type, media_type, group_id, effects=None, id=None):
+    def __init__(self, source_path, timeline_start_ms, clip_start_ms, duration_ms, track_index, track_type, media_type, group_id, effects=None, id=None, original_source_path=None):
         self.id = id if id else str(uuid.uuid4())
         self.source_path = source_path
+        self.original_source_path = original_source_path if original_source_path else source_path
         self.timeline_start_ms = int(timeline_start_ms)
         self.clip_start_ms = int(clip_start_ms)
         self.duration_ms = int(duration_ms)
@@ -428,7 +405,7 @@ class TimelineClip:
     def to_dict(self):
         return {
             "id": self.id,
-            "source_path": self.source_path,
+            "source_path": self.original_source_path,
             "timeline_start_ms": self.timeline_start_ms,
             "clip_start_ms": self.clip_start_ms,
             "duration_ms": self.duration_ms,
@@ -2422,15 +2399,98 @@ class TimelineWidget(QWidget):
         else:
             super().keyPressEvent(event)
 
+def get_system_memory_mb():
+    try:
+        import psutil
+        return int(psutil.virtual_memory().total / (1024 * 1024))
+    except Exception:
+        pass
+    if os.name == 'nt':
+        try:
+            import ctypes
+            class MEMORYSTATUSEX(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            stat = MEMORYSTATUSEX()
+            stat.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
+            return int(stat.ullTotalPhys / (1024 * 1024))
+        except Exception:
+            pass
+    elif hasattr(os, 'sysconf'):
+        try:
+            pages = os.sysconf('SC_PHYS_PAGES')
+            page_size = os.sysconf('SC_PAGE_SIZE')
+            return int((pages * page_size) / (1024 * 1024))
+        except Exception:
+            pass
+    return 8192
+
+def get_default_reindex_memory_mb():
+    total_mb = get_system_memory_mb()
+    return max(512, min(2048, total_mb // 4))
+
 class SettingsDialog(QDialog):
     def __init__(self, parent_settings, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(450)
+        self.setMinimumWidth(480)
         layout = QVBoxLayout(self)
+
         self.confirm_on_exit_checkbox = QCheckBox("Confirm before exiting")
         self.confirm_on_exit_checkbox.setChecked(parent_settings.get("confirm_on_exit", True))
         layout.addWidget(self.confirm_on_exit_checkbox)
+
+        reindex_group = QGroupBox("TS / MPEG-TS Re-indexing Settings")
+        reindex_layout = QFormLayout()
+
+        self.ts_reindex_combo = QComboBox()
+        self.ts_reindex_combo.addItems([
+            "Direct Stream Copy (faster)",
+            "Re-encode (more reliable)",
+            "Don't reindex"
+        ])
+        curr_method = parent_settings.get("ts_reindex_method", "Direct Stream Copy (faster)")
+        idx = self.ts_reindex_combo.findText(curr_method)
+        if idx != -1:
+            self.ts_reindex_combo.setCurrentIndex(idx)
+        reindex_layout.addRow("Re-indexing Option:", self.ts_reindex_combo)
+
+        self.reindex_storage_combo = QComboBox()
+        self.reindex_storage_combo.addItems([
+            "Automatic (Memory up to limit, then Temp File)",
+            "Always in memory",
+            "Always use temp file"
+        ])
+        curr_storage = parent_settings.get("ts_reindex_storage", "Automatic (Memory up to limit, then Temp File)")
+        s_idx = self.reindex_storage_combo.findText(curr_storage)
+        if s_idx != -1:
+            self.reindex_storage_combo.setCurrentIndex(s_idx)
+        self.reindex_storage_label = QLabel("Storage Target:")
+        reindex_layout.addRow(self.reindex_storage_label, self.reindex_storage_combo)
+
+        self.max_memory_spin = QSpinBox()
+        self.max_memory_spin.setRange(128, 65536)
+        self.max_memory_spin.setSingleStep(256)
+        self.max_memory_spin.setSuffix(" MB")
+        
+        default_mem_mb = get_default_reindex_memory_mb()
+        curr_mem = parent_settings.get("ts_reindex_max_memory_mb", default_mem_mb)
+        self.max_memory_spin.setValue(int(curr_mem))
+        self.max_memory_label = QLabel("Max Memory Limit:")
+        reindex_layout.addRow(self.max_memory_label, self.max_memory_spin)
+
+        reindex_group.setLayout(reindex_layout)
+        layout.addWidget(reindex_group)
 
         export_path_group = QGroupBox("Default Export Path (for new projects)")
         export_path_layout = QHBoxLayout()
@@ -2449,6 +2509,22 @@ class SettingsDialog(QDialog):
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
 
+        self.ts_reindex_combo.currentTextChanged.connect(self._update_reindex_controls_state)
+        self.reindex_storage_combo.currentTextChanged.connect(self._update_reindex_controls_state)
+        self._update_reindex_controls_state()
+
+    def _update_reindex_controls_state(self):
+        method = self.ts_reindex_combo.currentText()
+        is_enabled = (method != "Don't reindex")
+
+        self.reindex_storage_label.setEnabled(is_enabled)
+        self.reindex_storage_combo.setEnabled(is_enabled)
+
+        storage = self.reindex_storage_combo.currentText()
+        is_auto = ("Automatic" in storage)
+        self.max_memory_label.setEnabled(is_enabled and is_auto)
+        self.max_memory_spin.setEnabled(is_enabled and is_auto)
+
     def browse_default_export_path(self):
         path = QFileDialog.getExistingDirectory(self, "Select Default Export Folder", self.default_export_path_edit.text())
         if path:
@@ -2458,7 +2534,83 @@ class SettingsDialog(QDialog):
         return {
             "confirm_on_exit": self.confirm_on_exit_checkbox.isChecked(),
             "default_export_path": self.default_export_path_edit.text(),
+            "ts_reindex_method": self.ts_reindex_combo.currentText(),
+            "ts_reindex_storage": self.reindex_storage_combo.currentText(),
+            "ts_reindex_max_memory_mb": self.max_memory_spin.value(),
         }
+
+class ReindexWorker(QThread):
+    progress = pyqtSignal(int, str)
+    finished_with_result = pyqtSignal(object, str)
+
+    def __init__(self, file_path, est_duration_ms, settings, parent=None):
+        super().__init__(parent)
+        self.file_path = file_path
+        self.est_duration_ms = est_duration_ms
+        self.settings = settings
+        self.result = None
+        self.output_mkv_path = None
+        self.current_process = None
+        self.is_cancelled = False
+
+    def cancel(self):
+        self.is_cancelled = True
+        if self.current_process and self.current_process.poll() is None:
+            try:
+                self.current_process.terminate()
+            except Exception:
+                pass
+
+    def run(self):
+        self.result, self.output_mkv_path = self._execute_reindex()
+        self.finished_with_result.emit(self.result, self.output_mkv_path)
+
+    def _execute_reindex(self):
+        method = self.settings.get("ts_reindex_method", "Direct Stream Copy (faster)")
+        if method == "Don't reindex":
+            return None, None
+
+        basename = os.path.basename(self.file_path)
+
+        startupinfo = None
+        if hasattr(subprocess, 'STARTUPINFO'):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+        time_pattern = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
+        is_stream_copy = ("Direct Stream Copy" in method)
+
+        temp_filepath = os.path.join(tempfile.gettempdir(), f"ve_reindex_{uuid.uuid4().hex}.mkv")
+
+        if is_stream_copy:
+            cmd = ['ffmpeg', '-y', '-i', self.file_path, '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', temp_filepath]
+        else:
+            cmd = ['ffmpeg', '-y', '-i', self.file_path, '-map', '0:v:0', '-map', '0:a?', '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '22', '-c:a', 'aac', temp_filepath]
+
+        try:
+            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, universal_newlines=True, encoding='utf-8', errors='ignore', startupinfo=startupinfo)
+            self.current_process = proc
+            for line in iter(proc.stderr.readline, ""):
+                if self.is_cancelled:
+                    proc.terminate()
+                    break
+                m = time_pattern.search(line)
+                if m:
+                    h, mn, s, cs = [int(g) for g in m.groups()]
+                    cur_ms = (h * 3600 + mn * 60 + s) * 1000 + cs * 10
+                    pct = min(99, max(0, int((cur_ms / self.est_duration_ms) * 100))) if self.est_duration_ms > 0 else -1
+                    self.progress.emit(pct, f"Indexing {basename} ({h:02d}:{mn:02d}:{s:02d})")
+            proc.wait()
+            if proc.returncode == 0 and os.path.exists(temp_filepath):
+                result = ffmpeg.probe(temp_filepath)
+                return result, temp_filepath
+        except Exception as e:
+            print(f"File re-indexing error: {e}")
+            if os.path.exists(temp_filepath):
+                try: os.remove(temp_filepath)
+                except: pass
+
+        return None, None
 
 class ExportDialog(QDialog):
     def __init__(self, default_path, initial_settings=None, parent=None):
@@ -2514,9 +2666,10 @@ class ExportDialog(QDialog):
         self.winner_profile_combo = QComboBox()
         self.winner_profile_combo.addItems([
             "Custom (Use settings below)",
-            "Winner 1: Direct Stream Copy (Instant, 0 Re-encode, Clean Edit-Lists)",
-            "Winner 2: Lossless HEVC / H.265 (QP 0, Full Audio, Zero Freeze)",
-            "Winner 3: Lossless H.264 (CRF 1, High Profile, Max Compatibility)"
+            "Clean MKV-Aligned Transcode (H.264 CRF 16, Slow Preset, AAC 192k, CFR)",
+            "Direct Stream Copy (Instant, 0 Re-encode, Clean Edit-Lists)",
+            "Lossless HEVC / H.265 (QP 0, Full Audio, Zero Freeze)",
+            "Lossless H.264 (CRF 1, High Profile, Max Compatibility)"
         ])
         self.winner_profile_combo.currentIndexChanged.connect(self.on_winner_profile_selected)
         profile_layout.addRow("Preset Profile:", self.winner_profile_combo)
@@ -2714,6 +2867,25 @@ class ExportDialog(QDialog):
         if index == 1:
             mp4_idx = self.container_combo.findData("mp4")
             if mp4_idx != -1: self.container_combo.setCurrentIndex(mp4_idx)
+            v_idx = self.video_codec_combo.findData("libx264")
+            if v_idx != -1: self.video_codec_combo.setCurrentIndex(v_idx)
+            b_idx = self.v_bitrate_combo.findText("Custom...")
+            if b_idx != -1: self.v_bitrate_combo.setCurrentIndex(b_idx)
+            self.v_bitrate_custom_edit.setText("")
+            a_idx = self.audio_codec_combo.findData("aac")
+            if a_idx != -1: self.audio_codec_combo.setCurrentIndex(a_idx)
+            ab_idx = self.a_bitrate_combo.findText("192k")
+            if ab_idx != -1: self.a_bitrate_combo.setCurrentIndex(ab_idx)
+            self.cfr_mode_cb.setChecked(True)
+            self.aresample_first_pts_cb.setChecked(True)
+            self.aresample_async_spin.setValue(1)
+            self.aresample_hard_comp_spin.setValue(0.0010)
+            self.avoid_negative_ts_cb.setChecked(False)
+            self.use_editlist_cb.setChecked(True)
+            self.custom_args_edit.setText("-crf 16 -preset slow")
+        elif index == 2:
+            mp4_idx = self.container_combo.findData("mp4")
+            if mp4_idx != -1: self.container_combo.setCurrentIndex(mp4_idx)
             v_idx = self.video_codec_combo.findData("copy")
             if v_idx != -1: self.video_codec_combo.setCurrentIndex(v_idx)
             a_idx = self.audio_codec_combo.findData("copy")
@@ -2721,7 +2893,7 @@ class ExportDialog(QDialog):
             self.avoid_negative_ts_cb.setChecked(False)
             self.use_editlist_cb.setChecked(True)
             self.custom_args_edit.setText("")
-        elif index == 2:
+        elif index == 3:
             mp4_idx = self.container_combo.findData("mp4")
             if mp4_idx != -1: self.container_combo.setCurrentIndex(mp4_idx)
             v_idx = self.video_codec_combo.findData("libx265")
@@ -2738,7 +2910,7 @@ class ExportDialog(QDialog):
             self.avoid_negative_ts_cb.setChecked(False)
             self.use_editlist_cb.setChecked(True)
             self.custom_args_edit.setText("-x265-params qp=0")
-        elif index == 3:
+        elif index == 4:
             mp4_idx = self.container_combo.findData("mp4")
             if mp4_idx != -1: self.container_combo.setCurrentIndex(mp4_idx)
             v_idx = self.video_codec_combo.findData("libx264")
@@ -3025,6 +3197,7 @@ class MainWindow(QMainWindow):
         self.undo_stack = UndoStack()
         self.media_pool = []
         self.media_properties = {}
+        self.temp_session_files = set()
         self.current_project_path = None
         self.last_export_path = None
         self.last_export_settings = None
@@ -3048,6 +3221,8 @@ class MainWindow(QMainWindow):
         self.current_preview_pixmap = None
         self.crop_overlay = None
 
+        self.active_reindex_worker = None
+
         self._setup_ui()
         self._connect_signals()
         self._create_actions_and_shortcuts()
@@ -3061,6 +3236,29 @@ class MainWindow(QMainWindow):
         
         if not self.settings_file_was_loaded: self._save_settings()
         if project_to_load: QTimer.singleShot(100, lambda: self._load_project_from_path(project_to_load))
+
+    def _probe_for_drag(self, file_path):
+        if file_path in self.media_properties:
+            return self.media_properties[file_path]
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            if ext in ['.png', '.jpg', '.jpeg']:
+                return {'media_type': 'image', 'duration_ms': 5000, 'has_audio': False}
+            elif ext in ['.srt', '.ass']:
+                return {'media_type': 'subtitle', 'duration_ms': 5000, 'has_audio': False}
+            probe = ffmpeg.probe(file_path)
+            if not probe: return None
+            v_stream = next((s for s in probe['streams'] if s['codec_type'] == 'video'), None)
+            a_stream = next((s for s in probe['streams'] if s['codec_type'] == 'audio'), None)
+            dur = float(probe['format'].get('duration', 0) or 0) * 1000
+            return {
+                'media_type': 'video' if v_stream else ('audio' if a_stream else 'video'),
+                'duration_ms': int(dur) if dur > 0 else 5000,
+                'has_audio': a_stream is not None,
+                'source_path_for_clips': file_path
+            }
+        except Exception:
+            return None
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -3115,7 +3313,7 @@ class MainWindow(QMainWindow):
 
         container_widget = QWidget()
         main_layout = QVBoxLayout(container_widget)
-        main_layout.setContentsMargins(0,0,0,0)
+        main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.addWidget(self.splitter, 1)
 
         controls_widget = QWidget()
@@ -3184,7 +3382,7 @@ class MainWindow(QMainWindow):
         status_bar_widget = QWidget()
         status_bar_widget.setObjectName("status_bar_widget")
         status_layout = QHBoxLayout(status_bar_widget)
-        status_layout.setContentsMargins(5,2,5,2)
+        status_layout.setContentsMargins(5, 2, 5, 2)
 
         self.status_label = QLabel("Ready. Create or open a project from the File menu.")
         self.stats_label = QLabel("AQ: 0/0 | VQ: 0/0")
@@ -3524,45 +3722,38 @@ class MainWindow(QMainWindow):
             self.playback_manager.seek_to_frame(self.timeline_widget.playhead_pos_ms)
             self.timeline_widget.update()
         
-    def _re_index_video_to_temp_file(self, original_path):
-        self.status_label.setText(f"File may be corrupt or missing an index. Attempting to rebuild, please wait...")
-        QApplication.processEvents()
+    def _re_index_video(self, file_path, est_duration_ms):
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
 
-        try:
-            temp_dir = tempfile.gettempdir()
-            temp_filename = f"ve_reindex_{uuid.uuid4().hex}.mp4"
-            temp_filepath = os.path.join(temp_dir, temp_filename)
+        worker = ReindexWorker(file_path, est_duration_ms, self.settings, parent=self)
+        self.active_reindex_worker = worker
 
-            startupinfo = None
-            if hasattr(subprocess, 'STARTUPINFO'):
-                startupinfo = subprocess.STARTUPINFO()
-                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        loop = QEventLoop()
+        worker.progress.connect(self._on_reindex_progress)
+        worker.finished.connect(loop.quit)
 
-            process = subprocess.Popen(
-                ['ffmpeg', '-y', '-i', original_path, '-c', 'copy', '-movflags', 'faststart', temp_filepath],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
-                encoding='utf-8', errors='ignore', startupinfo=startupinfo
-            )
-            
-            for line in iter(process.stdout.readline, ""):
-                pass
-            
-            process.wait()
+        worker.start()
+        loop.exec()
 
-            if process.returncode == 0:
-                self.status_label.setText("Successfully re-indexed file to a temporary location for analysis.")
-                QApplication.processEvents()
-                return temp_filepath
-            else:
-                self.status_label.setText("Failed to re-index the file. It may be unsupported or severely corrupt.")
-                QApplication.processEvents()
-                if os.path.exists(temp_filepath):
-                    os.remove(temp_filepath)
-                return None
-        except Exception as e:
-            self.status_label.setText(f"An error occurred during file re-indexing: {e}")
-            QApplication.processEvents()
-            return None
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("Ready.")
+        self.active_reindex_worker = None
+
+        return worker.result, worker.output_mkv_path
+
+    def _on_reindex_progress(self, percent, message):
+        self.status_label.setText(message)
+        if percent >= 0:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(percent)
+        else:
+            self.progress_bar.setRange(0, 0)
+        if not self.progress_bar.isVisible():
+            self.progress_bar.setVisible(True)
 
     def _get_media_properties(self, file_path):
         try:
@@ -3577,73 +3768,80 @@ class MainWindow(QMainWindow):
                 media_info['width'] = img.width()
                 media_info['height'] = img.height()
                 media_info['source_path_for_clips'] = file_path
+                return media_info
             elif file_ext in ['.srt', '.ass']:
                 media_info['media_type'] = 'subtitle'
                 media_info['duration_ms'] = _get_subtitle_duration_ms(file_path)
                 media_info['has_audio'] = False
                 media_info['source_path_for_clips'] = file_path
+                return media_info
+
+            try:
+                probe = ffmpeg.probe(file_path)
+            except ffmpeg.Error:
+                probe = None
+
+            format_name = probe.get('format', {}).get('format_name', '').lower() if probe else ''
+            is_ts = file_ext in ['.ts', '.m2ts', '.mts', '.m2t', '.tsv'] or 'mpegts' in format_name
+
+            current_duration_ms = 0
+            if probe:
+                dur_str = probe['format'].get('duration')
+                if not dur_str or dur_str == 'N/A':
+                    vid = next((s for s in probe['streams'] if s['codec_type'] == 'video'), None)
+                    if vid: dur_str = vid.get('duration')
+                if not dur_str or dur_str == 'N/A':
+                     aud = next((s for s in probe['streams'] if s['codec_type'] == 'audio'), None)
+                     if aud: dur_str = aud.get('duration')
+
+                if dur_str and dur_str != 'N/A':
+                    try: current_duration_ms = float(dur_str) * 1000
+                    except ValueError: current_duration_ms = 0
+
+            reindex_method = self.settings.get("ts_reindex_method", "Direct Stream Copy (faster)")
+            reindexed_mkv_path = None
+
+            if reindex_method != "Don't reindex" and (is_ts or not probe or current_duration_ms < 1000):
+                new_probe, mkv_path = self._re_index_video(file_path, current_duration_ms)
+                if new_probe and mkv_path:
+                    probe = new_probe
+                    reindexed_mkv_path = mkv_path
+                    self.temp_session_files.add(mkv_path)
+
+            if not probe: return None
+
+            video_stream = next((s for s in probe['streams'] if s['codec_type'] == 'video'), None)
+            audio_stream = next((s for s in probe['streams'] if s['codec_type'] == 'audio'), None)
+
+            path_for_clips = reindexed_mkv_path if reindexed_mkv_path else file_path
+
+            if video_stream:
+                media_info['media_type'] = 'video'
+                duration_str = probe['format'].get('duration')
+                if not duration_str or duration_str == 'N/A':
+                    duration_str = video_stream.get('duration')
+                
+                media_info['duration_ms'] = int(float(duration_str) * 1000) if duration_str and duration_str != 'N/A' else 0
+                media_info['has_audio'] = audio_stream is not None
+                media_info['width'] = int(video_stream['width'])
+                media_info['height'] = int(video_stream['height'])
+                if 'r_frame_rate' in video_stream and video_stream['r_frame_rate'] != '0/0':
+                    num, den = map(int, video_stream['r_frame_rate'].split('/'))
+                    if den > 0: media_info['fps'] = num / den
+                media_info['source_path_for_clips'] = path_for_clips
+                media_info['original_path'] = file_path
+
+            elif audio_stream:
+                media_info['media_type'] = 'audio'
+                duration_str = probe['format'].get('duration')
+                if not duration_str or duration_str == 'N/A':
+                     duration_str = audio_stream.get('duration')
+                media_info['duration_ms'] = int(float(duration_str) * 1000) if duration_str and duration_str != 'N/A' else 0
+                media_info['has_audio'] = True
+                media_info['source_path_for_clips'] = path_for_clips
+                media_info['original_path'] = file_path
             else:
-                try:
-                    probe = ffmpeg.probe(file_path)
-                except ffmpeg.Error:
-                    probe = None
-
-                current_duration_ms = 0
-                if probe:
-                    dur_str = probe['format'].get('duration')
-                    if not dur_str or dur_str == 'N/A':
-                        vid = next((s for s in probe['streams'] if s['codec_type'] == 'video'), None)
-                        if vid: dur_str = vid.get('duration')
-                    if not dur_str or dur_str == 'N/A':
-                         aud = next((s for s in probe['streams'] if s['codec_type'] == 'audio'), None)
-                         if aud: dur_str = aud.get('duration')
-
-                    if dur_str and dur_str != 'N/A':
-                        try: current_duration_ms = float(dur_str) * 1000
-                        except ValueError: current_duration_ms = 0
-
-                if not probe or current_duration_ms < 1000:
-                    temp_path = self._re_index_video_to_temp_file(file_path)
-                    if temp_path:
-                        try:
-                            probe = ffmpeg.probe(temp_path)
-                        except Exception as e:
-                            print(f"Failed to probe temp file: {e}")
-                        finally:
-                            if os.path.exists(temp_path):
-                                try: os.remove(temp_path)
-                                except: pass
-
-                if not probe: return None
-
-                video_stream = next((s for s in probe['streams'] if s['codec_type'] == 'video'), None)
-                audio_stream = next((s for s in probe['streams'] if s['codec_type'] == 'audio'), None)
-
-                if video_stream:
-                    media_info['media_type'] = 'video'
-                    duration_str = probe['format'].get('duration')
-                    if not duration_str or duration_str == 'N/A':
-                        duration_str = video_stream.get('duration')
-                    
-                    media_info['duration_ms'] = int(float(duration_str) * 1000) if duration_str and duration_str != 'N/A' else 0
-                    media_info['has_audio'] = audio_stream is not None
-                    media_info['width'] = int(video_stream['width'])
-                    media_info['height'] = int(video_stream['height'])
-                    if 'r_frame_rate' in video_stream and video_stream['r_frame_rate'] != '0/0':
-                        num, den = map(int, video_stream['r_frame_rate'].split('/'))
-                        if den > 0: media_info['fps'] = num / den
-                    media_info['source_path_for_clips'] = file_path
-
-                elif audio_stream:
-                    media_info['media_type'] = 'audio'
-                    duration_str = probe['format'].get('duration')
-                    if not duration_str or duration_str == 'N/A':
-                         duration_str = audio_stream.get('duration')
-                    media_info['duration_ms'] = int(float(duration_str) * 1000) if duration_str and duration_str != 'N/A' else 0
-                    media_info['has_audio'] = True
-                    media_info['source_path_for_clips'] = file_path
-                else:
-                    return None
+                return None
             
             return media_info
         except Exception as e:
@@ -3693,9 +3891,6 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"Could not probe for project properties: {e}")
         return False
-
-    def _probe_for_drag(self, file_path):
-        return self._get_media_properties(file_path)
 
     def get_frame_data_at_time(self, time_ms):
         """Blocking frame grab for plugin compatibility."""
@@ -3812,11 +4007,11 @@ class MainWindow(QMainWindow):
 
         TOLERANCE_MS = 1 
 
-        if direction == 1: # Forward
+        if direction == 1:
             next_points = [p for p in sorted_points if p > current_time_ms + TOLERANCE_MS]
             if next_points:
                 self.playback_manager.seek_to_frame(next_points[0])
-        elif direction == -1: # Backward
+        elif direction == -1:
             prev_points = [p for p in sorted_points if p < current_time_ms - TOLERANCE_MS]
             if prev_points:
                 self.playback_manager.seek_to_frame(prev_points[-1])
@@ -3832,7 +4027,17 @@ class MainWindow(QMainWindow):
 
     def _load_settings(self):
         self.settings_file_was_loaded = False
-        defaults = {"window_visibility": {"project_media": False}, "splitter_state": None, "enabled_plugins": [], "recent_files": [], "confirm_on_exit": True, "default_export_path": ""}
+        defaults = {
+            "window_visibility": {"project_media": False},
+            "splitter_state": None,
+            "enabled_plugins": [],
+            "recent_files": [],
+            "confirm_on_exit": True,
+            "default_export_path": "",
+            "ts_reindex_method": "Direct Stream Copy (faster)",
+            "ts_reindex_storage": "Automatic (Memory up to limit, then Temp File)",
+            "ts_reindex_max_memory_mb": get_default_reindex_memory_mb()
+        }
         if os.path.exists(self.settings_file):
             try:
                 with open(self.settings_file, "r") as f: self.settings = json.load(f)
@@ -3882,6 +4087,11 @@ class MainWindow(QMainWindow):
     def new_project(self):
         self.playback_manager.stop()
         self.deactivate_crop_tool()
+        for f in list(self.temp_session_files):
+            try:
+                if os.path.exists(f): os.remove(f)
+            except Exception: pass
+        self.temp_session_files.clear()
         self.timeline.clips.clear(); self.timeline.num_video_tracks = 1; self.timeline.num_audio_tracks = 1
         self.media_pool.clear(); self.media_properties.clear(); self.project_media_widget.clear_list()
         self.current_project_path = None
@@ -3962,16 +4172,21 @@ class MainWindow(QMainWindow):
             for p in media_pool_paths: self._add_media_to_pool(p)
             
             for clip_data in project_data["clips"]:
-                if not os.path.exists(clip_data["source_path"]):
-                    self.status_label.setText(f"Error: Missing media file {clip_data['source_path']}"); self.new_project(); return
+                orig_path = clip_data["source_path"]
+                if not os.path.exists(orig_path):
+                    self.status_label.setText(f"Error: Missing media file {orig_path}"); self.new_project(); return
 
                 if 'media_type' not in clip_data:
-                    ext = os.path.splitext(clip_data['source_path'])[1].lower()
+                    ext = os.path.splitext(orig_path)[1].lower()
                     if ext in ['.mp3', '.wav', '.m4a', '.aac']:
                          clip_data['media_type'] = 'audio'
                     else:
                          clip_data['media_type'] = 'video'
-                
+
+                media_info = self.media_properties.get(orig_path, {})
+                active_source = media_info.get('source_path_for_clips', orig_path)
+                clip_data['source_path'] = active_source
+                clip_data['original_source_path'] = orig_path
                 self.timeline.add_clip(TimelineClip(**clip_data))
             
             self.current_project_path = path
@@ -4010,6 +4225,8 @@ class MainWindow(QMainWindow):
         
         if media_info:
             self.media_properties[original_path] = media_info
+            if 'source_path_for_clips' in media_info:
+                self.media_properties[media_info['source_path_for_clips']] = media_info
             if original_path not in self.media_pool:
                 self.media_pool.append(original_path)
             
@@ -4024,9 +4241,18 @@ class MainWindow(QMainWindow):
         old_state = self._get_current_timeline_state()
         
         if file_path in self.media_pool: self.media_pool.remove(file_path)
-        if file_path in self.media_properties: del self.media_properties[file_path]
+        if file_path in self.media_properties:
+            mprops = self.media_properties.get(file_path, {})
+            alt_path = mprops.get('source_path_for_clips')
+            if alt_path and alt_path in self.temp_session_files:
+                try:
+                    if os.path.exists(alt_path): os.remove(alt_path)
+                except Exception: pass
+                self.temp_session_files.discard(alt_path)
+                del self.media_properties[alt_path]
+            del self.media_properties[file_path]
         
-        clips_to_remove = [c for c in self.timeline.clips if c.source_path == file_path]
+        clips_to_remove = [c for c in self.timeline.clips if c.source_path == file_path or getattr(c, 'original_source_path', None) == file_path]
         for clip in clips_to_remove: self.timeline.clips.remove(clip)
 
         new_state = self._get_current_timeline_state()
@@ -4049,7 +4275,7 @@ class MainWindow(QMainWindow):
         return added_files
 
     def add_media_to_timeline(self):
-        file_paths, _ = QFileDialog.getOpenFileNames(self, "Add Media to Timeline", "", "All Supported Files (*.mp4 *.mov *.mkv *.avi *.png *.jpg *.jpeg *.mp3 *.wav *.srt *.ass);;Video Files (*.mp4 *.mov *.mkv *.avi);;Image Files (*.png *.jpg *.jpeg);;Audio Files (*.mp3 *.wav);;Subtitle Files (*.srt *.ass)")
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "Add Media to Timeline", "", "All Supported Files (*.mp4 *.mov *.mkv *.avi *.ts *.m2ts *.mts *.png *.jpg *.jpeg *.mp3 *.wav *.srt *.ass);;Video Files (*.mp4 *.mov *.mkv *.avi *.ts *.m2ts *.mts);;Image Files (*.png *.jpg *.jpeg);;Audio Files (*.mp3 *.wav);;Subtitle Files (*.srt *.ass)")
         if not file_paths:
             return
 
@@ -4095,16 +4321,19 @@ class MainWindow(QMainWindow):
                             break
                 
                 group_id = str(uuid.uuid4())
+                orig_path = media_info.get('original_path', file_path)
+                clip_source = media_info.get('source_path_for_clips', file_path)
+
                 if video_track_index is not None:
                     if video_track_index > self.timeline.num_video_tracks:
                         self.timeline.num_video_tracks = video_track_index
-                    video_clip = TimelineClip(media_info['source_path_for_clips'], clip_start_time, 0, duration_ms, video_track_index, 'video', media_type, group_id)
+                    video_clip = TimelineClip(clip_source, clip_start_time, 0, duration_ms, video_track_index, 'video', media_type, group_id, original_source_path=orig_path)
                     self.timeline.add_clip(video_clip)
                 
                 if audio_track_index is not None:
                     if audio_track_index > self.timeline.num_audio_tracks:
                         self.timeline.num_audio_tracks = audio_track_index
-                    audio_clip = TimelineClip(media_info['source_path_for_clips'], clip_start_time, 0, duration_ms, audio_track_index, 'audio', media_type, group_id)
+                    audio_clip = TimelineClip(clip_source, clip_start_time, 0, duration_ms, audio_track_index, 'audio', media_type, group_id, original_source_path=orig_path)
                     self.timeline.add_clip(audio_clip)
 
             self.status_label.setText(f"Added {len(added_files)} file(s) to timeline.")
@@ -4112,7 +4341,7 @@ class MainWindow(QMainWindow):
         self._perform_complex_timeline_change("Add Media to Timeline", add_clips_action)
 
     def add_media_files(self):
-        file_paths, _ = QFileDialog.getOpenFileNames(self, "Open Media Files", "", "All Supported Files (*.mp4 *.mov *.mkv *.avi *.png *.jpg *.jpeg *.mp3 *.wav *.srt *.ass);;Video Files (*.mp4 *.mov *.mkv *.avi);;Image Files (*.png *.jpg *.jpeg);;Audio Files (*.mp3 *.wav);;Subtitle Files (*.srt *.ass)")
+        file_paths, _ = QFileDialog.getOpenFileNames(self, "Open Media Files", "", "All Supported Files (*.mp4 *.mov *.mkv *.avi *.ts *.m2ts *.mts *.png *.jpg *.jpeg *.mp3 *.wav *.srt *.ass);;Video Files (*.mp4 *.mov *.mkv *.avi *.ts *.m2ts *.mts);;Image Files (*.png *.jpg *.jpeg);;Audio Files (*.mp3 *.wav);;Subtitle Files (*.srt *.ass)")
         if file_paths:
             self._add_media_files_to_project(file_paths)
 
@@ -4123,6 +4352,7 @@ class MainWindow(QMainWindow):
             return
 
         path_for_clip = media_info['source_path_for_clips']
+        orig_path = media_info.get('original_path', source_path)
 
         if media_type in ['video', 'image']:
             self._update_project_properties_from_clip(source_path)
@@ -4133,13 +4363,13 @@ class MainWindow(QMainWindow):
         if video_track_index is not None:
              if video_track_index > self.timeline.num_video_tracks:
                  self.timeline.num_video_tracks = video_track_index
-             video_clip = TimelineClip(path_for_clip, timeline_start_ms, clip_start_ms, duration_ms, video_track_index, 'video', media_type, group_id, effects=effects)
+             video_clip = TimelineClip(path_for_clip, timeline_start_ms, clip_start_ms, duration_ms, video_track_index, 'video', media_type, group_id, effects=effects, original_source_path=orig_path)
              self.timeline.add_clip(video_clip)
         
         if audio_track_index is not None:
              if audio_track_index > self.timeline.num_audio_tracks:
                  self.timeline.num_audio_tracks = audio_track_index
-             audio_clip = TimelineClip(path_for_clip, timeline_start_ms, clip_start_ms, duration_ms, audio_track_index, 'audio', media_type, group_id)
+             audio_clip = TimelineClip(path_for_clip, timeline_start_ms, clip_start_ms, duration_ms, audio_track_index, 'audio', media_type, group_id, original_source_path=orig_path)
              self.timeline.add_clip(audio_clip)
 
         new_state = self._get_current_timeline_state()
@@ -4162,7 +4392,8 @@ class MainWindow(QMainWindow):
             clip_to_split.track_type,
             clip_to_split.media_type,
             group_id_for_new_clip,
-            effects=copy.deepcopy(clip_to_split.effects)
+            effects=copy.deepcopy(clip_to_split.effects),
+            original_source_path=getattr(clip_to_split, 'original_source_path', clip_to_split.source_path)
         )
         clip_to_split.duration_ms = split_point
         self.timeline.add_clip(new_clip)
@@ -4270,6 +4501,7 @@ class MainWindow(QMainWindow):
                         found_spot = True
                         break
             
+            orig_path = media_info.get('original_path', video_clip.source_path)
             new_audio_clip = TimelineClip(
                 source_path=video_clip.source_path,
                 timeline_start_ms=video_clip.timeline_start_ms,
@@ -4278,7 +4510,8 @@ class MainWindow(QMainWindow):
                 track_index=target_audio_track,
                 track_type='audio',
                 media_type=video_clip.media_type,
-                group_id=video_clip.group_id
+                group_id=video_clip.group_id,
+                original_source_path=orig_path
             )
             self.timeline.add_clip(new_audio_clip)
             self.status_label.setText("Audio relinked.")
@@ -4596,6 +4829,14 @@ class MainWindow(QMainWindow):
             self.showFullScreen()
 
     def closeEvent(self, event):
+        if self.active_reindex_worker and self.active_reindex_worker.isRunning():
+            self.active_reindex_worker.cancel()
+            self.active_reindex_worker.wait(1000)
+        for f in list(self.temp_session_files):
+            try:
+                if os.path.exists(f): os.remove(f)
+            except Exception: pass
+        self.temp_session_files.clear()
         if self.settings.get("confirm_on_exit", True):
             msg_box = QMessageBox(self)
             msg_box.setWindowTitle("Confirm Exit")
