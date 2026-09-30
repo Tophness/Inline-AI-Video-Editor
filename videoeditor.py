@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QDoubleSpinBox, QToolTip)
 from PyQt6.QtGui import (QPainter, QColor, QPen, QFont, QFontMetrics, QMouseEvent, QAction,
                          QPixmap, QImage, QDrag, QCursor, QKeyEvent, QIcon, QTransform,
-                         QPainterPath)
+                         QPainterPath, QLinearGradient)
 from PyQt6.QtCore import (Qt, QPoint, QRect, QRectF, QSize, QPointF, QObject, QThread,
                           pyqtSignal, QTimer, QByteArray, QMimeData, QEvent, QLineF, QEventLoop)
 
@@ -392,7 +392,7 @@ class TimelineClip:
         self.timeline_start_ms = int(timeline_start_ms)
         self.clip_start_ms = int(clip_start_ms)
         self.duration_ms = int(duration_ms)
-        self.track_index = track_index
+        self.track_index = int(track_index)
         self.track_type = track_type
         self.media_type = media_type
         self.group_id = group_id
@@ -1093,6 +1093,8 @@ class TimelineWidget(QWidget):
 
         self.highlighted_track_info = None
         self.highlighted_ghost_track_info = None
+        self.highlighted_tracks = []
+        self.hovered_clip_id = None
         self.add_video_track_btn_rect = QRect()
         self.remove_video_track_btn_rect = QRect()
         self.add_audio_track_btn_rect = QRect()
@@ -1188,8 +1190,8 @@ class TimelineWidget(QWidget):
         y_cursor += self.TRACK_HEIGHT
         self.video_tracks_y_start = y_cursor
 
-        for i in range(self.timeline.num_video_tracks):
-            track_number = self.timeline.num_video_tracks - i
+        for i in range(int(self.timeline.num_video_tracks)):
+            track_number = int(self.timeline.num_video_tracks) - i
             rect = QRect(0, y_cursor, self.HEADER_WIDTH, self.TRACK_HEIGHT)
             painter.fillRect(rect, QColor("#444"))
             painter.drawRect(rect)
@@ -1206,7 +1208,7 @@ class TimelineWidget(QWidget):
         y_cursor += self.AUDIO_TRACKS_SEPARATOR_Y
 
         self.audio_tracks_y_start = y_cursor
-        for i in range(self.timeline.num_audio_tracks):
+        for i in range(int(self.timeline.num_audio_tracks)):
             track_number = i + 1
             rect = QRect(0, y_cursor, self.HEADER_WIDTH, self.TRACK_HEIGHT)
             painter.fillRect(rect, QColor("#444"))
@@ -1442,65 +1444,147 @@ class TimelineWidget(QWidget):
     def draw_tracks_and_clips(self, painter):
         painter.save()
         y_cursor = self.video_tracks_y_start
-        for i in range(self.timeline.num_video_tracks):
+        for i in range(int(self.timeline.num_video_tracks)):
             rect = QRect(self.HEADER_WIDTH, y_cursor, self.width() - self.HEADER_WIDTH, self.TRACK_HEIGHT)
-            painter.fillRect(rect, QColor("#444") if i % 2 == 0 else QColor("#404040"))
+            painter.fillRect(rect, QColor("#444") if i % 2 == 0 else QColor("#3c3c3c"))
             y_cursor += self.TRACK_HEIGHT
 
         y_cursor = self.audio_tracks_y_start
-        for i in range(self.timeline.num_audio_tracks):
+        for i in range(int(self.timeline.num_audio_tracks)):
             rect = QRect(self.HEADER_WIDTH, y_cursor, self.width() - self.HEADER_WIDTH, self.TRACK_HEIGHT)
-            painter.fillRect(rect, QColor("#444") if i % 2 == 0 else QColor("#404040"))
+            painter.fillRect(rect, QColor("#444") if i % 2 == 0 else QColor("#3c3c3c"))
             y_cursor += self.TRACK_HEIGHT
 
+        tracks_to_highlight = set(self.highlighted_tracks)
         if self.highlighted_track_info:
-            track_type, track_index = self.highlighted_track_info
-            y = -1
-            if track_type == 'video' and track_index <= self.timeline.num_video_tracks:
-                visual_index = self.timeline.num_video_tracks - track_index
-                y = self.video_tracks_y_start + visual_index * self.TRACK_HEIGHT
-            elif track_type == 'audio' and track_index <= self.timeline.num_audio_tracks:
-                visual_index = track_index - 1
-                y = self.audio_tracks_y_start + visual_index * self.TRACK_HEIGHT
-
-            if y != -1:
-                highlight_rect = QRect(self.HEADER_WIDTH, int(y), self.width() - self.HEADER_WIDTH, self.TRACK_HEIGHT)
-                painter.fillRect(highlight_rect, QColor(255, 255, 0, 40))
-
+            tracks_to_highlight.add(self.highlighted_track_info)
         if self.highlighted_ghost_track_info:
-            track_type, track_index = self.highlighted_ghost_track_info
+            tracks_to_highlight.add(self.highlighted_ghost_track_info)
+
+        for track_type, track_index in tracks_to_highlight:
             y = -1
             if track_type == 'video':
-                y = self.TIMESCALE_HEIGHT
+                if track_index > self.timeline.num_video_tracks:
+                    y = self.TIMESCALE_HEIGHT
+                else:
+                    visual_index = int(self.timeline.num_video_tracks - track_index)
+                    y = self.video_tracks_y_start + visual_index * self.TRACK_HEIGHT
             elif track_type == 'audio':
-                y = self.audio_tracks_y_start + self.timeline.num_audio_tracks * self.TRACK_HEIGHT
+                if track_index > self.timeline.num_audio_tracks:
+                    y = self.audio_tracks_y_start + int(self.timeline.num_audio_tracks) * self.TRACK_HEIGHT
+                else:
+                    visual_index = int(track_index - 1)
+                    y = self.audio_tracks_y_start + visual_index * self.TRACK_HEIGHT
 
             if y != -1:
                 highlight_rect = QRect(self.HEADER_WIDTH, int(y), self.width() - self.HEADER_WIDTH, self.TRACK_HEIGHT)
                 painter.fillRect(highlight_rect, QColor(255, 255, 0, 40))
+
+        hovered_group_id = None
+        if self.hovered_clip_id:
+            h_clip = next((c for c in self.timeline.clips if c.id == self.hovered_clip_id), None)
+            if h_clip:
+                hovered_group_id = h_clip.group_id
+
+        title_font = QFont("Segoe UI", 8, QFont.Weight.Bold)
+        fm = QFontMetrics(title_font)
 
         for clip in self.timeline.clips:
             clip_rect = self.get_clip_rect(clip)
-            base_color = QColor("#46A")
+            if clip_rect.width() <= 0:
+                continue
+
+            is_linked = any(c for c in self.timeline.clips if c.group_id == clip.group_id and c.id != clip.id)
+            is_being_dragged = bool(self.dragging_clip and clip.id in self.drag_original_clip_states)
+            is_selected = clip.id in self.selected_clips
+            is_hovered = (clip.id == self.hovered_clip_id) or (is_linked and clip.group_id == hovered_group_id)
+
             if clip.media_type == 'image':
-                base_color = QColor("#4A6")
+                c_top, c_bot = QColor("#3d784a"), QColor("#224e2d")
             elif clip.media_type == 'subtitle':
-                base_color = QColor("#D9A022")
+                c_top, c_bot = QColor("#b3811e"), QColor("#7a550f")
             elif clip.track_type == 'audio':
-                base_color = QColor("#284b63")
-            
-            color = QColor("#5A9") if self.dragging_clip and self.dragging_clip.id == clip.id else base_color
-            painter.fillRect(clip_rect, color)
+                c_top, c_bot = QColor("#235456"), QColor("#143536")
+            else:  # video
+                c_top, c_bot = QColor("#36628c"), QColor("#1e3d5b")
+
+            if is_being_dragged:
+                if clip.track_type == 'video':
+                    c_top, c_bot = QColor("#4fa180"), QColor("#326e55")
+                else:
+                    c_top, c_bot = QColor("#3a7d9c"), QColor("#23546b")
+
+            painter.save()
+            grad = QLinearGradient(clip_rect.topLeft(), clip_rect.bottomLeft())
+            grad.setColorAt(0.0, c_top)
+            grad.setColorAt(1.0, c_bot)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(grad)
+            painter.drawRoundedRect(clip_rect, 3.0, 3.0)
+
+            painter.setPen(QPen(QColor(15, 15, 15, 230), 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(clip_rect, 3.0, 3.0)
+
+            if clip_rect.width() > 4:
+                painter.setPen(QPen(QColor(255, 255, 255, 45), 1))
+                painter.drawLine(QPointF(clip_rect.left() + 1, clip_rect.top() + 2),
+                                 QPointF(clip_rect.left() + 1, clip_rect.bottom() - 2))
+                painter.setPen(QPen(QColor(0, 0, 0, 160), 1))
+                painter.drawLine(QPointF(clip_rect.right() - 1, clip_rect.top() + 2),
+                                 QPointF(clip_rect.right() - 1, clip_rect.bottom() - 2))
+
+            painter.restore()
 
             if clip.track_type == 'audio':
                 self._draw_waveform(painter, clip, clip_rect)
 
-            if clip.track_type == 'video' and clip.media_type != 'subtitle':
-                has_fx = bool(clip.effects)
-                fx_rect = QRectF(clip_rect.left() + 4, clip_rect.bottom() - 17, 24, 13)
+            header_h = min(16.0, clip_rect.height() - 4)
+            if clip_rect.width() > 14 and header_h > 8:
+                header_rect = QRectF(clip_rect.left() + 1, clip_rect.top() + 1, clip_rect.width() - 2, header_h)
+                painter.fillRect(header_rect, QColor(0, 0, 0, 75))
+
+            text_left_pad = clip_rect.left() + 6
+            if is_linked:
+                accent_rect = QRectF(clip_rect.left() + 1, clip_rect.top() + 2, 3, clip_rect.height() - 4)
+                painter.fillRect(accent_rect, QColor("#00b4d8"))
+                text_left_pad += 4
+
+                if clip_rect.width() >= 60 and header_h >= 12:
+                    badge_w = 18
+                    badge_x = clip_rect.right() - badge_w - 4
+                    badge_y = clip_rect.top() + (header_h - 10) / 2 + 1
+
+                    painter.save()
+                    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+                    badge_bg = QRectF(badge_x, badge_y, badge_w, 10)
+                    painter.setPen(QPen(QColor("#00b4d8"), 1))
+                    painter.setBrush(QColor(0, 30, 45, 180))
+                    painter.drawRoundedRect(badge_bg, 2, 2)
+
+                    painter.setPen(QPen(QColor("#38bdf8"), 1.2))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.drawRoundedRect(QRectF(badge_x + 3, badge_y + 2, 6, 6), 1.5, 1.5)
+                    painter.drawRoundedRect(QRectF(badge_x + 8, badge_y + 2, 6, 6), 1.5, 1.5)
+                    painter.restore()
+
+            avail_text_w = clip_rect.width() - (text_left_pad - clip_rect.left()) - (26 if is_linked else 8)
+            if avail_text_w > 15 and header_h >= 10:
+                raw_name = os.path.basename(getattr(clip, 'original_source_path', clip.source_path))
+                elided_title = fm.elidedText(raw_name, Qt.TextElideMode.ElideRight, int(avail_text_w))
                 painter.save()
-                btn_color = QColor("#2e7d32") if has_fx else QColor("#2b2b2b")
-                border_color = QColor("#4caf50") if has_fx else QColor("#777777")
+                painter.setFont(title_font)
+                painter.setPen(QColor(230, 230, 230))
+                painter.drawText(QRectF(text_left_pad, clip_rect.top() + 1, avail_text_w, header_h),
+                                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_title)
+                painter.restore()
+
+            if clip.track_type == 'video' and clip.media_type != 'subtitle' and clip_rect.width() > 35:
+                has_fx = bool(clip.effects)
+                fx_rect = QRectF(clip_rect.left() + 5, clip_rect.bottom() - 16, 24, 12)
+                painter.save()
+                btn_color = QColor("#2e7d32") if has_fx else QColor("#222222")
+                border_color = QColor("#4caf50") if has_fx else QColor("#666666")
                 painter.setBrush(btn_color)
                 painter.setPen(QPen(border_color, 1))
                 painter.drawRoundedRect(fx_rect, 2, 2)
@@ -1509,10 +1593,21 @@ class TimelineWidget(QWidget):
                 painter.drawText(fx_rect, Qt.AlignmentFlag.AlignCenter, "FX")
                 painter.restore()
 
-            if clip.id in self.selected_clips:
-                pen = QPen(QColor(255, 255, 0, 220), 2)
+            if is_hovered and not is_selected and not is_being_dragged:
+                painter.save()
+                glow_pen = QPen(QColor("#38bdf8") if is_linked else QColor(255, 255, 255, 180), 1.5)
+                painter.setPen(glow_pen)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(clip_rect, 3.0, 3.0)
+                painter.restore()
+
+            if is_selected:
+                painter.save()
+                pen = QPen(QColor(255, 225, 50, 240), 2)
                 painter.setPen(pen)
-                painter.drawRect(clip_rect)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawRoundedRect(clip_rect, 3.0, 3.0)
+                painter.restore()
 
         painter.restore()
 
@@ -1531,25 +1626,26 @@ class TimelineWidget(QWidget):
         painter.drawLine(playhead_x, 0, playhead_x, self.height())
 
     def y_to_track_info(self, y):
+        y = int(y)
         if self.TIMESCALE_HEIGHT <= y < self.video_tracks_y_start:
-            return ('video', self.timeline.num_video_tracks + 1)
+            return ('video', int(self.timeline.num_video_tracks + 1))
 
-        video_tracks_end_y = self.video_tracks_y_start + self.timeline.num_video_tracks * self.TRACK_HEIGHT
+        video_tracks_end_y = self.video_tracks_y_start + int(self.timeline.num_video_tracks) * self.TRACK_HEIGHT
         if self.video_tracks_y_start <= y < video_tracks_end_y:
-            visual_index = (y - self.video_tracks_y_start) // self.TRACK_HEIGHT
-            track_index = self.timeline.num_video_tracks - visual_index
+            visual_index = int((y - self.video_tracks_y_start) // self.TRACK_HEIGHT)
+            track_index = int(self.timeline.num_video_tracks - visual_index)
             return ('video', track_index)
 
-        audio_tracks_end_y = self.audio_tracks_y_start + self.timeline.num_audio_tracks * self.TRACK_HEIGHT
+        audio_tracks_end_y = self.audio_tracks_y_start + int(self.timeline.num_audio_tracks) * self.TRACK_HEIGHT
         if self.audio_tracks_y_start <= y < audio_tracks_end_y:
-            visual_index = (y - self.audio_tracks_y_start) // self.TRACK_HEIGHT
-            track_index = visual_index + 1
+            visual_index = int((y - self.audio_tracks_y_start) // self.TRACK_HEIGHT)
+            track_index = int(visual_index + 1)
             return ('audio', track_index)
 
-        add_audio_btn_y_start = self.audio_tracks_y_start + self.timeline.num_audio_tracks * self.TRACK_HEIGHT
+        add_audio_btn_y_start = self.audio_tracks_y_start + int(self.timeline.num_audio_tracks) * self.TRACK_HEIGHT
         add_audio_btn_y_end = add_audio_btn_y_start + self.TRACK_HEIGHT
         if add_audio_btn_y_start <= y < add_audio_btn_y_end:
-            return ('audio', self.timeline.num_audio_tracks + 1)
+            return ('audio', int(self.timeline.num_audio_tracks + 1))
             
         return None
 
@@ -1689,25 +1785,44 @@ class TimelineWidget(QWidget):
             
             if clicked_clip:
                 is_ctrl_pressed = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+                is_alt_pressed = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+
+                linked_clip = None
+                if not is_alt_pressed:
+                    linked_clip = next((c for c in self.timeline.clips if c.group_id == clicked_clip.group_id and c.id != clicked_clip.id), None)
                 
                 if clicked_clip.id in self.selected_clips:
                     if is_ctrl_pressed:
                         self.selected_clips.remove(clicked_clip.id)
+                        if linked_clip and linked_clip.id in self.selected_clips:
+                            self.selected_clips.remove(linked_clip.id)
                 else:
                     if not is_ctrl_pressed:
                         self.selected_clips.clear()
                     self.selected_clips.add(clicked_clip.id)
+                    if linked_clip:
+                        self.selected_clips.add(linked_clip.id)
 
                 if clicked_clip.id in self.selected_clips:
                     self.dragging_clip = clicked_clip
                     self.drag_start_state = self.window()._get_current_timeline_state()
-                    self.drag_original_clip_states[clicked_clip.id] = (clicked_clip.timeline_start_ms, clicked_clip.track_index)
-                    
-                    self.dragging_linked_clip = next((c for c in self.timeline.clips if c.group_id == clicked_clip.group_id and c.id != clicked_clip.id), None)
-                    if self.dragging_linked_clip:
-                        self.drag_original_clip_states[self.dragging_linked_clip.id] = \
-                            (self.dragging_linked_clip.timeline_start_ms, self.dragging_linked_clip.track_index)
                     self.drag_start_pos = event.pos()
+                    self.drag_original_clip_states.clear()
+
+                    clips_to_drag = set()
+                    for cid in self.selected_clips:
+                        c = next((x for x in self.timeline.clips if x.id == cid), None)
+                        if c:
+                            clips_to_drag.add(c)
+                            if not is_alt_pressed:
+                                partner = next((x for x in self.timeline.clips if x.group_id == c.group_id and x.id != c.id), None)
+                                if partner:
+                                    clips_to_drag.add(partner)
+
+                    for c in clips_to_drag:
+                        self.drag_original_clip_states[c.id] = (int(c.timeline_start_ms), int(c.track_index))
+
+                    self.dragging_linked_clip = next((c for c in self.timeline.clips if c.group_id == clicked_clip.group_id and c.id != clicked_clip.id), None)
 
             else:
                 self.selected_clips.clear()
@@ -1901,9 +2016,17 @@ class TimelineWidget(QWidget):
                     hovered_clip = clip
                     break
 
+            new_hovered_id = hovered_clip.id if hovered_clip else None
+            if self.hovered_clip_id != new_hovered_id:
+                self.hovered_clip_id = new_hovered_id
+                self.update()
+
             if hovered_clip:
+                is_linked = any(c for c in self.timeline.clips if c.group_id == hovered_clip.group_id and c.id != hovered_clip.id)
                 clip_dur_sec = hovered_clip.duration_ms / 1000.0
                 tip = f"{os.path.basename(hovered_clip.source_path)}\nDuration: {clip_dur_sec:.2f}s"
+                if is_linked:
+                    tip += "\n[Linked Audio/Video]"
                 if hovered_clip.effects:
                     fx_names = list(hovered_clip.effects.keys())
                     tip += f"\nEffects: {', '.join(fx_names)}"
@@ -1950,65 +2073,98 @@ class TimelineWidget(QWidget):
         elif self.dragging_clip:
             self.highlighted_track_info = None
             self.highlighted_ghost_track_info = None
-            new_track_info = self.y_to_track_info(event.pos().y())
+            self.highlighted_tracks.clear()
             
-            original_start_ms, _ = self.drag_original_clip_states[self.dragging_clip.id]
+            orig_anchor_start, orig_anchor_track = self.drag_original_clip_states[self.dragging_clip.id]
+            orig_anchor_track = int(orig_anchor_track)
+            y = int(event.pos().y())
+            
+            num_v = int(self.timeline.num_video_tracks)
+            num_a = int(self.timeline.num_audio_tracks)
+            video_tracks_end_y = self.video_tracks_y_start + num_v * self.TRACK_HEIGHT
+            audio_tracks_end_y = self.audio_tracks_y_start + num_a * self.TRACK_HEIGHT
 
-            if new_track_info:
-                new_track_type, new_track_index = new_track_info
-
-                is_ghost_track = (new_track_type == 'video' and new_track_index > self.timeline.num_video_tracks) or \
-                                 (new_track_type == 'audio' and new_track_index > self.timeline.num_audio_tracks)
-                
-                if is_ghost_track:
-                    self.highlighted_ghost_track_info = new_track_info
+            if self.dragging_clip.track_type == 'video':
+                if y < self.video_tracks_y_start:
+                    target_track_index = num_v + 1
+                elif y >= video_tracks_end_y:
+                    target_track_index = 1
                 else:
-                    self.highlighted_track_info = new_track_info
+                    visual_index = int((y - self.video_tracks_y_start) // self.TRACK_HEIGHT)
+                    target_track_index = int(max(1, min(num_v, num_v - visual_index)))
+            else:
+                if y < self.audio_tracks_y_start:
+                    target_track_index = 1
+                elif y >= audio_tracks_end_y:
+                    target_track_index = num_a + 1
+                else:
+                    visual_index = int((y - self.audio_tracks_y_start) // self.TRACK_HEIGHT)
+                    target_track_index = int(max(1, min(num_a, visual_index + 1)))
 
-                if new_track_type == self.dragging_clip.track_type:
-                    self.dragging_clip.track_index = new_track_index
+            track_delta = int(target_track_index - orig_anchor_track)
+
+            for cid, (orig_s, orig_t) in self.drag_original_clip_states.items():
+                if orig_t + track_delta < 1:
+                    track_delta = 1 - orig_t
+
+            moving_clip_ids = set(self.drag_original_clip_states.keys())
+            for cid in moving_clip_ids:
+                c = next((x for x in self.timeline.clips if x.id == cid), None)
+                if c:
+                    orig_s, orig_t = self.drag_original_clip_states[cid]
+                    c.track_index = int(max(1, orig_t + track_delta))
+                    self.highlighted_tracks.append((c.track_type, int(c.track_index)))
 
             delta_x = event.pos().x() - self.drag_start_pos.x()
             time_delta = delta_x / self.pixels_per_ms
-            true_new_start_time = original_start_ms + time_delta
-            
+            true_anchor_start = orig_anchor_start + time_delta
+
             if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                new_start_time = self._snap_to_frame(true_new_start_time)
+                new_anchor_start = self._snap_to_frame(true_anchor_start)
             else:
                 playhead_time = self.playhead_pos_ms
                 snap_time_delta = self.SNAP_THRESHOLD_PIXELS / self.pixels_per_ms
-                
-                new_start_time = true_new_start_time
-                true_new_end_time = true_new_start_time + self.dragging_clip.duration_ms
-                
-                if abs(true_new_start_time - playhead_time) < snap_time_delta:
-                    new_start_time = playhead_time
-                elif abs(true_new_end_time - playhead_time) < snap_time_delta:
-                    new_start_time = playhead_time - self.dragging_clip.duration_ms
+                new_anchor_start = true_anchor_start
+                true_anchor_end = true_anchor_start + self.dragging_clip.duration_ms
 
-            for other_clip in self.timeline.clips:
-                if other_clip.id == self.dragging_clip.id: continue
-                if self.dragging_linked_clip and other_clip.id == self.dragging_linked_clip.id: continue
-                if (other_clip.track_type != self.dragging_clip.track_type or 
-                    other_clip.track_index != self.dragging_clip.track_index):
+                if abs(true_anchor_start - playhead_time) < snap_time_delta:
+                    new_anchor_start = playhead_time
+                elif abs(true_anchor_end - playhead_time) < snap_time_delta:
+                    new_anchor_start = playhead_time - self.dragging_clip.duration_ms
+
+            min_orig_start = min(s for s, t in self.drag_original_clip_states.values())
+            actual_time_shift = new_anchor_start - orig_anchor_start
+            if min_orig_start + actual_time_shift < 0:
+                actual_time_shift = -min_orig_start
+
+            movement_direction = true_anchor_start - orig_anchor_start
+            adjusted_shift = actual_time_shift
+
+            stationary_clips = [c for c in self.timeline.clips if c.id not in moving_clip_ids]
+            for cid in moving_clip_ids:
+                c = next((x for x in self.timeline.clips if x.id == cid), None)
+                if not c:
                     continue
+                orig_s, _ = self.drag_original_clip_states[cid]
+                cand_start = orig_s + adjusted_shift
+                cand_end = cand_start + c.duration_ms
 
-                is_overlapping = (new_start_time < other_clip.timeline_end_ms and
-                                  new_start_time + self.dragging_clip.duration_ms > other_clip.timeline_start_ms)
-                
-                if is_overlapping:
-                    movement_direction = true_new_start_time - original_start_ms
-                    if movement_direction > 0:
-                        new_start_time = other_clip.timeline_start_ms - self.dragging_clip.duration_ms
-                    else:
-                        new_start_time = other_clip.timeline_end_ms
-                    break 
+                for other in stationary_clips:
+                    if other.track_type == c.track_type and other.track_index == c.track_index:
+                        if cand_start < other.timeline_end_ms and cand_end > other.timeline_start_ms:
+                            if movement_direction > 0:
+                                max_allowed = other.timeline_start_ms - c.duration_ms - orig_s
+                                adjusted_shift = min(adjusted_shift, max_allowed)
+                            else:
+                                min_allowed = other.timeline_end_ms - orig_s
+                                adjusted_shift = max(adjusted_shift, min_allowed)
 
-            final_start_time = max(0, new_start_time)
-            self.dragging_clip.timeline_start_ms = int(final_start_time)
-            if self.dragging_linked_clip:
-                self.dragging_linked_clip.timeline_start_ms = int(final_start_time)
-            
+            for cid in moving_clip_ids:
+                c = next((x for x in self.timeline.clips if x.id == cid), None)
+                if c:
+                    orig_s, _ = self.drag_original_clip_states[cid]
+                    c.timeline_start_ms = int(max(0, orig_s + adjusted_shift))
+
             self.update()
 
     def mouseReleaseEvent(self, event: QMouseEvent):
@@ -2049,21 +2205,31 @@ class TimelineWidget(QWidget):
 
             self.dragging_playhead = False
             if self.dragging_clip:
-                orig_start, orig_track = self.drag_original_clip_states[self.dragging_clip.id]
-                moved = (orig_start != self.dragging_clip.timeline_start_ms or 
-                         orig_track != self.dragging_clip.track_index)
+                moved = False
+                for cid, (orig_s, orig_t) in self.drag_original_clip_states.items():
+                    c = next((x for x in self.timeline.clips if x.id == cid), None)
+                    if c and (c.timeline_start_ms != orig_s or c.track_index != orig_t):
+                        moved = True
+                        break
 
-                if self.dragging_linked_clip:
-                    orig_start_link, orig_track_link = self.drag_original_clip_states[self.dragging_linked_clip.id]
-                    moved = moved or (orig_start_link != self.dragging_linked_clip.timeline_start_ms or 
-                                      orig_track_link != self.dragging_linked_clip.track_index)
-                
                 if moved:
                     self.window().finalize_clip_drag(self.drag_start_state)
-                
+                else:
+                    if not (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                        is_alt_pressed = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
+                        curr_linked = None
+                        if not is_alt_pressed:
+                            curr_linked = next((c for c in self.timeline.clips if c.group_id == self.dragging_clip.group_id and c.id != self.dragging_clip.id), None)
+                        
+                        self.selected_clips.clear()
+                        self.selected_clips.add(self.dragging_clip.id)
+                        if curr_linked:
+                            self.selected_clips.add(curr_linked.id)
+
                 self.timeline.clips.sort(key=lambda c: c.timeline_start_ms)
                 self.highlighted_track_info = None
                 self.highlighted_ghost_track_info = None
+                self.highlighted_tracks.clear()
                 self.operation_finished.emit()
 
             self.dragging_clip = None
@@ -2075,6 +2241,9 @@ class TimelineWidget(QWidget):
 
     def leaveEvent(self, event):
         QToolTip.hideText()
+        if self.hovered_clip_id is not None:
+            self.hovered_clip_id = None
+            self.update()
         super().leaveEvent(event)
 
     def dragEnterEvent(self, event):
@@ -2089,6 +2258,7 @@ class TimelineWidget(QWidget):
         self.drag_over_active = False
         self.highlighted_ghost_track_info = None
         self.highlighted_track_info = None
+        self.highlighted_tracks.clear()
         self.drag_url_cache.clear()
         self.update()
 
@@ -2180,11 +2350,11 @@ class TimelineWidget(QWidget):
                     visual_index = self.timeline.num_video_tracks - track_index
                     video_y = self.video_tracks_y_start + visual_index * self.TRACK_HEIGHT
                     if has_audio:
-                        audio_y = self.audio_tracks_y_start
+                        audio_y = self.audio_tracks_y_start + (track_index - 1) * self.TRACK_HEIGHT
                 elif track_type == 'audio' and has_audio:
                     visual_index = track_index - 1
                     audio_y = self.audio_tracks_y_start + visual_index * self.TRACK_HEIGHT
-                    video_y = self.video_tracks_y_start + (self.timeline.num_video_tracks - 1) * self.TRACK_HEIGHT
+                    video_y = self.video_tracks_y_start + (self.timeline.num_video_tracks - track_index) * self.TRACK_HEIGHT
             
             elif media_type == 'audio':
                 if track_type == 'audio':
@@ -2242,10 +2412,10 @@ class TimelineWidget(QWidget):
                 elif media_type == 'video':
                     if drop_track_type == 'video':
                         video_track_idx = drop_track_index
-                        if has_audio: audio_track_idx = 1
+                        if has_audio: audio_track_idx = drop_track_index
                     elif drop_track_type == 'audio' and has_audio:
                         audio_track_idx = drop_track_index
-                        video_track_idx = 1
+                        video_track_idx = drop_track_index
                 
                 if video_track_idx is None and audio_track_idx is None:
                     continue
@@ -2361,7 +2531,7 @@ class TimelineWidget(QWidget):
 
             linked_clip = next((c for c in self.timeline.clips if c.group_id == clip_at_pos.group_id and c.id != clip_at_pos.id), None)
             if linked_clip:
-                unlink_action = menu.addAction("Unlink Audio Track")
+                unlink_action = menu.addAction("Unlink Audio Track (Linked ⚯)")
                 unlink_action.triggered.connect(lambda: self.window().unlink_clip_pair(clip_at_pos))
             else:
                 media_info = self.window().media_properties.get(clip_at_pos.source_path)
@@ -3522,15 +3692,19 @@ class MainWindow(QMainWindow):
     def finalize_clip_drag(self, old_state_tuple):
         current_clips, _, _ = self._get_current_timeline_state()
         
-        max_v_idx = max([c.track_index for c in current_clips if c.track_type == 'video'] + [1])
-        max_a_idx = max([c.track_index for c in current_clips if c.track_type == 'audio'] + [1])
+        max_v_idx = int(max([c.track_index for c in current_clips if c.track_type == 'video'] + [1]))
+        max_a_idx = int(max([c.track_index for c in current_clips if c.track_type == 'audio'] + [1]))
 
         if max_v_idx > self.timeline.num_video_tracks:
-            self.timeline.num_video_tracks = max_v_idx
+            self.timeline.num_video_tracks = int(max_v_idx)
         
         if max_a_idx > self.timeline.num_audio_tracks:
-            self.timeline.num_audio_tracks = max_a_idx
+            self.timeline.num_audio_tracks = int(max_a_idx)
             
+        self.prune_empty_tracks()
+        self.timeline.num_video_tracks = int(self.timeline.num_video_tracks)
+        self.timeline.num_audio_tracks = int(self.timeline.num_audio_tracks)
+
         new_state_tuple = self._get_current_timeline_state()
         
         command = TimelineStateChangeCommand("Move Clip", self.timeline, *old_state_tuple, *new_state_tuple)
@@ -3563,25 +3737,28 @@ class MainWindow(QMainWindow):
 
     def prune_empty_tracks(self):
         pruned_something = False
-        while self.timeline.num_video_tracks > 1:
-            highest_track_index = self.timeline.num_video_tracks
+        while int(self.timeline.num_video_tracks) > 1:
+            highest_track_index = int(self.timeline.num_video_tracks)
             is_track_occupied = any(c for c in self.timeline.clips 
-                                    if c.track_type == 'video' and c.track_index == highest_track_index)
+                                    if c.track_type == 'video' and int(c.track_index) == highest_track_index)
             if is_track_occupied:
                 break
             else:
-                self.timeline.num_video_tracks -= 1
+                self.timeline.num_video_tracks = int(self.timeline.num_video_tracks - 1)
                 pruned_something = True
 
-        while self.timeline.num_audio_tracks > 1:
-            highest_track_index = self.timeline.num_audio_tracks
+        while int(self.timeline.num_audio_tracks) > 1:
+            highest_track_index = int(self.timeline.num_audio_tracks)
             is_track_occupied = any(c for c in self.timeline.clips 
-                                    if c.track_type == 'audio' and c.track_index == highest_track_index)
+                                    if c.track_type == 'audio' and int(c.track_index) == highest_track_index)
             if is_track_occupied:
                 break
             else:
-                self.timeline.num_audio_tracks -= 1
+                self.timeline.num_audio_tracks = int(self.timeline.num_audio_tracks - 1)
                 pruned_something = True
+
+        self.timeline.num_video_tracks = int(self.timeline.num_video_tracks)
+        self.timeline.num_audio_tracks = int(self.timeline.num_audio_tracks)
 
         if pruned_something:
             self.timeline_widget.update()
@@ -4471,11 +4648,16 @@ class MainWindow(QMainWindow):
         if linked_clip:
             clip_to_unlink.group_id = str(uuid.uuid4())
             linked_clip.group_id = str(uuid.uuid4())
-            
+
+            self.timeline_widget.selected_clips.clear()
+            self.timeline_widget.selected_clips.add(clip_to_unlink.id)
+
             new_state = self._get_current_timeline_state()
             command = TimelineStateChangeCommand("Unlink Clips", self.timeline, *old_state, *new_state)
             command.undo()
             self.undo_stack.push(command)
+            
+            self.timeline_widget.update()  # <-- Immediately repaint the timeline
             self.status_label.setText("Clips unlinked.")
         else:
             self.status_label.setText("Could not find a clip to unlink.")
@@ -4487,7 +4669,7 @@ class MainWindow(QMainWindow):
                 self.status_label.setText("Source media has no audio to relink.")
                 return
 
-            target_audio_track = 1
+            target_audio_track = video_clip.track_index
             new_audio_start = video_clip.timeline_start_ms
             new_audio_end = video_clip.timeline_end_ms
             
