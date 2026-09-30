@@ -11,6 +11,7 @@ import tempfile
 import math
 import shlex
 import threading
+import time
 import numpy as np
 from plugins import PluginManager, ManagePluginsDialog
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -19,7 +20,8 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QCheckBox, QDialogButtonBox, QMenu, QSplitter, QDockWidget,
                              QListWidget, QListWidgetItem, QMessageBox, QComboBox,
                              QFormLayout, QGroupBox, QLineEdit, QSlider, QSpinBox,
-                             QDoubleSpinBox, QToolTip)
+                             QDoubleSpinBox, QToolTip, QStackedWidget, QTreeWidget,
+                             QTreeWidgetItem, QHeaderView)
 from PyQt6.QtGui import (QPainter, QColor, QPen, QFont, QFontMetrics, QMouseEvent, QAction,
                          QPixmap, QImage, QDrag, QCursor, QKeyEvent, QIcon, QTransform,
                          QPainterPath, QLinearGradient)
@@ -384,6 +386,95 @@ class KeyframeCache(QObject):
 
         self.keyframes_ready.emit(source_path)
 
+class ThumbnailCache(QObject):
+    thumbnail_ready = pyqtSignal(str)
+
+    def __init__(self):
+        super().__init__()
+        self._cache = {}
+        self._loading = set()
+        self._lock = threading.Lock()
+
+    def get_thumbnail(self, file_path, width=100, height=60):
+        with self._lock:
+            if file_path in self._cache:
+                return self._cache[file_path]
+            if file_path in self._loading:
+                return None
+            self._loading.add(file_path)
+
+        threading.Thread(target=self._extract_worker, args=(file_path, width, height), daemon=True).start()
+        return None
+
+    def _extract_worker(self, file_path, width, height):
+        try:
+            ext = os.path.splitext(file_path)[1].lower()
+            pixmap = None
+
+            if ext in ['.png', '.jpg', '.jpeg', '.bmp', '.webp']:
+                img = QImage(file_path)
+                if not img.isNull():
+                    pixmap = QPixmap.fromImage(img).scaled(width, height, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            elif ext in ['.mp3', '.wav', '.flac', '.aac', '.m4a', '.oga']:
+                pixmap = QPixmap(width, height)
+                pixmap.fill(QColor("#235456"))
+                p = QPainter(pixmap)
+                p.setPen(QColor("#FFFFFF"))
+                p.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+                p.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "AUDIO 🎵")
+                p.end()
+            elif ext in ['.srt', '.ass']:
+                pixmap = QPixmap(width, height)
+                pixmap.fill(QColor("#7a550f"))
+                p = QPainter(pixmap)
+                p.setPen(QColor("#FFFFFF"))
+                p.setFont(QFont("Arial", 8, QFont.Weight.Bold))
+                p.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "SUBTITLE 💬")
+                p.end()
+            else:
+                startupinfo = None
+                if hasattr(subprocess, 'STARTUPINFO'):
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = subprocess.SW_HIDE
+                cmd = [
+                    'ffmpeg', '-v', 'error', '-ss', '0.5', '-i', file_path,
+                    '-vf', f'scale={width}:{height}:force_original_aspect_ratio=decrease',
+                    '-vframes', '1', '-f', 'image2', '-c:v', 'mjpeg', '-'
+                ]
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, startupinfo=startupinfo)
+                raw_bytes, _ = proc.communicate(timeout=3.0)
+                if raw_bytes:
+                    img = QImage()
+                    if img.loadFromData(raw_bytes):
+                        pixmap = QPixmap.fromImage(img)
+                if not pixmap or pixmap.isNull():
+                    cmd[3] = '0.0'
+                    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, startupinfo=startupinfo)
+                    raw_bytes, _ = proc.communicate(timeout=3.0)
+                    if raw_bytes:
+                        img = QImage()
+                        if img.loadFromData(raw_bytes):
+                            pixmap = QPixmap.fromImage(img)
+
+            if not pixmap or pixmap.isNull():
+                pixmap = QPixmap(width, height)
+                pixmap.fill(QColor("#333333"))
+                p = QPainter(pixmap)
+                p.setPen(QColor("#AAAAAA"))
+                p.setFont(QFont("Arial", 8))
+                p.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, ext.upper().replace('.', ''))
+                p.end()
+
+            with self._lock:
+                self._cache[file_path] = pixmap
+                self._loading.discard(file_path)
+
+            self.thumbnail_ready.emit(file_path)
+        except Exception:
+            with self._lock:
+                self._loading.discard(file_path)
+
 class TimelineClip:
     def __init__(self, source_path, timeline_start_ms, clip_start_ms, duration_ms, track_index, track_type, media_type, group_id, effects=None, id=None, original_source_path=None):
         self.id = id if id else str(uuid.uuid4())
@@ -463,6 +554,7 @@ class Timeline:
         self.clips = []
         self.num_video_tracks = 1
         self.num_audio_tracks = 1
+        self.hidden_video_tracks = set()
 
     def add_clip(self, clip):
         self.clips.append(clip)
@@ -1073,6 +1165,39 @@ class CropOverlayWidget(QWidget):
         self.control_bar.set_values(self.crop_x, self.crop_y, self.crop_w, self.crop_h)
         self.update()
 
+def _draw_eye_icon(painter, rect, is_visible):
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    cx = rect.center().x()
+    cy = rect.center().y()
+    w = rect.width() - 4
+    h = rect.height() - 7
+    
+    path = QPainterPath()
+    path.moveTo(cx - w/2, cy)
+    path.quadTo(cx, cy - h/1.2, cx + w/2, cy)
+    path.quadTo(cx, cy + h/1.2, cx - w/2, cy)
+    
+    if is_visible:
+        painter.setPen(QPen(QColor(220, 220, 220), 1.4))
+        painter.setBrush(QColor(50, 50, 50, 200))
+        painter.drawPath(path)
+        
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(70, 160, 240))
+        painter.drawEllipse(QPointF(cx, cy), 3.2, 3.2)
+        painter.setBrush(QColor(20, 20, 20))
+        painter.drawEllipse(QPointF(cx, cy), 1.5, 1.5)
+    else:
+        painter.setPen(QPen(QColor(110, 110, 110), 1.2))
+        painter.setBrush(QColor(35, 35, 35, 160))
+        painter.drawPath(path)
+        
+        painter.setPen(QPen(QColor(220, 70, 70), 1.8))
+        painter.drawLine(QPointF(cx - w/2 + 1, cy + h/2 - 1), QPointF(cx + w/2 - 1, cy - h/2 + 1))
+        
+    painter.restore()
+
 class TimelineWidget(QWidget):
     TIMESCALE_HEIGHT = 30
     HEADER_WIDTH = 120
@@ -1150,6 +1275,7 @@ class TimelineWidget(QWidget):
         self.remove_video_track_btn_rect = QRect()
         self.add_audio_track_btn_rect = QRect()
         self.remove_audio_track_btn_rect = QRect()
+        self.video_track_eye_rects = {}
         
         self.video_tracks_y_start = 0
         self.audio_tracks_y_start = 0
@@ -1241,18 +1367,30 @@ class TimelineWidget(QWidget):
         y_cursor += self.TRACK_HEIGHT
         self.video_tracks_y_start = y_cursor
 
+        self.video_track_eye_rects.clear()
         for i in range(int(self.timeline.num_video_tracks)):
             track_number = int(self.timeline.num_video_tracks) - i
+            is_hidden = track_number in getattr(self.timeline, 'hidden_video_tracks', set())
             rect = QRect(0, y_cursor, self.HEADER_WIDTH, self.TRACK_HEIGHT)
-            painter.fillRect(rect, QColor("#444"))
+            
+            painter.fillRect(rect, QColor("#292929") if is_hidden else QColor("#444"))
+            painter.setPen(QColor("#222") if is_hidden else QColor("#AAA"))
             painter.drawRect(rect)
+
+            eye_rect = QRect(rect.left() + 6, rect.top() + (self.TRACK_HEIGHT - 22) // 2, 22, 22)
+            self.video_track_eye_rects[track_number] = eye_rect
+            _draw_eye_icon(painter, eye_rect, not is_hidden)
+
+            text_rect = QRect(rect.left() + 32, rect.top(), self.HEADER_WIDTH - 36, self.TRACK_HEIGHT)
             painter.setFont(header_font)
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, f"Video {track_number}")
+            painter.setPen(QColor("#777") if is_hidden else QColor("#FFF"))
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, f"Video {track_number}")
 
             if track_number == self.timeline.num_video_tracks and self.timeline.num_video_tracks > 1:
                 self.remove_video_track_btn_rect = QRect(rect.right() - 25, rect.top() + 5, 20, 20)
                 painter.setFont(button_font)
                 painter.fillRect(self.remove_video_track_btn_rect, QColor("#833"))
+                painter.setPen(QColor("#FFF"))
                 painter.drawText(self.remove_video_track_btn_rect, Qt.AlignmentFlag.AlignCenter, "-")
             y_cursor += self.TRACK_HEIGHT
 
@@ -1263,8 +1401,10 @@ class TimelineWidget(QWidget):
             track_number = i + 1
             rect = QRect(0, y_cursor, self.HEADER_WIDTH, self.TRACK_HEIGHT)
             painter.fillRect(rect, QColor("#444"))
+            painter.setPen(QColor("#AAA"))
             painter.drawRect(rect)
             painter.setFont(header_font)
+            painter.setPen(QColor("#FFF"))
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, f"Audio {track_number}")
 
             if track_number == self.timeline.num_audio_tracks and self.timeline.num_audio_tracks > 1:
@@ -1276,6 +1416,7 @@ class TimelineWidget(QWidget):
         
         rect = QRect(0, y_cursor, self.HEADER_WIDTH, self.TRACK_HEIGHT)
         painter.fillRect(rect, QColor("#3a3a3a"))
+        painter.setPen(QColor("#AAA"))
         painter.drawRect(rect)
         self.add_audio_track_btn_rect = QRect(rect.left() + 10, rect.top() + (rect.height() - 22)//2, self.HEADER_WIDTH - 20, 22)
         painter.setFont(button_font)
@@ -1494,10 +1635,17 @@ class TimelineWidget(QWidget):
 
     def draw_tracks_and_clips(self, painter):
         painter.save()
+        hidden_v_tracks = getattr(self.timeline, 'hidden_video_tracks', set())
+
         y_cursor = self.video_tracks_y_start
         for i in range(int(self.timeline.num_video_tracks)):
+            track_num = int(self.timeline.num_video_tracks - i)
+            is_hidden = track_num in hidden_v_tracks
             rect = QRect(self.HEADER_WIDTH, y_cursor, self.width() - self.HEADER_WIDTH, self.TRACK_HEIGHT)
-            painter.fillRect(rect, QColor("#444") if i % 2 == 0 else QColor("#3c3c3c"))
+            if is_hidden:
+                painter.fillRect(rect, QColor("#222222") if i % 2 == 0 else QColor("#1c1c1c"))
+            else:
+                painter.fillRect(rect, QColor("#444") if i % 2 == 0 else QColor("#3c3c3c"))
             y_cursor += self.TRACK_HEIGHT
 
         y_cursor = self.audio_tracks_y_start
@@ -1545,12 +1693,15 @@ class TimelineWidget(QWidget):
             if clip_rect.width() <= 0:
                 continue
 
+            is_track_hidden = (clip.track_type == 'video' and clip.track_index in hidden_v_tracks)
             is_linked = any(c for c in self.timeline.clips if c.group_id == clip.group_id and c.id != clip.id)
             is_being_dragged = bool(self.dragging_clip and clip.id in self.drag_original_clip_states)
             is_selected = clip.id in self.selected_clips
             is_hovered = (clip.id == self.hovered_clip_id) or (is_linked and clip.group_id == hovered_group_id)
 
-            if clip.media_type == 'image':
+            if is_track_hidden:
+                c_top, c_bot = QColor("#3a3a3a"), QColor("#222222")
+            elif clip.media_type == 'image':
                 c_top, c_bot = QColor("#3d784a"), QColor("#224e2d")
             elif clip.media_type == 'subtitle':
                 c_top, c_bot = QColor("#b3811e"), QColor("#7a550f")
@@ -1566,6 +1717,9 @@ class TimelineWidget(QWidget):
                     c_top, c_bot = QColor("#3a7d9c"), QColor("#23546b")
 
             painter.save()
+            if is_track_hidden:
+                painter.setOpacity(0.5)
+
             grad = QLinearGradient(clip_rect.topLeft(), clip_rect.bottomLeft())
             grad.setColorAt(0.0, c_top)
             grad.setColorAt(1.0, c_bot)
@@ -1625,7 +1779,7 @@ class TimelineWidget(QWidget):
                 elided_title = fm.elidedText(raw_name, Qt.TextElideMode.ElideRight, int(avail_text_w))
                 painter.save()
                 painter.setFont(title_font)
-                painter.setPen(QColor(230, 230, 230))
+                painter.setPen(QColor(160, 160, 160) if is_track_hidden else QColor(230, 230, 230))
                 painter.drawText(QRectF(text_left_pad, clip_rect.top() + 1, avail_text_w, header_h),
                                  Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_title)
                 painter.restore()
@@ -1762,6 +1916,19 @@ class TimelineWidget(QWidget):
             return
 
         if event.pos().x() < self.HEADER_WIDTH:
+            for track_num, eye_rect in self.video_track_eye_rects.items():
+                if eye_rect.contains(event.pos()):
+                    hidden = getattr(self.timeline, 'hidden_video_tracks', set())
+                    if track_num in hidden:
+                        hidden.remove(track_num)
+                    else:
+                        hidden.add(track_num)
+                    self.timeline.hidden_video_tracks = hidden
+                    self.window().update_project_resolution_from_timeline()
+                    self.window().playback_manager.seek_to_frame(self.playhead_pos_ms)
+                    self.update()
+                    return
+
             if self.add_video_track_btn_rect.contains(event.pos()): self.add_track.emit('video')
             elif self.remove_video_track_btn_rect.contains(event.pos()): self.remove_track.emit('video')
             elif self.add_audio_track_btn_rect.contains(event.pos()): self.add_track.emit('audio')
@@ -2174,52 +2341,102 @@ class TimelineWidget(QWidget):
             delta_x = event.pos().x() - self.drag_start_pos.x()
             time_delta = delta_x / self.pixels_per_ms
             true_anchor_start = orig_anchor_start + time_delta
+            snap_time_delta = self.SNAP_THRESHOLD_PIXELS / self.pixels_per_ms
+
+            snap_points = [self.playhead_pos_ms]
+            stationary_clips = [c for c in self.timeline.clips if c.id not in moving_clip_ids]
+            
+            for other in stationary_clips:
+                snap_points.append(other.timeline_start_ms)
+                snap_points.append(other.timeline_end_ms)
+
+            candidate_start = true_anchor_start
+            anchor_duration = self.dragging_clip.duration_ms
+            candidate_end = true_anchor_start + anchor_duration
 
             if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
-                new_anchor_start = self._snap_to_frame(true_anchor_start)
+                candidate_start = self._snap_to_frame(true_anchor_start)
             else:
-                playhead_time = self.playhead_pos_ms
-                snap_time_delta = self.SNAP_THRESHOLD_PIXELS / self.pixels_per_ms
-                new_anchor_start = true_anchor_start
-                true_anchor_end = true_anchor_start + self.dragging_clip.duration_ms
+                best_snap_diff = snap_time_delta + 1.0
+                best_snapped_start = candidate_start
 
-                if abs(true_anchor_start - playhead_time) < snap_time_delta:
-                    new_anchor_start = playhead_time
-                elif abs(true_anchor_end - playhead_time) < snap_time_delta:
-                    new_anchor_start = playhead_time - self.dragging_clip.duration_ms
+                for sp in snap_points:
+                    diff_start = abs(true_anchor_start - sp)
+                    if diff_start <= snap_time_delta and diff_start < best_snap_diff:
+                        best_snap_diff = diff_start
+                        best_snapped_start = sp
+
+                    diff_end = abs(candidate_end - sp)
+                    if diff_end <= snap_time_delta and diff_end < best_snap_diff:
+                        best_snap_diff = diff_end
+                        best_snapped_start = sp - anchor_duration
+
+                if best_snap_diff <= snap_time_delta:
+                    candidate_start = best_snapped_start
 
             min_orig_start = min(s for s, t in self.drag_original_clip_states.values())
-            actual_time_shift = new_anchor_start - orig_anchor_start
+            actual_time_shift = candidate_start - orig_anchor_start
             if min_orig_start + actual_time_shift < 0:
                 actual_time_shift = -min_orig_start
 
-            movement_direction = true_anchor_start - orig_anchor_start
-            adjusted_shift = actual_time_shift
+            if not hasattr(self, 'drag_clip_sides'):
+                self.drag_clip_sides = {}
 
-            stationary_clips = [c for c in self.timeline.clips if c.id not in moving_clip_ids]
+            max_allowed_shift = float('inf')
+            min_allowed_shift = -min_orig_start
+
+            raw_shift = time_delta
+
             for cid in moving_clip_ids:
-                c = next((x for x in self.timeline.clips if x.id == cid), None)
-                if not c:
+                mc = next((x for x in self.timeline.clips if x.id == cid), None)
+                if not mc:
                     continue
-                orig_s, _ = self.drag_original_clip_states[cid]
-                cand_start = orig_s + adjusted_shift
-                cand_end = cand_start + c.duration_ms
+                orig_mc_s, _ = self.drag_original_clip_states[cid]
+                raw_mc_s = orig_mc_s + raw_shift
+                raw_mc_e = raw_mc_s + mc.duration_ms
 
                 for other in stationary_clips:
-                    if other.track_type == c.track_type and other.track_index == c.track_index:
-                        if cand_start < other.timeline_end_ms and cand_end > other.timeline_start_ms:
-                            if movement_direction > 0:
-                                max_allowed = other.timeline_start_ms - c.duration_ms - orig_s
-                                adjusted_shift = min(adjusted_shift, max_allowed)
-                            else:
-                                min_allowed = other.timeline_end_ms - orig_s
-                                adjusted_shift = max(adjusted_shift, min_allowed)
+                    if other.track_type == mc.track_type and other.track_index == mc.track_index:
+                        other_s = other.timeline_start_ms
+                        other_e = other.timeline_end_ms
+
+                        pair_key = (mc.id, other.id)
+                        if pair_key not in self.drag_clip_sides:
+                            self.drag_clip_sides[pair_key] = 'left' if orig_mc_s < other_s else 'right'
+
+                        side = self.drag_clip_sides[pair_key]
+
+                        if side == 'left':
+                            if raw_mc_s >= other_e:
+                                self.drag_clip_sides[pair_key] = 'right'
+                                side = 'right'
+                        else:
+                            if raw_mc_e <= other_s:
+                                self.drag_clip_sides[pair_key] = 'left'
+                                side = 'left'
+
+                        if side == 'left':
+                            allowed_end = other_s
+                            allowed_mc_start = allowed_end - mc.duration_ms
+                            max_allowed_shift = min(max_allowed_shift, allowed_mc_start - orig_mc_s)
+                        else:
+                            allowed_start = other_e
+                            min_allowed_shift = max(min_allowed_shift, allowed_start - orig_mc_s)
+
+            desired_shift = actual_time_shift
+
+            if abs(desired_shift - max_allowed_shift) <= snap_time_delta:
+                desired_shift = max_allowed_shift
+            if abs(desired_shift - min_allowed_shift) <= snap_time_delta:
+                desired_shift = min_allowed_shift
+
+            final_shift = max(min_allowed_shift, min(desired_shift, max_allowed_shift))
 
             for cid in moving_clip_ids:
                 c = next((x for x in self.timeline.clips if x.id == cid), None)
                 if c:
                     orig_s, _ = self.drag_original_clip_states[cid]
-                    c.timeline_start_ms = int(max(0, orig_s + adjusted_shift))
+                    c.timeline_start_ms = int(max(0, orig_s + final_shift))
 
             self.update()
 
@@ -2294,6 +2511,8 @@ class TimelineWidget(QWidget):
             self.dragging_linked_clip = None
             self.drag_original_clip_states.clear()
             self.drag_start_state = None
+            if hasattr(self, 'drag_clip_sides'):
+                self.drag_clip_sides.clear()
             
             self.update()
 
@@ -3328,18 +3547,66 @@ class ExportDialog(QDialog):
             "custom_ffmpeg_args": self.custom_args_edit.text().strip(),
         }
 
-class MediaListWidget(QListWidget):
+class MediaDetailsTreeWidget(QTreeWidget):
     def __init__(self, main_window, parent=None):
         super().__init__(parent)
         self.main_window = main_window
         self.setDragEnabled(True)
         self.setAcceptDrops(False)
+        self.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
+        self.setRootIsDecorated(False)
+        self.setItemsExpandable(False)
+        self.setColumnCount(3)
+        self.setHeaderLabels(["File 🔼", "Path", "Date Modified"])
+        self.header().setStretchLastSection(True)
+        self.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.header().setSectionsClickable(True)
+        self.setColumnWidth(0, 160)
+        self.setColumnWidth(1, 190)
+
+    def startDrag(self, supportedActions):
+        item = self.currentItem()
+        if not item: return
+
+        path = item.data(0, Qt.ItemDataRole.UserRole)
+        media_info = self.main_window.media_properties.get(path)
+        if not media_info: return
+
+        drag = QDrag(self)
+        mime_data = QMimeData()
+        payload = {
+            "path": path,
+            "duration_ms": media_info['duration_ms'],
+            "has_audio": media_info['has_audio'],
+            "media_type": media_info['media_type']
+        }
+        mime_data.setData('application/x-vnd.video.filepath', QByteArray(json.dumps(payload).encode('utf-8')))
+        drag.setMimeData(mime_data)
+        drag.exec(Qt.DropAction.CopyAction)
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.parent().remove_selected_media()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+class MediaThumbnailListWidget(QListWidget):
+    def __init__(self, main_window, parent=None):
+        super().__init__(parent)
+        self.main_window = main_window
+        self.setDragEnabled(True)
+        self.setAcceptDrops(False)
+        self.setViewMode(QListWidget.ViewMode.IconMode)
+        self.setIconSize(QSize(110, 68))
+        self.setGridSize(QSize(130, 95))
+        self.setSpacing(6)
+        self.setResizeMode(QListWidget.ResizeMode.Adjust)
+        self.setWordWrap(True)
         self.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
 
     def startDrag(self, supportedActions):
-        drag = QDrag(self)
-        mime_data = QMimeData()
-        
         item = self.currentItem()
         if not item: return
 
@@ -3347,16 +3614,24 @@ class MediaListWidget(QListWidget):
         media_info = self.main_window.media_properties.get(path)
         if not media_info: return
 
+        drag = QDrag(self)
+        mime_data = QMimeData()
         payload = {
             "path": path,
             "duration_ms": media_info['duration_ms'],
             "has_audio": media_info['has_audio'],
             "media_type": media_info['media_type']
         }
-        
         mime_data.setData('application/x-vnd.video.filepath', QByteArray(json.dumps(payload).encode('utf-8')))
         drag.setMimeData(mime_data)
         drag.exec(Qt.DropAction.CopyAction)
+
+    def keyPressEvent(self, event: QKeyEvent):
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self.parent().remove_selected_media()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 class ProjectMediaWidget(QWidget):
     media_removed = pyqtSignal(str)
@@ -3367,13 +3642,63 @@ class ProjectMediaWidget(QWidget):
         super().__init__(parent)
         self.main_window = parent
         self.setAcceptDrops(True)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
         
-        self.media_list = MediaListWidget(self.main_window, self)
-        self.media_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.media_list.customContextMenuRequested.connect(self.show_context_menu)
-        layout.addWidget(self.media_list)
+        self.sort_column = 0 # 0=File, 1=Path, 2=Date Modified
+        self.sort_ascending = True
+
+        self.thumbnail_cache = ThumbnailCache()
+        self.thumbnail_cache.thumbnail_ready.connect(self._on_thumbnail_ready)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
+        
+        top_bar = QHBoxLayout()
+        top_bar.setContentsMargins(0, 0, 0, 0)
+        top_bar.addWidget(QLabel("View:"))
+        self.view_combo = QComboBox()
+        self.view_combo.addItems(["Details", "Thumbnails"])
+        self.view_combo.currentTextChanged.connect(self.on_view_mode_changed)
+        top_bar.addWidget(self.view_combo)
+        top_bar.addStretch()
+        layout.addLayout(top_bar)
+
+        self.sort_bar_widget = QWidget()
+        self.sort_bar = QHBoxLayout(self.sort_bar_widget)
+        self.sort_bar.setContentsMargins(0, 0, 0, 0)
+        self.sort_bar.setSpacing(2)
+
+        self.sort_file_btn = QPushButton("File 🔼")
+        self.sort_path_btn = QPushButton("Path")
+        self.sort_date_btn = QPushButton("Date Modified")
+
+        for b in [self.sort_file_btn, self.sort_path_btn, self.sort_date_btn]:
+            b.setStyleSheet("QPushButton { font-size: 11px; padding: 2px 4px; }")
+
+        self.sort_file_btn.clicked.connect(lambda: self.set_sorting(0))
+        self.sort_path_btn.clicked.connect(lambda: self.set_sorting(1))
+        self.sort_date_btn.clicked.connect(lambda: self.set_sorting(2))
+
+        self.sort_bar.addWidget(self.sort_file_btn)
+        self.sort_bar.addWidget(self.sort_path_btn)
+        self.sort_bar.addWidget(self.sort_date_btn)
+        self.sort_bar_widget.setVisible(False)
+        layout.addWidget(self.sort_bar_widget)
+
+        self.stacked_view = QStackedWidget(self)
+        
+        self.tree_widget = MediaDetailsTreeWidget(self.main_window, self)
+        self.tree_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree_widget.customContextMenuRequested.connect(self.show_details_context_menu)
+        self.tree_widget.header().sectionClicked.connect(self.set_sorting)
+        self.stacked_view.addWidget(self.tree_widget)
+
+        self.thumb_widget = MediaThumbnailListWidget(self.main_window, self)
+        self.thumb_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.thumb_widget.customContextMenuRequested.connect(self.show_thumb_context_menu)
+        self.stacked_view.addWidget(self.thumb_widget)
+
+        layout.addWidget(self.stacked_view, 1)
         
         button_layout = QHBoxLayout()
         add_button = QPushButton("Add")
@@ -3384,7 +3709,135 @@ class ProjectMediaWidget(QWidget):
         
         add_button.clicked.connect(self.add_media_requested.emit)
         remove_button.clicked.connect(self.remove_selected_media)
+
+    def on_view_mode_changed(self, mode):
+        if mode == "Thumbnails":
+            self.sort_bar_widget.setVisible(True)
+            self.stacked_view.setCurrentWidget(self.thumb_widget)
+            self._refresh_thumbnails()
+        else:
+            self.sort_bar_widget.setVisible(False)
+            self.stacked_view.setCurrentWidget(self.tree_widget)
+
+    def set_sorting(self, column):
+        if self.sort_column == column:
+            self.sort_ascending = not self.sort_ascending
+        else:
+            self.sort_column = column
+            self.sort_ascending = True
+
+        arrow = " 🔼" if self.sort_ascending else " 🔽"
+        self.sort_file_btn.setText("File" + (arrow if column == 0 else ""))
+        self.sort_path_btn.setText("Path" + (arrow if column == 1 else ""))
+        self.sort_date_btn.setText("Date Modified" + (arrow if column == 2 else ""))
+
+        header_item = self.tree_widget.headerItem()
+        header_item.setText(0, "File" + (arrow if column == 0 else ""))
+        header_item.setText(1, "Path" + (arrow if column == 1 else ""))
+        header_item.setText(2, "Date Modified" + (arrow if column == 2 else ""))
+
+        self.resort()
+
+    def resort(self):
+        pool = list(self.main_window.media_pool)
+
+        def sort_key(p):
+            if self.sort_column == 0:
+                return os.path.basename(p).lower()
+            elif self.sort_column == 1:
+                return os.path.dirname(p).lower()
+            else:
+                try:
+                    return os.path.getmtime(p)
+                except Exception:
+                    return 0
+
+        pool.sort(key=sort_key, reverse=not self.sort_ascending)
+        self.main_window.media_pool = pool
+        self.sync_with_media_pool(pool)
+
+    def _get_date_modified_str(self, path):
+        try:
+            mtime = os.path.getmtime(path)
+            return time.strftime("%Y-%m-%d %H:%M", time.localtime(mtime))
+        except Exception:
+            return ""
+
+    def add_media_item(self, file_path):
+        for i in range(self.tree_widget.topLevelItemCount()):
+            if self.tree_widget.topLevelItem(i).data(0, Qt.ItemDataRole.UserRole) == file_path:
+                return
+
+        name = os.path.basename(file_path)
+        folder = os.path.dirname(file_path)
+        mtime_str = self._get_date_modified_str(file_path)
+
+        tree_item = QTreeWidgetItem([name, folder, mtime_str])
+        tree_item.setData(0, Qt.ItemDataRole.UserRole, file_path)
+        self.tree_widget.addTopLevelItem(tree_item)
+
+        list_item = QListWidgetItem(name)
+        list_item.setData(Qt.ItemDataRole.UserRole, file_path)
+        pm = self.thumbnail_cache.get_thumbnail(file_path)
+        if pm:
+            list_item.setIcon(QIcon(pm))
+        self.thumb_widget.addItem(list_item)
+
+    def _on_thumbnail_ready(self, file_path):
+        pm = self.thumbnail_cache.get_thumbnail(file_path)
+        if not pm: return
+        icon = QIcon(pm)
+        for i in range(self.thumb_widget.count()):
+            it = self.thumb_widget.item(i)
+            if it.data(Qt.ItemDataRole.UserRole) == file_path:
+                it.setIcon(icon)
+
+    def _refresh_thumbnails(self):
+        for i in range(self.thumb_widget.count()):
+            it = self.thumb_widget.item(i)
+            p = it.data(Qt.ItemDataRole.UserRole)
+            pm = self.thumbnail_cache.get_thumbnail(p)
+            if pm:
+                it.setIcon(QIcon(pm))
+
+    def remove_selected_media(self):
+        selected_paths = []
+        if self.stacked_view.currentWidget() == self.tree_widget:
+            items = self.tree_widget.selectedItems()
+            selected_paths = [it.data(0, Qt.ItemDataRole.UserRole) for it in items]
+        else:
+            items = self.thumb_widget.selectedItems()
+            selected_paths = [it.data(Qt.ItemDataRole.UserRole) for it in items]
+
+        if not selected_paths:
+            return
+
+        for p in selected_paths:
+            self.media_removed.emit(p)
+
+    def show_details_context_menu(self, pos):
+        item = self.tree_widget.itemAt(pos)
+        if not item: return
+        file_path = item.data(0, Qt.ItemDataRole.UserRole)
+        self._exec_media_context_menu(file_path, self.tree_widget.mapToGlobal(pos))
+
+    def show_thumb_context_menu(self, pos):
+        item = self.thumb_widget.itemAt(pos)
+        if not item: return
+        file_path = item.data(Qt.ItemDataRole.UserRole)
+        self._exec_media_context_menu(file_path, self.thumb_widget.mapToGlobal(pos))
+
+    def _exec_media_context_menu(self, file_path, global_pos):
+        menu = QMenu()
+        add_action = menu.addAction("Add to timeline at playhead")
+        remove_action = menu.addAction("Remove")
         
+        act = menu.exec(global_pos)
+        if act == add_action:
+            self.add_to_timeline_requested.emit(file_path)
+        elif act == remove_action:
+            self.remove_selected_media()
+
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
@@ -3399,45 +3852,15 @@ class ProjectMediaWidget(QWidget):
         else:
             event.ignore()
 
-    def show_context_menu(self, pos):
-        item = self.media_list.itemAt(pos)
-        if not item:
-            return
-
-        menu = QMenu()
-        add_action = menu.addAction("Add to timeline at playhead")
-        
-        action = menu.exec(self.media_list.mapToGlobal(pos))
-
-        if action == add_action:
-            file_path = item.data(Qt.ItemDataRole.UserRole)
-            self.add_to_timeline_requested.emit(file_path)
-
-    def add_media_item(self, file_path):
-        if not any(self.media_list.item(i).data(Qt.ItemDataRole.UserRole) == file_path for i in range(self.media_list.count())):
-            item = QListWidgetItem(os.path.basename(file_path))
-            item.setData(Qt.ItemDataRole.UserRole, file_path)
-            self.media_list.addItem(item)
-
-    def remove_selected_media(self):
-        selected_items = self.media_list.selectedItems()
-        if not selected_items: return
-
-        for item in selected_items:
-            file_path = item.data(Qt.ItemDataRole.UserRole)
-            self.media_removed.emit(file_path)
-            self.media_list.takeItem(self.media_list.row(item))
-
     def sync_with_media_pool(self, media_pool):
-        current_items = [self.media_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.media_list.count())]
-        if current_items == media_pool:
-            return
-        self.media_list.clear()
+        self.tree_widget.clear()
+        self.thumb_widget.clear()
         for file_path in media_pool:
             self.add_media_item(file_path)
 
     def clear_list(self):
-        self.media_list.clear()
+        self.tree_widget.clear()
+        self.thumb_widget.clear()
 
 class MainWindow(QMainWindow):
     def __init__(self, project_to_load=None):
@@ -3530,7 +3953,8 @@ class MainWindow(QMainWindow):
             media_pool=self.media_pool,
             media_properties=self.media_properties,
             selected_clip_ids=self.timeline_widget.selected_clips,
-            selection_regions=self.timeline_widget.selection_regions
+            selection_regions=self.timeline_widget.selection_regions,
+            hidden_video_tracks=getattr(self.timeline, 'hidden_video_tracks', set())
         )
 
     def _restore_snapshot(self, snapshot):
@@ -3543,6 +3967,7 @@ class MainWindow(QMainWindow):
         self.timeline.clips = [c.clone() for c in snapshot.clips]
         self.timeline.num_video_tracks = int(snapshot.num_video_tracks)
         self.timeline.num_audio_tracks = int(snapshot.num_audio_tracks)
+        self.timeline.hidden_video_tracks = set(getattr(snapshot, 'hidden_video_tracks', set()))
 
         self.project_width = int(snapshot.project_width)
         self.project_height = int(snapshot.project_height)
@@ -4242,8 +4667,9 @@ class MainWindow(QMainWindow):
         _, clips, proj_settings = self._get_playback_data()
         w, h = proj_settings['width'], proj_settings['height']
 
+        hidden_v = getattr(self.timeline, 'hidden_video_tracks', set())
         clip_at_time = next((c for c in sorted(clips, key=lambda x: x.track_index, reverse=True) 
-                         if c.track_type == 'video' and c.timeline_start_ms <= time_ms < c.timeline_end_ms), None)
+                         if c.track_type == 'video' and c.track_index not in hidden_v and c.timeline_start_ms <= time_ms < c.timeline_end_ms), None)
         
         if not clip_at_time:
             return (None, 0, 0)
@@ -4443,6 +4869,7 @@ class MainWindow(QMainWindow):
             except Exception: pass
         self.temp_session_files.clear()
         self.timeline.clips.clear(); self.timeline.num_video_tracks = 1; self.timeline.num_audio_tracks = 1
+        self.timeline.hidden_video_tracks = set()
         self.media_pool.clear(); self.media_properties.clear(); self.project_media_widget.clear_list()
         self.current_project_path = None
         self.last_export_path = None
@@ -4478,7 +4905,8 @@ class MainWindow(QMainWindow):
                 "num_audio_tracks": self.timeline.num_audio_tracks,
                 "project_width": self.project_width,
                 "project_height": self.project_height,
-                "project_fps": self.project_fps
+                "project_fps": self.project_fps,
+                "hidden_video_tracks": list(getattr(self.timeline, 'hidden_video_tracks', []))
             }
         }
         try:
@@ -4510,6 +4938,7 @@ class MainWindow(QMainWindow):
             project_settings = project_data.get("settings", {})
             self.timeline.num_video_tracks = project_settings.get("num_video_tracks", 1)
             self.timeline.num_audio_tracks = project_settings.get("num_audio_tracks", 1)
+            self.timeline.hidden_video_tracks = set(project_settings.get("hidden_video_tracks", []))
             self.project_width = project_settings.get("project_width", 1280)
             self.project_height = project_settings.get("project_height", 720)
             self.project_fps = project_settings.get("project_fps", 25.0)
@@ -4607,6 +5036,7 @@ class MainWindow(QMainWindow):
             clips_to_remove = [c for c in self.timeline.clips if c.source_path == file_path or getattr(c, 'original_source_path', None) == file_path]
             for clip in clips_to_remove: self.timeline.clips.remove(clip)
             self.prune_empty_tracks()
+            self.project_media_widget.sync_with_media_pool(self.media_pool)
 
         self._perform_complex_timeline_change(f'Remove "{filename}" from Project', action)
 

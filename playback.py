@@ -199,11 +199,13 @@ class PlaybackManager(QObject):
             seek_time_ms = time_ms
             is_clip_end = False
 
+            hidden_v_tracks = getattr(timeline, 'hidden_video_tracks', set())
+
             video_clip_at_time = next((c for c in sorted(clips, key=lambda x: x.track_index, reverse=True) 
-                                     if c.track_type == 'video' and c.media_type in ['video', 'image'] and c.timeline_start_ms <= time_ms < c.timeline_end_ms), None)
+                                     if c.track_type == 'video' and c.track_index not in hidden_v_tracks and c.media_type in ['video', 'image'] and c.timeline_start_ms <= time_ms < c.timeline_end_ms), None)
 
             if not video_clip_at_time and time_ms > 0:
-                candidates = [c for c in clips if c.track_type == 'video' and c.media_type in ['video', 'image'] and c.timeline_end_ms <= time_ms]
+                candidates = [c for c in clips if c.track_type == 'video' and c.track_index not in hidden_v_tracks and c.media_type in ['video', 'image'] and c.timeline_end_ms <= time_ms]
                 if candidates:
                     max_end = max(c.timeline_end_ms for c in candidates)
                     total_dur = timeline.get_total_duration()
@@ -285,7 +287,8 @@ class PlaybackManager(QObject):
     def _build_video_graph(self, start_ms, timeline, clips, proj_settings):
         w, h, fps = proj_settings['width'], proj_settings['height'], proj_settings['fps']
 
-        visual_clips = [c for c in clips if c.track_type == 'video' and c.media_type in ['video', 'image'] and c.timeline_end_ms > start_ms]
+        hidden_v_tracks = getattr(timeline, 'hidden_video_tracks', set())
+        visual_clips = [c for c in clips if c.track_type == 'video' and c.track_index not in hidden_v_tracks and c.media_type in ['video', 'image'] and c.timeline_end_ms > start_ms]
         subtitle_clips = [c for c in clips if c.media_type == 'subtitle' and c.timeline_end_ms > start_ms]
         
         if not visual_clips:
