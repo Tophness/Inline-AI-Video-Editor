@@ -38,6 +38,7 @@ class PlaybackManager(QObject):
         self._seek_thread = None
         self._seek_request_ms = -1
         self._seek_lock = threading.Lock()
+        self.bypass_crop = False
 
         self.video_process = None
         self.audio_process = None
@@ -239,7 +240,7 @@ class PlaybackManager(QObject):
                     final_node = video_node.video
 
                     crop = getattr(video_clip_at_time, 'effects', {}).get('crop')
-                    if crop and all(k in crop for k in ('x', 'y', 'w', 'h')):
+                    if crop and not getattr(self, 'bypass_crop', False) and all(k in crop for k in ('x', 'y', 'w', 'h')):
                         final_node = final_node.filter('crop', w=crop['w'], h=crop['h'], x=crop['x'], y=crop['y'])
 
                     if subtitle_clip_at_time:
