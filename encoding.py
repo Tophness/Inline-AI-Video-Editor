@@ -208,10 +208,10 @@ class Encoder(QObject):
                 if is_lossless:
                     if vcodec == 'libx265':
                         output_args['x265-params'] = 'qp=0'
-                        output_args['preset'] = 'fast'
+                        output_args['preset'] = 'slow'
                     elif vcodec == 'libx264':
                         output_args['crf'] = '1'
-                        output_args['preset'] = 'veryfast'
+                        output_args['preset'] = 'slow'
                 elif v_bitrate:
                     output_args['b:v'] = v_bitrate
 
