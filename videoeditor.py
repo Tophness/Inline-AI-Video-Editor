@@ -2311,6 +2311,8 @@ class TimelineWidget(QWidget):
             video_track_index=video_track_idx,
             audio_track_index=audio_track_idx
         )
+        self.update()
+        event.acceptProposedAction()
 
     def contextMenuEvent(self, event: 'QContextMenuEvent'):
         menu = QMenu(self)
@@ -2450,6 +2452,10 @@ class SettingsDialog(QDialog):
         self.confirm_on_exit_checkbox.setChecked(parent_settings.get("confirm_on_exit", True))
         layout.addWidget(self.confirm_on_exit_checkbox)
 
+        self.start_maximized_checkbox = QCheckBox("Start window maximized")
+        self.start_maximized_checkbox.setChecked(parent_settings.get("start_maximized", True))
+        layout.addWidget(self.start_maximized_checkbox)
+
         reindex_group = QGroupBox("TS / MPEG-TS Re-indexing Settings")
         reindex_layout = QFormLayout()
 
@@ -2533,6 +2539,7 @@ class SettingsDialog(QDialog):
     def get_settings(self):
         return {
             "confirm_on_exit": self.confirm_on_exit_checkbox.isChecked(),
+            "start_maximized": self.start_maximized_checkbox.isChecked(),
             "default_export_path": self.default_export_path_edit.text(),
             "ts_reindex_method": self.ts_reindex_combo.currentText(),
             "ts_reindex_storage": self.reindex_storage_combo.currentText(),
@@ -4033,6 +4040,7 @@ class MainWindow(QMainWindow):
             "enabled_plugins": [],
             "recent_files": [],
             "confirm_on_exit": True,
+            "start_maximized": True,
             "default_export_path": "",
             "ts_reindex_method": "Direct Stream Copy (faster)",
             "ts_reindex_storage": "Automatic (Memory up to limit, then Temp File)",
@@ -4068,8 +4076,12 @@ class MainWindow(QMainWindow):
             if data['action']: data['action'].setChecked(is_visible)
         splitter_state = self.settings.get("splitter_state")
         if splitter_state: self.splitter.restoreState(QByteArray.fromHex(splitter_state.encode('ascii')))
+        if self.settings.get("start_maximized", True):
+            self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
+        else:
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMaximized)
 
-    def on_splitter_moved(self, pos, index): 
+    def on_splitter_moved(self, pos, index):
         self.splitter_save_timer.start(500)
         self._update_preview_display()
     
@@ -4376,6 +4388,7 @@ class MainWindow(QMainWindow):
         command = TimelineStateChangeCommand("Add Clip", self.timeline, *old_state, *new_state)
         command.undo()
         self.undo_stack.push(command)
+        self.timeline_widget.update()
 
     def _split_at_time(self, clip_to_split, time_ms, new_group_id=None):
         if not (clip_to_split.timeline_start_ms < time_ms < clip_to_split.timeline_end_ms): return False
@@ -4873,5 +4886,8 @@ if __name__ == '__main__':
             project_to_load_on_startup = path
             print(f"Loading project: {path}")
     window = MainWindow(project_to_load=project_to_load_on_startup)
-    window.show()
+    if window.settings.get("start_maximized", True):
+        window.showMaximized()
+    else:
+        window.show()
     sys.exit(app.exec())

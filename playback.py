@@ -195,23 +195,46 @@ class PlaybackManager(QObject):
             timeline, clips, proj_settings = self.get_timeline_data()
             w, h, fps = proj_settings['width'], proj_settings['height'], proj_settings['fps']
 
+            seek_time_ms = time_ms
+            is_clip_end = False
+
             video_clip_at_time = next((c for c in sorted(clips, key=lambda x: x.track_index, reverse=True) 
                                      if c.track_type == 'video' and c.media_type in ['video', 'image'] and c.timeline_start_ms <= time_ms < c.timeline_end_ms), None)
-            
+
+            if not video_clip_at_time and time_ms > 0:
+                candidates = [c for c in clips if c.track_type == 'video' and c.media_type in ['video', 'image'] and c.timeline_end_ms <= time_ms]
+                if candidates:
+                    max_end = max(c.timeline_end_ms for c in candidates)
+                    total_dur = timeline.get_total_duration()
+                    if time_ms == max_end or time_ms >= total_dur or abs(max_end - time_ms) <= 500:
+                        video_clip_at_time = next((c for c in sorted(candidates, key=lambda x: x.track_index, reverse=True) if c.timeline_end_ms == max_end), None)
+                        if video_clip_at_time:
+                            is_clip_end = True
+                            seek_time_ms = video_clip_at_time.timeline_end_ms
+
             subtitle_clip_at_time = next((c for c in sorted(clips, key=lambda x: x.track_index, reverse=True)
-                                        if c.media_type == 'subtitle' and c.timeline_start_ms <= time_ms < c.timeline_end_ms), None)
+                                        if c.media_type == 'subtitle' and c.timeline_start_ms <= seek_time_ms < c.timeline_end_ms), None)
 
             pixmap = QPixmap(w, h)
             pixmap.fill(QColor("black"))
 
             if video_clip_at_time:
                 try:
-                    video_seek_sec = (time_ms - video_clip_at_time.timeline_start_ms + video_clip_at_time.clip_start_ms) / 1000.0
+                    output_kwargs = {'format': 'rawvideo', 'pix_fmt': 'rgb24'}
 
                     if video_clip_at_time.media_type == 'image':
                         video_node = ffmpeg.input(video_clip_at_time.source_path, loop=1, framerate=fps)
+                        output_kwargs['vframes'] = 1
+                    elif is_clip_end:
+                        clip_start_sec = video_clip_at_time.clip_start_ms / 1000.0
+                        clip_end_sec = (video_clip_at_time.clip_start_ms + video_clip_at_time.duration_ms) / 1000.0
+                        seek_sec = max(clip_start_sec, clip_end_sec - 0.3)
+                        dur_sec = max(0.04, clip_end_sec - seek_sec)
+                        video_node = ffmpeg.input(video_clip_at_time.source_path, ss=f"{seek_sec:.6f}", t=f"{dur_sec:.6f}")
                     else:
+                        video_seek_sec = max(0.0, (seek_time_ms - video_clip_at_time.timeline_start_ms + video_clip_at_time.clip_start_ms) / 1000.0)
                         video_node = ffmpeg.input(video_clip_at_time.source_path, ss=f"{video_seek_sec:.6f}")
+                        output_kwargs['vframes'] = 1
 
                     final_node = video_node.video
 
@@ -220,19 +243,20 @@ class PlaybackManager(QObject):
                         final_node = final_node.filter('crop', w=crop['w'], h=crop['h'], x=crop['x'], y=crop['y'])
 
                     if subtitle_clip_at_time:
-                        sub_seek_sec = (time_ms - subtitle_clip_at_time.timeline_start_ms + subtitle_clip_at_time.clip_start_ms) / 1000.0
-
+                        sub_seek_sec = (seek_time_ms - subtitle_clip_at_time.timeline_start_ms + subtitle_clip_at_time.clip_start_ms) / 1000.0
                         final_node = final_node.filter('setpts', f'PTS-STARTPTS+{sub_seek_sec}/TB')
                         final_node = final_node.filter('subtitles', filename=subtitle_clip_at_time.source_path)
 
                     out, _ = (final_node
                                     .filter('scale', w, h, force_original_aspect_ratio='decrease')
                                     .filter('pad', w, h, '(ow-iw)/2', '(oh-ih)/2', 'black')
-                                    .output('pipe:', vframes=1, format='rawvideo', pix_fmt='rgb24')
+                                    .output('pipe:', **output_kwargs)
                                     .run(capture_stdout=True, quiet=True))
 
-                    if out:
-                        image = QImage(out, w, h, w * 3, QImage.Format.Format_RGB888)
+                    frame_size = w * h * 3
+                    if out and len(out) >= frame_size:
+                        last_frame_bytes = out[-frame_size:]
+                        image = QImage(last_frame_bytes, w, h, w * 3, QImage.Format.Format_RGB888)
                         pixmap = QPixmap.fromImage(image)
 
                 except ffmpeg.Error as e:
