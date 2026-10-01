@@ -360,7 +360,7 @@ class PlaybackManager(QObject):
                 last_end_time_ms = max(last_end_time_ms, segment_clip.timeline_end_ms)
                 continue
 
-            in_kwargs = {'re': None}
+            in_kwargs = {}
             if hwaccel and segment_clip.media_type != 'image':
                 in_kwargs['hwaccel'] = hwaccel
 
@@ -432,7 +432,7 @@ class PlaybackManager(QObject):
                 
                 if clip_remaining_duration_ms > 0:
                     dur_sec = clip_remaining_duration_ms / 1000.0
-                    segment = ffmpeg.input(clip.source_path, ss=clip_read_start_ms/1000.0, re=None).audio
+                    segment = ffmpeg.input(clip.source_path, ss=clip_read_start_ms/1000.0).audio
                     segment = segment.filter('apad').filter('atrim', start=0, duration=f"{dur_sec:.6f}").filter('asetpts', 'PTS-STARTPTS')
                     concat_inputs.append(segment)
                 
