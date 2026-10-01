@@ -94,6 +94,13 @@ _cached_formats = None
 _cached_video_codecs = None
 _cached_audio_codecs = None
 
+def get_temp_dir(settings=None):
+    if settings:
+        custom = settings.get("custom_temp_dir", "").strip()
+        if custom and os.path.isdir(custom):
+            return os.path.abspath(custom)
+    return tempfile.gettempdir()
+
 def download_ffmpeg():
     if os.name != 'nt': return
     exes = ['ffmpeg.exe', 'ffprobe.exe', 'ffplay.exe']
@@ -3182,6 +3189,33 @@ class SettingsDialog(QDialog):
         export_path_group.setLayout(export_path_layout)
         layout.addWidget(export_path_group)
 
+        temp_dir_group = QGroupBox("Temporary Files Directory")
+        temp_dir_layout = QHBoxLayout()
+        self.temp_dir_edit = QLineEdit()
+        self.temp_dir_edit.setPlaceholderText("Default: System Temp Directory")
+        self.temp_dir_edit.setText(parent_settings.get("custom_temp_dir", ""))
+        temp_browse_btn = QPushButton("Browse...")
+        temp_browse_btn.clicked.connect(self.browse_temp_dir)
+        temp_dir_layout.addWidget(self.temp_dir_edit)
+        temp_dir_layout.addWidget(temp_browse_btn)
+        temp_dir_group.setLayout(temp_dir_layout)
+        layout.addWidget(temp_dir_group)
+
+        stream_copy_group = QGroupBox("Direct Stream Copy Multi-Clip Mode")
+        stream_copy_layout = QFormLayout()
+        self.stream_copy_mode_combo = QComboBox()
+        self.stream_copy_mode_combo.addItems([
+            "Direct In-Memory (No intermediate video files, faster)",
+            "Use Temp Files (Disk-buffered video segments)"
+        ])
+        saved_mode = parent_settings.get("stream_copy_mode", "Direct In-Memory (No intermediate video files, faster)")
+        idx = self.stream_copy_mode_combo.findText(saved_mode)
+        if idx != -1:
+            self.stream_copy_mode_combo.setCurrentIndex(idx)
+        stream_copy_layout.addRow("Concat Mode:", self.stream_copy_mode_combo)
+        stream_copy_group.setLayout(stream_copy_layout)
+        layout.addWidget(stream_copy_group)
+
         button_box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
@@ -3208,11 +3242,18 @@ class SettingsDialog(QDialog):
         if path:
             self.default_export_path_edit.setText(path)
 
+    def browse_temp_dir(self):
+        path = QFileDialog.getExistingDirectory(self, "Select Temporary Folder", self.temp_dir_edit.text())
+        if path:
+            self.temp_dir_edit.setText(path)
+
     def get_settings(self):
         return {
             "confirm_on_exit": self.confirm_on_exit_checkbox.isChecked(),
             "start_maximized": self.start_maximized_checkbox.isChecked(),
             "default_export_path": self.default_export_path_edit.text(),
+            "custom_temp_dir": self.temp_dir_edit.text().strip(),
+            "stream_copy_mode": self.stream_copy_mode_combo.currentText(),
             "ts_reindex_method": self.ts_reindex_combo.currentText(),
             "ts_reindex_storage": self.reindex_storage_combo.currentText(),
             "ts_reindex_max_memory_mb": self.max_memory_spin.value(),
@@ -3259,7 +3300,8 @@ class ReindexWorker(QThread):
         time_pattern = re.compile(r"time=(\d+):(\d+):(\d+)\.(\d+)")
         is_stream_copy = ("Direct Stream Copy" in method)
 
-        temp_filepath = os.path.join(tempfile.gettempdir(), f"ve_reindex_{uuid.uuid4().hex}.mkv")
+        temp_dir = get_temp_dir(self.settings)
+        temp_filepath = os.path.join(temp_dir, f"ve_reindex_{uuid.uuid4().hex}.mkv")
 
         if is_stream_copy:
             cmd = ['ffmpeg', '-y', '-i', self.file_path, '-map', '0:v:0', '-map', '0:a?', '-c', 'copy', temp_filepath]
@@ -5222,6 +5264,8 @@ class MainWindow(QMainWindow):
             "confirm_on_exit": True,
             "start_maximized": True,
             "default_export_path": "",
+            "custom_temp_dir": "",
+            "stream_copy_mode": "Direct In-Memory (No intermediate video files, faster)",
             "ts_reindex_method": "Direct Stream Copy (faster)",
             "ts_reindex_storage": "Automatic (Memory up to limit, then Temp File)",
             "ts_reindex_max_memory_mb": get_default_reindex_memory_mb()
@@ -5994,7 +6038,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setValue(0)
         self.status_label.setText("Exporting...")
 
-        self.encoder.start_export(self.timeline, project_settings, export_settings)
+        self.encoder.start_export(self.timeline, project_settings, export_settings, app_settings=self.settings)
 
     def on_export_finished(self, success, message):
         self.status_label.setText(message)

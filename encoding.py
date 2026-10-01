@@ -26,8 +26,7 @@ class _ExportRunner(QObject):
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
-            # Run any fast preparatory slice commands for multi-clip stream copy
-            for i, cmd in enumerate(self.prep_cmds):
+            for cmd in self.prep_cmds:
                 self.process = subprocess.Popen(
                     cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                     startupinfo=startupinfo
@@ -35,7 +34,7 @@ class _ExportRunner(QObject):
                 _, stderr = self.process.communicate()
                 if self.process.returncode != 0:
                     self._cleanup_temp_files()
-                    self.finished.emit(False, f"Direct stream copy slicing failed: {stderr.decode('utf-8', errors='ignore')}")
+                    self.finished.emit(False, f"Stream copy segment preparation failed: {stderr.decode('utf-8', errors='ignore')}")
                     return
 
             self.process = subprocess.Popen(
@@ -103,7 +102,7 @@ class Encoder(QObject):
         self.worker = None
         self._is_running = False
 
-    def start_export(self, timeline, project_settings, export_settings):
+    def start_export(self, timeline, project_settings, export_settings, app_settings=None):
         if self._is_running:
             self.finished.emit(False, "An export is already in progress.")
             return
@@ -126,17 +125,20 @@ class Encoder(QObject):
 
             all_video_clips = sorted(
                 [c for c in timeline.clips if c.track_type == 'video' and c.media_type != 'subtitle' and c.track_index not in hidden_v_tracks],
-                key=lambda c: c.track_index
+                key=lambda c: c.timeline_start_ms
             )
 
             all_subtitle_clips = sorted(
                 [c for c in timeline.clips if c.media_type == 'subtitle' and c.track_index not in hidden_v_tracks],
-                key=lambda c: c.track_index
+                key=lambda c: c.timeline_start_ms
             )
 
             vcodec = export_settings.get('vcodec')
             acodec = export_settings.get('acodec')
-            all_audio_clips = [c for c in timeline.clips if c.track_type == 'audio' and c.track_index not in muted_a_tracks]
+            all_audio_clips = sorted(
+                [c for c in timeline.clips if c.track_type == 'audio' and c.track_index not in muted_a_tracks],
+                key=lambda c: c.timeline_start_ms
+            )
 
             v_bitrate = export_settings.get('v_bitrate')
             is_lossless = (v_bitrate == "Lossless (QP 0 / CRF 1)")
@@ -144,50 +146,77 @@ class Encoder(QObject):
             prep_cmds = []
             temp_files = []
 
+            custom_temp = ""
+            stream_mode = "Direct In-Memory (No intermediate video files, faster)"
+            if app_settings:
+                custom_temp = app_settings.get("custom_temp_dir", "").strip()
+                stream_mode = app_settings.get("stream_copy_mode", stream_mode)
+
+            temp_dir = custom_temp if (custom_temp and os.path.isdir(custom_temp)) else tempfile.gettempdir()
+            use_disk_segments = ("Use Temp Files" in stream_mode)
+
             if vcodec == 'copy' and len(all_video_clips) > 1:
-                seg_files = []
-                last_end_ms = 0
-
-                for i, c in enumerate(all_video_clips):
-                    gap_ms = c.timeline_start_ms - last_end_ms
-                    if acodec == 'copy' and gap_ms > 40:
-                        silence_seg = os.path.join(tempfile.gettempdir(), f"ve_silence_{uuid.uuid4().hex}_{i}.mp4")
-                        silence_dur = gap_ms / 1000.0
-                        silence_cmd = [
-                            'ffmpeg', '-y', '-f', 'lavfi',
-                            '-i', f'color=c=black:s={w}x{h}:r={fps}:d={silence_dur:.6f}',
-                            '-f', 'lavfi',
-                            '-i', f'anullsrc=r={sample_rate}:cl={channel_layout}:d={silence_dur:.6f}',
-                            '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-b:a', '192k',
-                            silence_seg
-                        ]
-                        prep_cmds.append(silence_cmd)
-                        temp_files.append(silence_seg)
-                        seg_files.append(silence_seg)
-
-                    has_audio = (acodec == 'copy' and any(a for a in all_audio_clips if abs(a.timeline_start_ms - c.timeline_start_ms) < 40))
-                    cut_start = c.clip_start_ms / 1000.0
-                    cut_dur = c.duration_ms / 1000.0
-                    temp_seg = os.path.join(tempfile.gettempdir(), f"ve_concat_seg_{uuid.uuid4().hex}_{i}.mp4")
-                    
-                    slice_cmd = ['ffmpeg', '-y', '-ss', f"{cut_start:.6f}", '-t', f"{cut_dur:.6f}", '-i', c.source_path]
-                    if has_audio:
-                        slice_cmd.extend(['-map', '0:v:0', '-map', '0:a:0?'])
-                    else:
-                        slice_cmd.extend(['-map', '0:v:0', '-an'])
-                    slice_cmd.extend(['-c', 'copy', '-avoid_negative_ts', 'make_zero', temp_seg])
-                    
-                    prep_cmds.append(slice_cmd)
-                    temp_files.append(temp_seg)
-                    seg_files.append(temp_seg)
-                    last_end_ms = c.timeline_start_ms + c.duration_ms
-
-                list_path = os.path.join(tempfile.gettempdir(), f"ve_concat_list_{uuid.uuid4().hex}.txt")
-                with open(list_path, 'w', encoding='utf-8') as f:
-                    for seg in seg_files:
-                        escaped = seg.replace("'", "'\\''")
-                        f.write(f"file '{escaped}'\n")
+                list_path = os.path.join(temp_dir, f"ve_concat_list_{uuid.uuid4().hex}.txt")
                 temp_files.append(list_path)
+
+                if not use_disk_segments:
+                    with open(list_path, 'w', encoding='utf-8') as f:
+                        f.write("ffconcat version 1.0\n")
+                        for c in all_video_clips:
+                            escaped_path = c.source_path.replace("'", "'\\''")
+                            f.write(f"file '{escaped_path}'\n")
+                            if c.clip_start_ms > 0:
+                                f.write(f"inpoint {c.clip_start_ms / 1000.0:.6f}\n")
+                            outpoint_sec = (c.clip_start_ms + c.duration_ms) / 1000.0
+                            f.write(f"outpoint {outpoint_sec:.6f}\n")
+                else:
+                    seg_files = []
+                    last_end_ms = 0
+                    for i, c in enumerate(all_video_clips):
+                        gap_ms = c.timeline_start_ms - last_end_ms
+                        if acodec == 'copy' and gap_ms > 40:
+                            silence_seg = os.path.join(temp_dir, f"ve_silence_{uuid.uuid4().hex}_{i}.mp4")
+                            silence_dur = gap_ms / 1000.0
+                            silence_cmd = [
+                                'ffmpeg', '-y', '-f', 'lavfi',
+                                '-i', f'color=c=black:s={w}x{h}:r={fps}:d={silence_dur:.6f}',
+                                '-f', 'lavfi',
+                                '-i', f'anullsrc=r={sample_rate}:cl={channel_layout}:d={silence_dur:.6f}',
+                                '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-b:a', '192k',
+                                silence_seg
+                            ]
+                            prep_cmds.append(silence_cmd)
+                            temp_files.append(silence_seg)
+                            seg_files.append(silence_seg)
+
+                        has_audio = (acodec == 'copy' and any(a for a in all_audio_clips if abs(a.timeline_start_ms - c.timeline_start_ms) < 40))
+                        cut_start = c.clip_start_ms / 1000.0
+                        cut_dur = c.duration_ms / 1000.0
+                        temp_seg = os.path.join(temp_dir, f"ve_concat_seg_{uuid.uuid4().hex}_{i}.mp4")
+
+                        slice_cmd = ['ffmpeg', '-y', '-ss', f"{cut_start:.6f}", '-t', f"{cut_dur:.6f}", '-i', c.source_path]
+                        if has_audio:
+                            slice_cmd.extend(['-map', '0:v:0', '-map', '0:a:0?'])
+                        else:
+                            slice_cmd.extend(['-map', '0:v:0', '-an'])
+                        slice_cmd.extend(['-c', 'copy', '-avoid_negative_ts', 'make_zero', temp_seg])
+
+                        prep_cmds.append(slice_cmd)
+                        temp_files.append(temp_seg)
+                        seg_files.append(temp_seg)
+                        last_end_ms = c.timeline_start_ms + c.duration_ms
+
+                    with open(list_path, 'w', encoding='utf-8') as f:
+                        for seg in seg_files:
+                            escaped = seg.replace("'", "'\\''")
+                            f.write(f"file '{escaped}'\n")
+
+                concat_input = ffmpeg.input(list_path, f='concat', safe=0)
+                stream_args.append(concat_input.video)
+                output_args['vcodec'] = 'copy'
+                if acodec == 'copy':
+                    stream_args.append(concat_input.audio)
+                    output_args['acodec'] = 'copy'
 
             elif vcodec == 'copy' and acodec == 'copy' and len(all_video_clips) == 1 and len(all_audio_clips) == 1 and all_video_clips[0].source_path == all_audio_clips[0].source_path and not all_subtitle_clips:
                 single_v_clip = all_video_clips[0]
@@ -290,7 +319,7 @@ class Encoder(QObject):
 
             if vcodec == 'copy' and acodec == 'copy' and len(all_video_clips) == 1 and len(all_audio_clips) == 1 and all_video_clips[0].source_path == all_audio_clips[0].source_path and not all_subtitle_clips:
                 pass
-            elif acodec == 'copy':
+            elif acodec == 'copy' and vcodec != 'copy':
                 if len(all_audio_clips) != 1:
                     if len(all_audio_clips) == 0:
                         output_args['an'] = None
@@ -306,7 +335,7 @@ class Encoder(QObject):
                     if 't' not in output_args:
                         output_args['t'] = f"{cut_dur_sec:.6f}"
                     output_args['avoid_negative_ts'] = 'make_zero'
-            elif acodec:
+            elif acodec and acodec != 'copy':
                 track_audio_streams = []
                 for i in range(1, timeline.num_audio_tracks + 1):
                     if i in muted_a_tracks:
@@ -355,7 +384,8 @@ class Encoder(QObject):
                 else:
                     output_args['an'] = None
             else:
-                output_args['an'] = None
+                if vcodec != 'copy' or len(all_video_clips) <= 1:
+                    output_args['an'] = None
 
             if not stream_args:
                 raise ValueError("No video or audio streams to export (all tracks may be hidden or muted).")
