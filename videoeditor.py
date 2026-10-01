@@ -4004,10 +4004,10 @@ class ExportDialog(QDialog):
         }
 
 class MediaDetailsTreeWidget(QTreeWidget):
-    def __init__(self, main_window, project_media_widget, parent=None):
+    def __init__(self, main_window, parent=None):
         super().__init__(parent)
         self.main_window = main_window
-        self.project_media_widget = project_media_widget
+        self.media_widget = parent
         self.setDragEnabled(True)
         self.setAcceptDrops(False)
         self.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
@@ -4044,16 +4044,17 @@ class MediaDetailsTreeWidget(QTreeWidget):
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
-            self.project_media_widget.remove_selected_media()
+            if self.media_widget:
+                self.media_widget.remove_selected_media()
             event.accept()
             return
         super().keyPressEvent(event)
 
 class MediaThumbnailListWidget(QListWidget):
-    def __init__(self, main_window, project_media_widget, parent=None):
+    def __init__(self, main_window, parent=None):
         super().__init__(parent)
         self.main_window = main_window
-        self.project_media_widget = project_media_widget
+        self.media_widget = parent
         self.setDragEnabled(True)
         self.setAcceptDrops(False)
         self.setViewMode(QListWidget.ViewMode.IconMode)
@@ -4086,7 +4087,8 @@ class MediaThumbnailListWidget(QListWidget):
 
     def keyPressEvent(self, event: QKeyEvent):
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
-            self.project_media_widget.remove_selected_media()
+            if self.media_widget:
+                self.media_widget.remove_selected_media()
             event.accept()
             return
         super().keyPressEvent(event)
@@ -4145,13 +4147,13 @@ class ProjectMediaWidget(QWidget):
 
         self.stacked_view = QStackedWidget(self)
         
-        self.tree_widget = MediaDetailsTreeWidget(self.main_window, self, self.stacked_view)
+        self.tree_widget = MediaDetailsTreeWidget(self.main_window, self)
         self.tree_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree_widget.customContextMenuRequested.connect(self.show_details_context_menu)
         self.tree_widget.header().sectionClicked.connect(self.set_sorting)
         self.stacked_view.addWidget(self.tree_widget)
 
-        self.thumb_widget = MediaThumbnailListWidget(self.main_window, self, self.stacked_view)
+        self.thumb_widget = MediaThumbnailListWidget(self.main_window, self)
         self.thumb_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.thumb_widget.customContextMenuRequested.connect(self.show_thumb_context_menu)
         self.stacked_view.addWidget(self.thumb_widget)
