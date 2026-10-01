@@ -273,28 +273,19 @@ class WaveformCache(QObject):
 
             cmd = [
                 'ffmpeg', '-v', 'error', '-i', source_path,
-                '-vn', '-ac', '1', '-ar', '4000', '-f', 'f32le', '-'
+                '-vn', '-ac', '1', '-ar', '16000', '-f', 'f32le', '-'
             ]
             proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, startupinfo=startupinfo
             )
             raw_bytes, _ = proc.communicate()
             if not raw_bytes:
-                peaks = np.zeros((1, 2), dtype=np.float32)
+                samples = np.zeros(1, dtype=np.float32)
             else:
-                arr = np.frombuffer(raw_bytes, dtype=np.float32)
-                bucket_size = 20
-                num_buckets = len(arr) // bucket_size
-                if num_buckets > 0:
-                    reshaped = arr[:num_buckets * bucket_size].reshape(num_buckets, bucket_size)
-                    mins = reshaped.min(axis=1)
-                    maxs = reshaped.max(axis=1)
-                    peaks = np.column_stack([mins, maxs])
-                else:
-                    peaks = np.zeros((1, 2), dtype=np.float32)
+                samples = np.frombuffer(raw_bytes, dtype=np.float32)
 
             with self._lock:
-                self._cache[source_path] = peaks
+                self._cache[source_path] = samples
                 self._loading.discard(source_path)
 
             self.waveform_ready.emit(source_path)
@@ -1663,8 +1654,8 @@ class TimelineWidget(QWidget):
         return QRectF(x, y, w, clip_height)
 
     def _draw_waveform(self, painter, clip, clip_rect):
-        peaks = self.waveform_cache.request_waveform(clip.source_path)
-        if peaks is None or len(peaks) == 0:
+        samples = self.waveform_cache.request_waveform(clip.source_path)
+        if samples is None or len(samples) == 0:
             return
 
         x_left = int(clip_rect.left())
@@ -1685,8 +1676,14 @@ class TimelineWidget(QWidget):
 
         y_center = wave_top + wave_height / 2.0
         max_amp = wave_height * 0.46
-        bucket_duration_ms = 5.0
-        
+        sample_rate = 16000.0
+        total_samples = len(samples)
+
+        painter.save()
+        painter.setPen(QPen(QColor(85, 160, 255, 45), 1))
+        painter.drawLine(QPointF(max(self.HEADER_WIDTH, x_left), y_center), QPointF(min(self.width(), x_right), y_center))
+        painter.restore()
+
         lines = []
         for px in range(width_px):
             cur_x = x_left + px
@@ -1696,36 +1693,67 @@ class TimelineWidget(QWidget):
             ms_start = clip.clip_start_ms + (px / self.pixels_per_ms)
             ms_end = clip.clip_start_ms + ((px + 1) / self.pixels_per_ms)
 
-            b_start = max(0, int(ms_start / bucket_duration_ms))
-            b_end = min(len(peaks), int(math.ceil(ms_end / bucket_duration_ms)))
+            s_start = int((ms_start / 1000.0) * sample_rate)
+            s_end = int(math.ceil((ms_end / 1000.0) * sample_rate))
 
-            if b_start >= len(peaks):
+            if s_start >= total_samples:
                 break
-            if b_end <= b_start:
-                b_end = b_start + 1
+            s_start = max(0, s_start)
+            s_end = min(total_samples, max(s_start + 1, s_end))
 
-            slice_peaks = peaks[b_start:b_end]
-            if len(slice_peaks) == 0:
-                continue
+            count = s_end - s_start
 
-            min_val = float(slice_peaks[:, 0].min())
-            max_val = float(slice_peaks[:, 1].max())
+            if count > 2:
+                sub = samples[s_start:s_end]
+                if sub.ndim == 2:
+                    s_min = float(sub[:, 0].min())
+                    s_max = float(sub[:, 1].max())
+                else:
+                    s_min = float(sub.min())
+                    s_max = float(sub.max())
 
-            min_val = max(-1.0, min(1.0, min_val))
-            max_val = max(-1.0, min(1.0, max_val))
+                s_min = max(-1.0, min(1.0, s_min))
+                s_max = max(-1.0, min(1.0, s_max))
 
-            y_top = y_center - max(0.04, max_val) * max_amp
-            y_bot = y_center - min(-0.04, min_val) * max_amp
+                top_y = y_center - (pow(s_max, 0.70) * max_amp) if s_max > 0 else y_center
+                bot_y = y_center + (pow(abs(s_min), 0.70) * max_amp) if s_min < 0 else y_center
 
-            lines.append(QLineF(cur_x, y_top, cur_x, y_bot))
+                if bot_y - top_y < 1.0:
+                    top_y = y_center - 0.5
+                    bot_y = y_center + 0.5
+
+                lines.append(QLineF(cur_x, top_y, cur_x, bot_y))
+            else:
+                idx_float = (ms_start / 1000.0) * sample_rate
+                idx = int(idx_float)
+                frac = idx_float - idx
+                if idx + 1 < total_samples:
+                    s0 = float(samples[idx, 0] if samples.ndim == 2 else samples[idx])
+                    s1 = float(samples[idx + 1, 0] if samples.ndim == 2 else samples[idx + 1])
+                    val = (1.0 - frac) * s0 + frac * s1
+                elif idx < total_samples:
+                    val = float(samples[idx, 0] if samples.ndim == 2 else samples[idx])
+                else:
+                    val = 0.0
+
+                val = max(-1.0, min(1.0, val))
+
+                if val > 0.002:
+                    y_val = y_center - (pow(val, 0.70) * max_amp)
+                    lines.append(QLineF(cur_x, y_center, cur_x, y_val))
+                elif val < -0.002:
+                    y_val = y_center + (pow(abs(val), 0.70) * max_amp)
+                    lines.append(QLineF(cur_x, y_center, cur_x, y_val))
+                else:
+                    lines.append(QLineF(cur_x, y_center - 0.5, cur_x, y_center + 0.5))
 
         if lines:
             painter.save()
             muted_a = getattr(self.timeline, 'muted_audio_tracks', set())
             if clip.track_index in muted_a:
-                painter.setPen(QPen(QColor(120, 140, 160, 120), 1))
+                painter.setPen(QPen(QColor(110, 130, 150, 130), 1))
             else:
-                painter.setPen(QPen(QColor(160, 210, 255, 200), 1))
+                painter.setPen(QPen(QColor("#5599ff"), 1))
             painter.drawLines(lines)
             painter.restore()
 
