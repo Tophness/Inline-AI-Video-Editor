@@ -23,9 +23,10 @@ class PlaybackManager(QObject):
     paused = pyqtSignal()
     stats_updated = pyqtSignal(str)
 
-    def __init__(self, get_timeline_data_func, parent=None):
+    def __init__(self, get_timeline_data_func, settings=None, parent=None):
         super().__init__(parent)
         self.get_timeline_data = get_timeline_data_func
+        self.settings = settings or {}
 
         self.is_playing = False
         self.is_muted = False
@@ -64,6 +65,22 @@ class PlaybackManager(QObject):
         self.update_timer = QTimer(self)
         self.update_timer.timeout.connect(self._update_loop)
         self.update_timer.setInterval(16)
+
+    def set_settings(self, settings):
+        self.settings = settings or {}
+
+    def _get_hwaccel_param(self):
+        mode = self.settings.get("playback_hwaccel", "CPU (Software)") if self.settings else "CPU (Software)"
+        mapping = {
+            "GPU (Auto)": "auto",
+            "Auto (GPU)": "auto",
+            "NVIDIA (CUDA)": "cuda",
+            "DirectX (DXVA2)": "dxva2",
+            "DirectX (D3D11VA)": "d3d11va",
+            "Intel (QSV)": "qsv",
+            "Apple (VideoToolbox)": "videotoolbox"
+        }
+        return mapping.get(mode, None)
 
     def _emit_playhead_pos(self, time_ms, source):
         if time_ms != self.last_emitted_pos:
@@ -224,6 +241,8 @@ class PlaybackManager(QObject):
             if video_clip_at_time:
                 try:
                     output_kwargs = {'format': 'rawvideo', 'pix_fmt': 'rgb24'}
+                    hwaccel = self._get_hwaccel_param()
+                    in_kwargs = {'hwaccel': hwaccel} if (hwaccel and video_clip_at_time.media_type != 'image') else {}
 
                     if video_clip_at_time.media_type == 'image':
                         video_node = ffmpeg.input(video_clip_at_time.source_path, loop=1, framerate=fps)
@@ -233,10 +252,10 @@ class PlaybackManager(QObject):
                         clip_end_sec = (video_clip_at_time.clip_start_ms + video_clip_at_time.duration_ms) / 1000.0
                         seek_sec = max(clip_start_sec, clip_end_sec - 0.3)
                         dur_sec = max(0.04, clip_end_sec - seek_sec)
-                        video_node = ffmpeg.input(video_clip_at_time.source_path, ss=f"{seek_sec:.6f}", t=f"{dur_sec:.6f}")
+                        video_node = ffmpeg.input(video_clip_at_time.source_path, ss=f"{seek_sec:.6f}", t=f"{dur_sec:.6f}", **in_kwargs)
                     else:
                         video_seek_sec = max(0.0, (seek_time_ms - video_clip_at_time.timeline_start_ms + video_clip_at_time.clip_start_ms) / 1000.0)
-                        video_node = ffmpeg.input(video_clip_at_time.source_path, ss=f"{video_seek_sec:.6f}")
+                        video_node = ffmpeg.input(video_clip_at_time.source_path, ss=f"{video_seek_sec:.6f}", **in_kwargs)
                         output_kwargs['vframes'] = 1
 
                     final_node = video_node.video
@@ -331,6 +350,8 @@ class PlaybackManager(QObject):
 
         concat_inputs = []
         last_end_time_ms = start_ms
+        hwaccel = self._get_hwaccel_param()
+
         for segment_clip in visible_segments:
             clip_read_start_ms = segment_clip.clip_start_ms
             clip_duration_ms = segment_clip.duration_ms
@@ -339,7 +360,11 @@ class PlaybackManager(QObject):
                 last_end_time_ms = max(last_end_time_ms, segment_clip.timeline_end_ms)
                 continue
 
-            input_stream = ffmpeg.input(segment_clip.source_path, ss=clip_read_start_ms / 1000.0, t=clip_duration_ms / 1000.0, re=None)
+            in_kwargs = {'re': None}
+            if hwaccel and segment_clip.media_type != 'image':
+                in_kwargs['hwaccel'] = hwaccel
+
+            input_stream = ffmpeg.input(segment_clip.source_path, ss=clip_read_start_ms / 1000.0, t=clip_duration_ms / 1000.0, **in_kwargs)
 
             segment_node = input_stream.video
             if segment_clip.media_type == 'image':

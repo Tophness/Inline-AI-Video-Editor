@@ -35,19 +35,28 @@ from encoding import Encoder
 CONTAINER_PRESETS = {
     'mp4': {
         'vcodec': 'libx264', 'acodec': 'aac', 
-        'allowed_vcodecs': ['libx264', 'libx265', 'mpeg4', 'copy'],
+        'allowed_vcodecs': [
+            'libx264', 'libx265', 'h264_nvenc', 'hevc_nvenc', 'h264_qsv', 'hevc_qsv',
+            'h264_amf', 'hevc_amf', 'h264_videotoolbox', 'hevc_videotoolbox', 'mpeg4', 'copy'
+        ],
         'allowed_acodecs': ['aac', 'libmp3lame', 'copy'],
         'v_bitrate': '5M', 'a_bitrate': '192k'
     },
     'matroska': {
         'vcodec': 'libx264', 'acodec': 'aac',
-        'allowed_vcodecs': ['libx264', 'libx265', 'libvpx-vp9', 'copy'],
+        'allowed_vcodecs': [
+            'libx264', 'libx265', 'h264_nvenc', 'hevc_nvenc', 'h264_qsv', 'hevc_qsv',
+            'h264_amf', 'hevc_amf', 'h264_videotoolbox', 'hevc_videotoolbox', 'libvpx-vp9', 'copy'
+        ],
         'allowed_acodecs': ['aac', 'libopus', 'libvorbis', 'flac', 'copy'],
         'v_bitrate': '5M', 'a_bitrate': '192k'
     },
     'mov': {
         'vcodec': 'libx264', 'acodec': 'aac',
-        'allowed_vcodecs': ['libx264', 'prores_ks', 'mpeg4', 'copy'],
+        'allowed_vcodecs': [
+            'libx264', 'libx265', 'h264_nvenc', 'hevc_nvenc', 'h264_videotoolbox',
+            'hevc_videotoolbox', 'prores_ks', 'mpeg4', 'copy'
+        ],
         'allowed_acodecs': ['aac', 'pcm_s16le', 'copy'],
         'v_bitrate': '8M', 'a_bitrate': '256k'
     },
@@ -3201,6 +3210,41 @@ class SettingsDialog(QDialog):
         temp_dir_group.setLayout(temp_dir_layout)
         layout.addWidget(temp_dir_group)
 
+        hw_group = QGroupBox("Hardware Acceleration")
+        hw_layout = QFormLayout()
+
+        self.playback_hwaccel_combo = QComboBox()
+        self.playback_hwaccel_combo.addItems([
+            "CPU (Software)",
+            "GPU (Auto)",
+            "NVIDIA (CUDA)",
+            "DirectX (DXVA2)",
+            "DirectX (D3D11VA)",
+            "Intel (QSV)",
+            "Apple (VideoToolbox)"
+        ])
+        curr_pb_hw = parent_settings.get("playback_hwaccel", "CPU (Software)")
+        idx = self.playback_hwaccel_combo.findText(curr_pb_hw)
+        if idx != -1: self.playback_hwaccel_combo.setCurrentIndex(idx)
+        hw_layout.addRow("Playback Acceleration:", self.playback_hwaccel_combo)
+
+        self.encoding_hwaccel_combo = QComboBox()
+        self.encoding_hwaccel_combo.addItems([
+            "CPU (Software)",
+            "GPU (Auto / Best Available)",
+            "NVIDIA (NVENC)",
+            "Intel (QSV)",
+            "AMD (AMF)",
+            "Apple (VideoToolbox)"
+        ])
+        curr_enc_hw = parent_settings.get("encoding_hwaccel", "CPU (Software)")
+        idx = self.encoding_hwaccel_combo.findText(curr_enc_hw)
+        if idx != -1: self.encoding_hwaccel_combo.setCurrentIndex(idx)
+        hw_layout.addRow("Encoding Acceleration:", self.encoding_hwaccel_combo)
+
+        hw_group.setLayout(hw_layout)
+        layout.addWidget(hw_group)
+
         stream_copy_group = QGroupBox("Direct Stream Copy Multi-Clip Mode")
         stream_copy_layout = QFormLayout()
         self.stream_copy_mode_combo = QComboBox()
@@ -3253,6 +3297,8 @@ class SettingsDialog(QDialog):
             "start_maximized": self.start_maximized_checkbox.isChecked(),
             "default_export_path": self.default_export_path_edit.text(),
             "custom_temp_dir": self.temp_dir_edit.text().strip(),
+            "playback_hwaccel": self.playback_hwaccel_combo.currentText(),
+            "encoding_hwaccel": self.encoding_hwaccel_combo.currentText(),
             "stream_copy_mode": self.stream_copy_mode_combo.currentText(),
             "ts_reindex_method": self.ts_reindex_combo.currentText(),
             "ts_reindex_storage": self.reindex_storage_combo.currentText(),
@@ -4293,7 +4339,7 @@ class MainWindow(QMainWindow):
         self.pre_fullscreen_visibility = {}
         self._load_settings()
 
-        self.playback_manager = PlaybackManager(self._get_playback_data)
+        self.playback_manager = PlaybackManager(self._get_playback_data, settings=self.settings)
         self.encoder = Encoder()
 
         self.plugin_manager = PluginManager(self)
@@ -5265,6 +5311,8 @@ class MainWindow(QMainWindow):
             "start_maximized": True,
             "default_export_path": "",
             "custom_temp_dir": "",
+            "playback_hwaccel": "CPU (Software)",
+            "encoding_hwaccel": "CPU (Software)",
             "stream_copy_mode": "Direct In-Memory (No intermediate video files, faster)",
             "ts_reindex_method": "Direct Stream Copy (faster)",
             "ts_reindex_storage": "Automatic (Memory up to limit, then Temp File)",
@@ -5318,7 +5366,10 @@ class MainWindow(QMainWindow):
     def open_settings_dialog(self):
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.settings.update(dialog.get_settings()); self._save_settings(); self.status_label.setText("Settings updated.")
+            self.settings.update(dialog.get_settings())
+            self.playback_manager.set_settings(self.settings)
+            self._save_settings()
+            self.status_label.setText("Settings updated.")
 
     def new_project(self):
         self.playback_manager.stop()

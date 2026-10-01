@@ -7,6 +7,55 @@ import tempfile
 import uuid
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 
+_CACHED_ENCODERS = None
+
+def get_supported_encoders():
+    global _CACHED_ENCODERS
+    if _CACHED_ENCODERS is not None:
+        return _CACHED_ENCODERS
+    try:
+        startupinfo = None
+        if hasattr(subprocess, 'STARTUPINFO'):
+            startupinfo = subprocess.STARTUPINFO()
+            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        res = subprocess.run(['ffmpeg', '-encoders'], capture_output=True, text=True, errors='ignore', startupinfo=startupinfo)
+        _CACHED_ENCODERS = set(re.findall(r'^\s*V\S*\s+(\S+)', res.stdout, re.MULTILINE))
+    except Exception:
+        _CACHED_ENCODERS = set()
+    return _CACHED_ENCODERS
+
+def _resolve_gpu_codec(target_codec, enc_hw_setting):
+    if not target_codec or target_codec == 'copy' or enc_hw_setting == 'CPU (Software)':
+        return target_codec
+
+    if target_codec not in ['libx264', 'libx265']:
+        return target_codec
+
+    available = get_supported_encoders()
+    mapping_264 = {
+        "NVIDIA (NVENC)": ['h264_nvenc'],
+        "Intel (QSV)": ['h264_qsv'],
+        "AMD (AMF)": ['h264_amf'],
+        "Apple (VideoToolbox)": ['h264_videotoolbox'],
+        "GPU (Auto / Best Available)": ['h264_nvenc', 'h264_qsv', 'h264_amf', 'h264_videotoolbox'],
+        "Auto (GPU / Best Available)": ['h264_nvenc', 'h264_qsv', 'h264_amf', 'h264_videotoolbox'],
+    }
+    mapping_265 = {
+        "NVIDIA (NVENC)": ['hevc_nvenc'],
+        "Intel (QSV)": ['hevc_qsv'],
+        "AMD (AMF)": ['hevc_amf'],
+        "Apple (VideoToolbox)": ['hevc_videotoolbox'],
+        "GPU (Auto / Best Available)": ['hevc_nvenc', 'hevc_qsv', 'hevc_amf', 'hevc_videotoolbox'],
+        "Auto (GPU / Best Available)": ['hevc_nvenc', 'hevc_qsv', 'hevc_amf', 'hevc_videotoolbox'],
+    }
+
+    candidates = mapping_264.get(enc_hw_setting, []) if target_codec == 'libx264' else mapping_265.get(enc_hw_setting, [])
+
+    for c in candidates:
+        if c in available:
+            return c
+    return target_codec
+
 class _ExportRunner(QObject):
     progress = pyqtSignal(int)
     finished = pyqtSignal(bool, str)
@@ -135,6 +184,23 @@ class Encoder(QObject):
 
             vcodec = export_settings.get('vcodec')
             acodec = export_settings.get('acodec')
+
+            enc_hw = app_settings.get("encoding_hwaccel", "CPU (Software)") if app_settings else "CPU (Software)"
+
+            hwaccel_dec = None
+            if enc_hw != "CPU (Software)":
+                if "NVIDIA" in enc_hw:
+                    hwaccel_dec = "cuda"
+                elif "Intel" in enc_hw:
+                    hwaccel_dec = "qsv"
+                elif "Apple" in enc_hw:
+                    hwaccel_dec = "videotoolbox"
+                else:
+                    hwaccel_dec = "auto"
+
+            if vcodec and vcodec != 'copy':
+                vcodec = _resolve_gpu_codec(vcodec, enc_hw)
+
             all_audio_clips = sorted(
                 [c for c in timeline.clips if c.track_type == 'audio' and c.track_index not in muted_a_tracks],
                 key=lambda c: c.timeline_start_ms
@@ -243,11 +309,12 @@ class Encoder(QObject):
                     clip_start_sec = single_v_clip.clip_start_ms / 1000.0
                     clip_dur_sec = single_v_clip.duration_ms / 1000.0
 
+                    dec_kwargs = {'hwaccel': hwaccel_dec} if (hwaccel_dec and single_v_clip.media_type != 'image') else {}
                     if single_v_clip.media_type == 'image':
                         clip_input = ffmpeg.input(single_v_clip.source_path, loop=1, framerate=fps)
                         v_layer = clip_input.video.filter('trim', duration=f"{clip_dur_sec:.6f}").filter('setpts', 'PTS-STARTPTS')
                     else:
-                        clip_input = ffmpeg.input(single_v_clip.source_path, ss=f"{clip_start_sec:.6f}", t=f"{clip_dur_sec:.6f}")
+                        clip_input = ffmpeg.input(single_v_clip.source_path, ss=f"{clip_start_sec:.6f}", t=f"{clip_dur_sec:.6f}", **dec_kwargs)
                         v_layer = clip_input.video.filter('setpts', 'PTS-STARTPTS')
 
                     crop = getattr(single_v_clip, 'effects', {}).get('crop')
@@ -267,11 +334,12 @@ class Encoder(QObject):
                         clip_start_sec = clip.clip_start_ms / 1000.0
                         clip_dur_sec = clip.duration_ms / 1000.0
 
+                        dec_kwargs = {'hwaccel': hwaccel_dec} if (hwaccel_dec and clip.media_type != 'image') else {}
                         if clip.media_type == 'image':
                             clip_input = ffmpeg.input(clip.source_path, loop=1, framerate=fps)
                             v_layer = clip_input.video.filter('trim', duration=f"{clip_dur_sec:.6f}").filter('setpts', 'PTS-STARTPTS')
                         else:
-                            clip_input = ffmpeg.input(clip.source_path, ss=f"{clip_start_sec:.6f}", t=f"{clip_dur_sec:.6f}")
+                            clip_input = ffmpeg.input(clip.source_path, ss=f"{clip_start_sec:.6f}", t=f"{clip_dur_sec:.6f}", **dec_kwargs)
                             v_layer = clip_input.video.filter('setpts', 'PTS-STARTPTS')
 
                         crop = getattr(clip, 'effects', {}).get('crop')
@@ -308,7 +376,18 @@ class Encoder(QObject):
                 output_args['pix_fmt'] = 'yuv420p'
 
                 if is_lossless:
-                    if vcodec == 'libx265':
+                    if 'nvenc' in vcodec:
+                        output_args['qp'] = '0'
+                        output_args['preset'] = 'p7'
+                    elif 'qsv' in vcodec:
+                        output_args['global_quality'] = '1'
+                    elif 'amf' in vcodec:
+                        output_args['rc'] = 'cqp'
+                        output_args['qp_i'] = '0'
+                        output_args['qp_p'] = '0'
+                    elif 'videotoolbox' in vcodec:
+                        output_args['q:v'] = '100'
+                    elif vcodec == 'libx265':
                         output_args['x265-params'] = 'qp=0'
                         output_args['preset'] = 'slow'
                     elif vcodec == 'libx264':
