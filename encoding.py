@@ -146,8 +146,26 @@ class Encoder(QObject):
 
             if vcodec == 'copy' and len(all_video_clips) > 1:
                 seg_files = []
+                last_end_ms = 0
+
                 for i, c in enumerate(all_video_clips):
-                    has_audio = (acodec == 'copy' and any(a for a in all_audio_clips if a.timeline_start_ms == c.timeline_start_ms))
+                    gap_ms = c.timeline_start_ms - last_end_ms
+                    if acodec == 'copy' and gap_ms > 40:
+                        silence_seg = os.path.join(tempfile.gettempdir(), f"ve_silence_{uuid.uuid4().hex}_{i}.mp4")
+                        silence_dur = gap_ms / 1000.0
+                        silence_cmd = [
+                            'ffmpeg', '-y', '-f', 'lavfi',
+                            '-i', f'color=c=black:s={w}x{h}:r={fps}:d={silence_dur:.6f}',
+                            '-f', 'lavfi',
+                            '-i', f'anullsrc=r={sample_rate}:cl={channel_layout}:d={silence_dur:.6f}',
+                            '-c:v', 'libx264', '-preset', 'ultrafast', '-c:a', 'aac', '-b:a', '192k',
+                            silence_seg
+                        ]
+                        prep_cmds.append(silence_cmd)
+                        temp_files.append(silence_seg)
+                        seg_files.append(silence_seg)
+
+                    has_audio = (acodec == 'copy' and any(a for a in all_audio_clips if abs(a.timeline_start_ms - c.timeline_start_ms) < 40))
                     cut_start = c.clip_start_ms / 1000.0
                     cut_dur = c.duration_ms / 1000.0
                     temp_seg = os.path.join(tempfile.gettempdir(), f"ve_concat_seg_{uuid.uuid4().hex}_{i}.mp4")
@@ -162,6 +180,7 @@ class Encoder(QObject):
                     prep_cmds.append(slice_cmd)
                     temp_files.append(temp_seg)
                     seg_files.append(temp_seg)
+                    last_end_ms = c.timeline_start_ms + c.duration_ms
 
                 list_path = os.path.join(tempfile.gettempdir(), f"ve_concat_list_{uuid.uuid4().hex}.txt")
                 with open(list_path, 'w', encoding='utf-8') as f:
@@ -169,13 +188,6 @@ class Encoder(QObject):
                         escaped = seg.replace("'", "'\\''")
                         f.write(f"file '{escaped}'\n")
                 temp_files.append(list_path)
-
-                concat_input = ffmpeg.input(list_path, f='concat', safe=0)
-                stream_args.append(concat_input.video)
-                output_args['vcodec'] = 'copy'
-                if acodec == 'copy':
-                    stream_args.append(concat_input.audio)
-                    output_args['acodec'] = 'copy'
 
             elif vcodec == 'copy' and acodec == 'copy' and len(all_video_clips) == 1 and len(all_audio_clips) == 1 and all_video_clips[0].source_path == all_audio_clips[0].source_path and not all_subtitle_clips:
                 single_v_clip = all_video_clips[0]
