@@ -431,7 +431,9 @@ class PlaybackManager(QObject):
                 clip_remaining_duration_ms = clip.timeline_end_ms - clip_play_start_ms
                 
                 if clip_remaining_duration_ms > 0:
-                    segment = ffmpeg.input(clip.source_path, ss=clip_read_start_ms/1000.0, t=clip_remaining_duration_ms/1000.0, re=None).audio
+                    dur_sec = clip_remaining_duration_ms / 1000.0
+                    segment = ffmpeg.input(clip.source_path, ss=clip_read_start_ms/1000.0, re=None).audio
+                    segment = segment.filter('apad').filter('atrim', start=0, duration=f"{dur_sec:.6f}").filter('asetpts', 'PTS-STARTPTS')
                     concat_inputs.append(segment)
                 
                 last_end_time_ms = clip.timeline_end_ms
