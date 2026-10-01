@@ -394,6 +394,7 @@ class PlaybackManager(QObject):
                 gap_duration_sec = (segment_clip.timeline_start_ms - gap_start_ms) / 1000.0
                 segment_node = segment_node.filter('tpad', start_duration=f'{gap_duration_sec:.6f}', color='black')
 
+            segment_node = segment_node.filter('setsar', '1')
             concat_inputs.append(segment_node)
             last_end_time_ms = segment_clip.timeline_end_ms
 
