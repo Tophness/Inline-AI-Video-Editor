@@ -92,19 +92,22 @@ class Encoder(QObject):
             output_args = {}
             stream_args = []
 
+            hidden_v_tracks = getattr(timeline, 'hidden_video_tracks', set())
+            muted_a_tracks = getattr(timeline, 'muted_audio_tracks', set())
+
             all_video_clips = sorted(
-                [c for c in timeline.clips if c.track_type == 'video' and c.media_type != 'subtitle'],
+                [c for c in timeline.clips if c.track_type == 'video' and c.media_type != 'subtitle' and c.track_index not in hidden_v_tracks],
                 key=lambda c: c.track_index
             )
 
             all_subtitle_clips = sorted(
-                [c for c in timeline.clips if c.media_type == 'subtitle'],
+                [c for c in timeline.clips if c.media_type == 'subtitle' and c.track_index not in hidden_v_tracks],
                 key=lambda c: c.track_index
             )
 
             vcodec = export_settings.get('vcodec')
             acodec = export_settings.get('acodec')
-            all_audio_clips = [c for c in timeline.clips if c.track_type == 'audio']
+            all_audio_clips = [c for c in timeline.clips if c.track_type == 'audio' and c.track_index not in muted_a_tracks]
 
             v_bitrate = export_settings.get('v_bitrate')
             is_lossless = (v_bitrate == "Lossless (QP 0 / CRF 1)")
@@ -124,6 +127,8 @@ class Encoder(QObject):
                 output_args['acodec'] = 'copy'
             elif vcodec == 'copy':
                 if len(all_video_clips) != 1 or all_subtitle_clips:
+                    if len(all_video_clips) == 0:
+                        raise ValueError("Direct Stream Copy (copy) for video cannot be used because all video tracks are hidden or empty. Please select an encoder codec or unhide a video track.")
                     raise ValueError("Direct Stream Copy (copy) for video cannot be used when there are multiple video clips or subtitles on the timeline. Please select a video codec such as libx265 or libx264.")
                 single_v_clip = all_video_clips[0]
                 crop = getattr(single_v_clip, 'effects', {}).get('crop')
@@ -219,19 +224,25 @@ class Encoder(QObject):
                 pass
             elif acodec == 'copy':
                 if len(all_audio_clips) != 1:
-                    raise ValueError("Direct Stream Copy (copy) for audio cannot be used when there are multiple audio clips or gaps on the timeline. Please select an audio codec such as aac or flac.")
-                single_a_clip = all_audio_clips[0]
-                cut_start_sec = single_a_clip.clip_start_ms / 1000.0
-                cut_dur_sec = single_a_clip.duration_ms / 1000.0
-                a_in = ffmpeg.input(single_a_clip.source_path, ss=f"{cut_start_sec:.6f}")
-                stream_args.append(a_in.audio)
-                output_args['acodec'] = 'copy'
-                if 't' not in output_args:
-                    output_args['t'] = f"{cut_dur_sec:.6f}"
-                output_args['avoid_negative_ts'] = 'make_zero'
+                    if len(all_audio_clips) == 0:
+                        output_args['an'] = None
+                    else:
+                        raise ValueError("Direct Stream Copy (copy) for audio cannot be used when there are multiple audio clips or gaps on the timeline. Please select an audio codec such as aac or flac.")
+                else:
+                    single_a_clip = all_audio_clips[0]
+                    cut_start_sec = single_a_clip.clip_start_ms / 1000.0
+                    cut_dur_sec = single_a_clip.duration_ms / 1000.0
+                    a_in = ffmpeg.input(single_a_clip.source_path, ss=f"{cut_start_sec:.6f}")
+                    stream_args.append(a_in.audio)
+                    output_args['acodec'] = 'copy'
+                    if 't' not in output_args:
+                        output_args['t'] = f"{cut_dur_sec:.6f}"
+                    output_args['avoid_negative_ts'] = 'make_zero'
             elif acodec:
                 track_audio_streams = []
                 for i in range(1, timeline.num_audio_tracks + 1):
+                    if i in muted_a_tracks:
+                        continue
                     track_clips = sorted([c for c in timeline.clips if c.track_type == 'audio' and c.track_index == i], key=lambda c: c.timeline_start_ms)
                     if not track_clips:
                         continue
@@ -279,7 +290,7 @@ class Encoder(QObject):
                 output_args['an'] = None
 
             if not stream_args:
-                raise ValueError("No streams to output. Check export settings.")
+                raise ValueError("No video or audio streams to export (all tracks may be hidden or muted).")
 
             if export_settings.get('avoid_negative_ts'):
                 output_args['avoid_negative_ts'] = 'make_zero'

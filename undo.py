@@ -31,7 +31,7 @@ class ProjectSnapshot:
     def __init__(self, clips, num_video_tracks, num_audio_tracks,
                  project_width, project_height, project_fps,
                  media_pool=None, media_properties=None, selected_clip_ids=None,
-                 selection_regions=None, hidden_video_tracks=None):
+                 selection_regions=None, hidden_video_tracks=None, muted_audio_tracks=None):
         self.clips = [c.clone() if hasattr(c, 'clone') else copy.deepcopy(c) for c in clips]
         self.num_video_tracks = int(num_video_tracks)
         self.num_audio_tracks = int(num_audio_tracks)
@@ -43,13 +43,14 @@ class ProjectSnapshot:
         self.selected_clip_ids = set(selected_clip_ids) if selected_clip_ids is not None else set()
         self.selection_regions = copy.deepcopy(selection_regions) if selection_regions is not None else []
         self.hidden_video_tracks = set(hidden_video_tracks) if hidden_video_tracks is not None else set()
+        self.muted_audio_tracks = set(muted_audio_tracks) if muted_audio_tracks is not None else set()
 
     def clone(self):
         return ProjectSnapshot(
             self.clips, self.num_video_tracks, self.num_audio_tracks,
             self.project_width, self.project_height, self.project_fps,
             self.media_pool, self.media_properties, self.selected_clip_ids,
-            self.selection_regions, self.hidden_video_tracks
+            self.selection_regions, self.hidden_video_tracks, self.muted_audio_tracks
         )
 
     def __getitem__(self, idx):
@@ -68,6 +69,7 @@ class ProjectSnapshot:
             abs(self.project_fps - other.project_fps) > 1e-5 or
             self.media_pool != other.media_pool or
             self.hidden_video_tracks != getattr(other, 'hidden_video_tracks', set()) or
+            self.muted_audio_tracks != getattr(other, 'muted_audio_tracks', set()) or
             len(self.clips) != len(other.clips)):
             return False
         for c1, c2 in zip(self.clips, other.clips):

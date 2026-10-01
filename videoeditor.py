@@ -555,6 +555,7 @@ class Timeline:
         self.num_video_tracks = 1
         self.num_audio_tracks = 1
         self.hidden_video_tracks = set()
+        self.muted_audio_tracks = set()
 
     def add_clip(self, clip):
         self.clips.append(clip)
@@ -967,14 +968,6 @@ class CropOverlayWidget(QWidget):
         sh = vh * scale_y
         return QRectF(sx, sy, sw, sh)
 
-    def _screen_to_video(self, sx, sy):
-        d_rect = self._get_video_display_rect()
-        scale_x = float(self.video_width) / max(1.0, d_rect.width())
-        scale_y = float(self.video_height) / max(1.0, d_rect.height())
-        vx = (sx - d_rect.left()) * scale_x
-        vy = (sy - d_rect.top()) * scale_y
-        return vx, vy
-
     def _get_handles(self, rect):
         hs = self.HANDLE_SIZE
         ehs = self.EDGE_HANDLE_SIZE
@@ -1165,9 +1158,15 @@ class CropOverlayWidget(QWidget):
         self.control_bar.set_values(self.crop_x, self.crop_y, self.crop_w, self.crop_h)
         self.update()
 
-def _draw_eye_icon(painter, rect, is_visible):
+def _draw_eye_icon(painter, rect, is_visible, is_hovered=False):
     painter.save()
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    
+    if is_hovered:
+        painter.setPen(QPen(QColor(180, 200, 240, 160), 1))
+        painter.setBrush(QColor(255, 255, 255, 35))
+        painter.drawRoundedRect(QRectF(rect).adjusted(-2, -2, 2, 2), 4, 4)
+
     cx = rect.center().x()
     cy = rect.center().y()
     w = rect.width() - 4
@@ -1179,29 +1178,70 @@ def _draw_eye_icon(painter, rect, is_visible):
     path.quadTo(cx, cy + h/1.2, cx - w/2, cy)
     
     if is_visible:
-        painter.setPen(QPen(QColor(220, 220, 220), 1.4))
-        painter.setBrush(QColor(50, 50, 50, 200))
+        painter.setPen(QPen(QColor(245, 245, 245) if is_hovered else QColor(220, 220, 220), 1.4))
+        painter.setBrush(QColor(60, 60, 60, 220) if is_hovered else QColor(50, 50, 50, 200))
         painter.drawPath(path)
         
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(70, 160, 240))
+        painter.setBrush(QColor(90, 180, 255) if is_hovered else QColor(70, 160, 240))
         painter.drawEllipse(QPointF(cx, cy), 3.2, 3.2)
         painter.setBrush(QColor(20, 20, 20))
         painter.drawEllipse(QPointF(cx, cy), 1.5, 1.5)
     else:
-        painter.setPen(QPen(QColor(110, 110, 110), 1.2))
-        painter.setBrush(QColor(35, 35, 35, 160))
+        painter.setPen(QPen(QColor(140, 140, 140) if is_hovered else QColor(110, 110, 110), 1.2))
+        painter.setBrush(QColor(45, 45, 45, 180) if is_hovered else QColor(35, 35, 35, 160))
         painter.drawPath(path)
         
-        painter.setPen(QPen(QColor(220, 70, 70), 1.8))
+        painter.setPen(QPen(QColor(230, 80, 80) if is_hovered else QColor(220, 70, 70), 1.8))
         painter.drawLine(QPointF(cx - w/2 + 1, cy + h/2 - 1), QPointF(cx + w/2 - 1, cy - h/2 + 1))
         
+    painter.restore()
+
+def _draw_speaker_icon(painter, rect, is_unmuted, is_hovered=False):
+    painter.save()
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    
+    if is_hovered:
+        painter.setPen(QPen(QColor(180, 200, 240, 160), 1))
+        painter.setBrush(QColor(255, 255, 255, 35))
+        painter.drawRoundedRect(QRectF(rect).adjusted(-2, -2, 2, 2), 4, 4)
+
+    cx = rect.center().x()
+    cy = rect.center().y()
+
+    cone_path = QPainterPath()
+    cone_path.moveTo(cx - 6, cy - 3)
+    cone_path.lineTo(cx - 3, cy - 3)
+    cone_path.lineTo(cx + 1, cy - 7)
+    cone_path.lineTo(cx + 1, cy + 7)
+    cone_path.lineTo(cx - 3, cy + 3)
+    cone_path.lineTo(cx - 6, cy + 3)
+    cone_path.closeSubpath()
+
+    if is_unmuted:
+        painter.setPen(QPen(QColor(240, 240, 240) if is_hovered else QColor(210, 210, 210), 1.2))
+        painter.setBrush(QColor(60, 170, 180) if is_hovered else QColor(40, 135, 145))
+        painter.drawPath(cone_path)
+
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(210, 245, 255) if is_hovered else QColor(170, 225, 245), 1.4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawArc(QRectF(cx - 1, cy - 4, 6, 8), -50 * 16, 100 * 16)
+        painter.drawArc(QRectF(cx + 1, cy - 7, 7, 14), -55 * 16, 110 * 16)
+    else:
+        painter.setPen(QPen(QColor(130, 130, 130), 1.2))
+        painter.setBrush(QColor(50, 50, 50))
+        painter.drawPath(cone_path)
+
+        painter.setPen(QPen(QColor(230, 80, 80) if is_hovered else QColor(220, 70, 70), 1.8, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(QPointF(cx - 6, cy + 6), QPointF(cx + 7, cy - 6))
+
     painter.restore()
 
 class TimelineWidget(QWidget):
     TIMESCALE_HEIGHT = 30
     HEADER_WIDTH = 120
-    TRACK_HEIGHT = 50
+    TRACK_HEIGHT = 100
+    ADD_TRACK_HEIGHT = 26
     AUDIO_TRACKS_SEPARATOR_Y = 15
     RESIZE_HANDLE_WIDTH = 8
     SNAP_THRESHOLD_PIXELS = 8
@@ -1242,7 +1282,7 @@ class TimelineWidget(QWidget):
         self.keyframe_cache = KeyframeCache()
         self.keyframe_cache.keyframes_ready.connect(lambda _: self.update())
 
-        self.setMinimumHeight(300)
+        self.setMinimumHeight(350)
         self.setMouseTracking(True)
         self.setAcceptDrops(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -1271,11 +1311,16 @@ class TimelineWidget(QWidget):
         self.highlighted_ghost_track_info = None
         self.highlighted_tracks = []
         self.hovered_clip_id = None
+        self.hovered_add_btn = None
+        self.hovered_video_eye_track = None
+        self.hovered_audio_mute_track = None
+
         self.add_video_track_btn_rect = QRect()
         self.remove_video_track_btn_rect = QRect()
         self.add_audio_track_btn_rect = QRect()
         self.remove_audio_track_btn_rect = QRect()
         self.video_track_eye_rects = {}
+        self.audio_track_mute_rects = {}
         
         self.video_tracks_y_start = 0
         self.audio_tracks_y_start = 0
@@ -1293,7 +1338,7 @@ class TimelineWidget(QWidget):
 
     def set_project_fps(self, fps):
         self.project_fps = fps if fps > 0 else 25.0
-        self.max_pixels_per_ms = (self.project_fps * 20) / 1000.0
+        self.max_pixels_per_ms = (self.project_fps * 1000.0) / 1000.0
         self.pixels_per_ms = min(self.pixels_per_ms, self.max_pixels_per_ms)
         self.update()
 
@@ -1345,26 +1390,31 @@ class TimelineWidget(QWidget):
             self.setMinimumHeight(total_height)
 
     def calculate_total_height(self):
-        video_tracks_height = (self.timeline.num_video_tracks + 1) * self.TRACK_HEIGHT
-        audio_tracks_height = (self.timeline.num_audio_tracks + 1) * self.TRACK_HEIGHT
-        return self.TIMESCALE_HEIGHT + video_tracks_height + self.AUDIO_TRACKS_SEPARATOR_Y + audio_tracks_height + 20
+        video_tracks_height = self.timeline.num_video_tracks * self.TRACK_HEIGHT
+        audio_tracks_height = self.timeline.num_audio_tracks * self.TRACK_HEIGHT
+        add_buttons_height = 2 * self.ADD_TRACK_HEIGHT
+        return self.TIMESCALE_HEIGHT + add_buttons_height + video_tracks_height + self.AUDIO_TRACKS_SEPARATOR_Y + audio_tracks_height + 20
 
     def draw_headers(self, painter):
         painter.save()
         painter.setPen(QColor("#AAA"))
         header_font = QFont("Arial", 9, QFont.Weight.Bold)
-        button_font = QFont("Arial", 8)
+        button_font = QFont("Arial", 8, QFont.Weight.Bold)
 
         y_cursor = self.TIMESCALE_HEIGHT
         
-        rect = QRect(0, y_cursor, self.HEADER_WIDTH, self.TRACK_HEIGHT)
-        painter.fillRect(rect, QColor("#3a3a3a"))
-        painter.drawRect(rect)
-        self.add_video_track_btn_rect = QRect(rect.left() + 10, rect.top() + (rect.height() - 22)//2, self.HEADER_WIDTH - 20, 22)
+        self.add_video_track_btn_rect = QRect(0, y_cursor, self.HEADER_WIDTH, self.ADD_TRACK_HEIGHT)
+        is_v_hovered = (self.hovered_add_btn == 'video')
+        btn_bg = QColor("#4a6a4a") if is_v_hovered else QColor("#354635")
+        painter.fillRect(self.add_video_track_btn_rect, btn_bg)
+        painter.setPen(QPen(QColor("#6a9a6a") if is_v_hovered else QColor("#273327"), 1))
+        painter.drawRect(self.add_video_track_btn_rect)
         painter.setFont(button_font)
-        painter.fillRect(self.add_video_track_btn_rect, QColor("#454"))
-        painter.drawText(self.add_video_track_btn_rect, Qt.AlignmentFlag.AlignCenter, "Add Track (+)")
-        y_cursor += self.TRACK_HEIGHT
+        painter.setPen(QColor("#FFFFFF") if is_v_hovered else QColor("#D0D0D0"))
+        next_v_num = int(self.timeline.num_video_tracks + 1)
+        painter.drawText(self.add_video_track_btn_rect, Qt.AlignmentFlag.AlignCenter, f"Add Video {next_v_num}")
+        y_cursor += self.ADD_TRACK_HEIGHT
+
         self.video_tracks_y_start = y_cursor
 
         self.video_track_eye_rects.clear()
@@ -1379,7 +1429,8 @@ class TimelineWidget(QWidget):
 
             eye_rect = QRect(rect.left() + 6, rect.top() + (self.TRACK_HEIGHT - 22) // 2, 22, 22)
             self.video_track_eye_rects[track_number] = eye_rect
-            _draw_eye_icon(painter, eye_rect, not is_hidden)
+            is_eye_hovered = (self.hovered_video_eye_track == track_number)
+            _draw_eye_icon(painter, eye_rect, not is_hidden, is_hovered=is_eye_hovered)
 
             text_rect = QRect(rect.left() + 32, rect.top(), self.HEADER_WIDTH - 36, self.TRACK_HEIGHT)
             painter.setFont(header_font)
@@ -1387,7 +1438,7 @@ class TimelineWidget(QWidget):
             painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, f"Video {track_number}")
 
             if track_number == self.timeline.num_video_tracks and self.timeline.num_video_tracks > 1:
-                self.remove_video_track_btn_rect = QRect(rect.right() - 25, rect.top() + 5, 20, 20)
+                self.remove_video_track_btn_rect = QRect(rect.right() - 25, rect.top() + (self.TRACK_HEIGHT - 20) // 2, 20, 20)
                 painter.setFont(button_font)
                 painter.fillRect(self.remove_video_track_btn_rect, QColor("#833"))
                 painter.setPen(QColor("#FFF"))
@@ -1397,31 +1448,43 @@ class TimelineWidget(QWidget):
         y_cursor += self.AUDIO_TRACKS_SEPARATOR_Y
 
         self.audio_tracks_y_start = y_cursor
+        self.audio_track_mute_rects.clear()
         for i in range(int(self.timeline.num_audio_tracks)):
             track_number = i + 1
+            is_muted = track_number in getattr(self.timeline, 'muted_audio_tracks', set())
             rect = QRect(0, y_cursor, self.HEADER_WIDTH, self.TRACK_HEIGHT)
-            painter.fillRect(rect, QColor("#444"))
-            painter.setPen(QColor("#AAA"))
+            painter.fillRect(rect, QColor("#292929") if is_muted else QColor("#444"))
+            painter.setPen(QColor("#222") if is_muted else QColor("#AAA"))
             painter.drawRect(rect)
+
+            mute_rect = QRect(rect.left() + 6, rect.top() + (self.TRACK_HEIGHT - 22) // 2, 22, 22)
+            self.audio_track_mute_rects[track_number] = mute_rect
+            is_mute_hovered = (self.hovered_audio_mute_track == track_number)
+            _draw_speaker_icon(painter, mute_rect, not is_muted, is_hovered=is_mute_hovered)
+
+            text_rect = QRect(rect.left() + 32, rect.top(), self.HEADER_WIDTH - 36, self.TRACK_HEIGHT)
             painter.setFont(header_font)
-            painter.setPen(QColor("#FFF"))
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, f"Audio {track_number}")
+            painter.setPen(QColor("#777") if is_muted else QColor("#FFF"))
+            painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, f"Audio {track_number}")
 
             if track_number == self.timeline.num_audio_tracks and self.timeline.num_audio_tracks > 1:
-                self.remove_audio_track_btn_rect = QRect(rect.right() - 25, rect.top() + 5, 20, 20)
+                self.remove_audio_track_btn_rect = QRect(rect.right() - 25, rect.top() + (self.TRACK_HEIGHT - 20) // 2, 20, 20)
                 painter.setFont(button_font)
                 painter.fillRect(self.remove_audio_track_btn_rect, QColor("#833"))
+                painter.setPen(QColor("#FFF"))
                 painter.drawText(self.remove_audio_track_btn_rect, Qt.AlignmentFlag.AlignCenter, "-")
             y_cursor += self.TRACK_HEIGHT
         
-        rect = QRect(0, y_cursor, self.HEADER_WIDTH, self.TRACK_HEIGHT)
-        painter.fillRect(rect, QColor("#3a3a3a"))
-        painter.setPen(QColor("#AAA"))
-        painter.drawRect(rect)
-        self.add_audio_track_btn_rect = QRect(rect.left() + 10, rect.top() + (rect.height() - 22)//2, self.HEADER_WIDTH - 20, 22)
+        self.add_audio_track_btn_rect = QRect(0, y_cursor, self.HEADER_WIDTH, self.ADD_TRACK_HEIGHT)
+        is_a_hovered = (self.hovered_add_btn == 'audio')
+        btn_bg = QColor("#4a6a4a") if is_a_hovered else QColor("#354635")
+        painter.fillRect(self.add_audio_track_btn_rect, btn_bg)
+        painter.setPen(QPen(QColor("#6a9a6a") if is_a_hovered else QColor("#273327"), 1))
+        painter.drawRect(self.add_audio_track_btn_rect)
         painter.setFont(button_font)
-        painter.fillRect(self.add_audio_track_btn_rect, QColor("#454"))
-        painter.drawText(self.add_audio_track_btn_rect, Qt.AlignmentFlag.AlignCenter, "Add Track (+)")
+        painter.setPen(QColor("#FFFFFF") if is_a_hovered else QColor("#D0D0D0"))
+        next_a_num = int(self.timeline.num_audio_tracks + 1)
+        painter.drawText(self.add_audio_track_btn_rect, Qt.AlignmentFlag.AlignCenter, f"Add Audio {next_a_num}")
         
         painter.restore()
         
@@ -1498,21 +1561,29 @@ class TimelineWidget(QWidget):
             60000, 120000, 300000, 600000, 900000, 1800000,
             3600000, 2*3600000, 5*3600000, 10*3600000
         ]
-        
+        filtered_intervals = []
+        for iv in intervals_ms:
+            if iv >= frame_dur_ms - 1e-4:
+                if not filtered_intervals or iv > filtered_intervals[-1] + 1e-4:
+                    filtered_intervals.append(iv)
+        filtered_intervals.sort()
+
         min_pixel_dist = 70
-        major_interval = next((i for i in intervals_ms if i * self.pixels_per_ms > min_pixel_dist), intervals_ms[-1])
+        major_interval = next((i for i in filtered_intervals if i * self.pixels_per_ms > min_pixel_dist), filtered_intervals[0])
 
         minor_interval = 0
-        for divisor in [5, 4, 2]:
-            if (major_interval / divisor) * self.pixels_per_ms > 10:
-                minor_interval = major_interval / divisor
-                break
+        if major_interval > frame_dur_ms * 1.5:
+            for divisor in [5, 4, 2]:
+                candidate = major_interval / divisor
+                if candidate >= frame_dur_ms - 1e-4 and (candidate * self.pixels_per_ms > 10):
+                    minor_interval = candidate
+                    break
         
         start_ms = self.x_to_ms(self.HEADER_WIDTH)
         end_ms = self.x_to_ms(self.width())
 
         def draw_ticks(interval_ms, height):
-            if interval_ms < 1: return
+            if interval_ms < 1e-4: return
             start_tick_num = int(start_ms / interval_ms)
             end_tick_num = int(end_ms / interval_ms) + 1
             for i in range(start_tick_num, end_tick_num + 1):
@@ -1522,7 +1593,7 @@ class TimelineWidget(QWidget):
                 if x >= self.HEADER_WIDTH:
                     painter.drawLine(x, self.TIMESCALE_HEIGHT - height, x, self.TIMESCALE_HEIGHT)
         
-        if frame_dur_ms * self.pixels_per_ms > 4:
+        if major_interval > frame_dur_ms * 1.5 and frame_dur_ms * self.pixels_per_ms > 4:
             draw_ticks(frame_dur_ms, 3)
         if minor_interval > 0:
             draw_ticks(minor_interval, 6)
@@ -1568,16 +1639,27 @@ class TimelineWidget(QWidget):
 
     def get_clip_rect(self, clip):
         if clip.track_type == 'video':
-            visual_index = self.timeline.num_video_tracks - clip.track_index
-            y = self.video_tracks_y_start + visual_index * self.TRACK_HEIGHT
+            if clip.track_index > self.timeline.num_video_tracks:
+                lane_height = self.ADD_TRACK_HEIGHT
+                clip_height = max(14, lane_height - 4)
+                y = self.TIMESCALE_HEIGHT + (lane_height - clip_height) / 2
+            else:
+                visual_index = self.timeline.num_video_tracks - clip.track_index
+                clip_height = self.TRACK_HEIGHT - 8
+                y = self.video_tracks_y_start + visual_index * self.TRACK_HEIGHT + (self.TRACK_HEIGHT - clip_height) / 2
         else:
-            visual_index = clip.track_index - 1
-            y = self.audio_tracks_y_start + visual_index * self.TRACK_HEIGHT
+            if clip.track_index > self.timeline.num_audio_tracks:
+                lane_height = self.ADD_TRACK_HEIGHT
+                clip_height = max(14, lane_height - 4)
+                add_y = self.audio_tracks_y_start + int(self.timeline.num_audio_tracks) * self.TRACK_HEIGHT
+                y = add_y + (lane_height - clip_height) / 2
+            else:
+                visual_index = clip.track_index - 1
+                clip_height = self.TRACK_HEIGHT - 8
+                y = self.audio_tracks_y_start + visual_index * self.TRACK_HEIGHT + (self.TRACK_HEIGHT - clip_height) / 2
         
         x = self.ms_to_x(clip.timeline_start_ms)
         w = int(clip.duration_ms * self.pixels_per_ms)
-        clip_height = self.TRACK_HEIGHT - 10
-        y += (self.TRACK_HEIGHT - clip_height) / 2
         return QRectF(x, y, w, clip_height)
 
     def _draw_waveform(self, painter, clip, clip_rect):
@@ -1591,8 +1673,18 @@ class TimelineWidget(QWidget):
         if width_px <= 0:
             return
 
-        y_center = clip_rect.center().y()
-        max_amp = (clip_rect.height() - 6) * 0.45
+        if clip_rect.height() < 30:
+            wave_top = clip_rect.top() + 1.0
+            wave_height = clip_rect.height() - 2.0
+        else:
+            header_h = 22.0
+            wave_top = clip_rect.top() + header_h
+            wave_height = clip_rect.bottom() - wave_top - 2.0
+        if wave_height <= 4:
+            return
+
+        y_center = wave_top + wave_height / 2.0
+        max_amp = wave_height * 0.46
         bucket_duration_ms = 5.0
         
         lines = []
@@ -1629,13 +1721,23 @@ class TimelineWidget(QWidget):
 
         if lines:
             painter.save()
-            painter.setPen(QPen(QColor(160, 210, 255, 200), 1))
+            muted_a = getattr(self.timeline, 'muted_audio_tracks', set())
+            if clip.track_index in muted_a:
+                painter.setPen(QPen(QColor(120, 140, 160, 120), 1))
+            else:
+                painter.setPen(QPen(QColor(160, 210, 255, 200), 1))
             painter.drawLines(lines)
             painter.restore()
 
     def draw_tracks_and_clips(self, painter):
         painter.save()
         hidden_v_tracks = getattr(self.timeline, 'hidden_video_tracks', set())
+        muted_a_tracks = getattr(self.timeline, 'muted_audio_tracks', set())
+
+        v_add_lane = QRect(self.HEADER_WIDTH, self.TIMESCALE_HEIGHT, self.width() - self.HEADER_WIDTH, self.ADD_TRACK_HEIGHT)
+        painter.fillRect(v_add_lane, QColor("#262626"))
+        painter.setPen(QPen(QColor("#1e1e1e"), 1))
+        painter.drawLine(self.HEADER_WIDTH, self.TIMESCALE_HEIGHT + self.ADD_TRACK_HEIGHT - 1, self.width(), self.TIMESCALE_HEIGHT + self.ADD_TRACK_HEIGHT - 1)
 
         y_cursor = self.video_tracks_y_start
         for i in range(int(self.timeline.num_video_tracks)):
@@ -1650,9 +1752,20 @@ class TimelineWidget(QWidget):
 
         y_cursor = self.audio_tracks_y_start
         for i in range(int(self.timeline.num_audio_tracks)):
+            track_num = int(i + 1)
+            is_muted = track_num in muted_a_tracks
             rect = QRect(self.HEADER_WIDTH, y_cursor, self.width() - self.HEADER_WIDTH, self.TRACK_HEIGHT)
-            painter.fillRect(rect, QColor("#444") if i % 2 == 0 else QColor("#3c3c3c"))
+            if is_muted:
+                painter.fillRect(rect, QColor("#222222") if i % 2 == 0 else QColor("#1c1c1c"))
+            else:
+                painter.fillRect(rect, QColor("#444") if i % 2 == 0 else QColor("#3c3c3c"))
             y_cursor += self.TRACK_HEIGHT
+
+        a_add_y = self.audio_tracks_y_start + int(self.timeline.num_audio_tracks) * self.TRACK_HEIGHT
+        a_add_lane = QRect(self.HEADER_WIDTH, a_add_y, self.width() - self.HEADER_WIDTH, self.ADD_TRACK_HEIGHT)
+        painter.fillRect(a_add_lane, QColor("#262626"))
+        painter.setPen(QPen(QColor("#1e1e1e"), 1))
+        painter.drawLine(self.HEADER_WIDTH, a_add_y + self.ADD_TRACK_HEIGHT - 1, self.width(), a_add_y + self.ADD_TRACK_HEIGHT - 1)
 
         tracks_to_highlight = set(self.highlighted_tracks)
         if self.highlighted_track_info:
@@ -1662,21 +1775,24 @@ class TimelineWidget(QWidget):
 
         for track_type, track_index in tracks_to_highlight:
             y = -1
+            h = self.TRACK_HEIGHT
             if track_type == 'video':
                 if track_index > self.timeline.num_video_tracks:
                     y = self.TIMESCALE_HEIGHT
+                    h = self.ADD_TRACK_HEIGHT
                 else:
                     visual_index = int(self.timeline.num_video_tracks - track_index)
                     y = self.video_tracks_y_start + visual_index * self.TRACK_HEIGHT
             elif track_type == 'audio':
                 if track_index > self.timeline.num_audio_tracks:
                     y = self.audio_tracks_y_start + int(self.timeline.num_audio_tracks) * self.TRACK_HEIGHT
+                    h = self.ADD_TRACK_HEIGHT
                 else:
                     visual_index = int(track_index - 1)
                     y = self.audio_tracks_y_start + visual_index * self.TRACK_HEIGHT
 
             if y != -1:
-                highlight_rect = QRect(self.HEADER_WIDTH, int(y), self.width() - self.HEADER_WIDTH, self.TRACK_HEIGHT)
+                highlight_rect = QRect(self.HEADER_WIDTH, int(y), self.width() - self.HEADER_WIDTH, int(h))
                 painter.fillRect(highlight_rect, QColor(255, 255, 0, 40))
 
         hovered_group_id = None
@@ -1694,12 +1810,13 @@ class TimelineWidget(QWidget):
                 continue
 
             is_track_hidden = (clip.track_type == 'video' and clip.track_index in hidden_v_tracks)
+            is_track_muted = (clip.track_type == 'audio' and clip.track_index in muted_a_tracks)
             is_linked = any(c for c in self.timeline.clips if c.group_id == clip.group_id and c.id != clip.id)
             is_being_dragged = bool(self.dragging_clip and clip.id in self.drag_original_clip_states)
             is_selected = clip.id in self.selected_clips
             is_hovered = (clip.id == self.hovered_clip_id) or (is_linked and clip.group_id == hovered_group_id)
 
-            if is_track_hidden:
+            if is_track_hidden or is_track_muted:
                 c_top, c_bot = QColor("#3a3a3a"), QColor("#222222")
             elif clip.media_type == 'image':
                 c_top, c_bot = QColor("#3d784a"), QColor("#224e2d")
@@ -1717,7 +1834,7 @@ class TimelineWidget(QWidget):
                     c_top, c_bot = QColor("#3a7d9c"), QColor("#23546b")
 
             painter.save()
-            if is_track_hidden:
+            if is_track_hidden or is_track_muted:
                 painter.setOpacity(0.5)
 
             grad = QLinearGradient(clip_rect.topLeft(), clip_rect.bottomLeft())
@@ -1744,10 +1861,10 @@ class TimelineWidget(QWidget):
             if clip.track_type == 'audio':
                 self._draw_waveform(painter, clip, clip_rect)
 
-            header_h = min(16.0, clip_rect.height() - 4)
-            if clip_rect.width() > 14 and header_h > 8:
+            header_h = min(20.0, clip_rect.height() - 2)
+            if clip_rect.width() > 14 and clip_rect.height() > 12:
                 header_rect = QRectF(clip_rect.left() + 1, clip_rect.top() + 1, clip_rect.width() - 2, header_h)
-                painter.fillRect(header_rect, QColor(0, 0, 0, 75))
+                painter.fillRect(header_rect, QColor(0, 0, 0, 85))
 
             text_left_pad = clip_rect.left() + 6
             if is_linked:
@@ -1774,19 +1891,19 @@ class TimelineWidget(QWidget):
                     painter.restore()
 
             avail_text_w = clip_rect.width() - (text_left_pad - clip_rect.left()) - (26 if is_linked else 8)
-            if avail_text_w > 15 and header_h >= 10:
+            if avail_text_w > 15 and clip_rect.height() > 12:
                 raw_name = os.path.basename(getattr(clip, 'original_source_path', clip.source_path))
                 elided_title = fm.elidedText(raw_name, Qt.TextElideMode.ElideRight, int(avail_text_w))
                 painter.save()
                 painter.setFont(title_font)
-                painter.setPen(QColor(160, 160, 160) if is_track_hidden else QColor(230, 230, 230))
+                painter.setPen(QColor(160, 160, 160) if (is_track_hidden or is_track_muted) else QColor(230, 230, 230))
                 painter.drawText(QRectF(text_left_pad, clip_rect.top() + 1, avail_text_w, header_h),
                                  Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided_title)
                 painter.restore()
 
             if clip.track_type == 'video' and clip.media_type != 'subtitle' and clip_rect.width() > 35:
                 has_fx = bool(clip.effects)
-                fx_rect = QRectF(clip_rect.left() + 5, clip_rect.bottom() - 16, 24, 12)
+                fx_rect = QRectF(clip_rect.left() + 5, clip_rect.bottom() - 18, 26, 14)
                 painter.save()
                 btn_color = QColor("#2e7d32") if has_fx else QColor("#222222")
                 border_color = QColor("#4caf50") if has_fx else QColor("#666666")
@@ -1826,7 +1943,13 @@ class TimelineWidget(QWidget):
             painter.drawRect(selection_rect)
 
     def draw_playhead(self, painter):
-        playhead_x = self.ms_to_x(self.playhead_pos_ms)
+        frame_dur_ms = 1000.0 / self.project_fps if self.project_fps > 0 else 40.0
+        frame_num = round(self.playhead_pos_ms / frame_dur_ms)
+        exact_frame_ms = frame_num * frame_dur_ms
+        if abs(self.playhead_pos_ms - exact_frame_ms) < 1.0:
+            playhead_x = self.ms_to_x(exact_frame_ms)
+        else:
+            playhead_x = self.ms_to_x(self.playhead_pos_ms)
         painter.setPen(QPen(QColor("red"), 2))
         painter.drawLine(playhead_x, 0, playhead_x, self.height())
 
@@ -1847,8 +1970,8 @@ class TimelineWidget(QWidget):
             track_index = int(visual_index + 1)
             return ('audio', track_index)
 
-        add_audio_btn_y_start = self.audio_tracks_y_start + int(self.timeline.num_audio_tracks) * self.TRACK_HEIGHT
-        add_audio_btn_y_end = add_audio_btn_y_start + self.TRACK_HEIGHT
+        add_audio_btn_y_start = audio_tracks_end_y
+        add_audio_btn_y_end = add_audio_btn_y_start + self.ADD_TRACK_HEIGHT
         if add_audio_btn_y_start <= y < add_audio_btn_y_end:
             return ('audio', int(self.timeline.num_audio_tracks + 1))
             
@@ -1918,15 +2041,12 @@ class TimelineWidget(QWidget):
         if event.pos().x() < self.HEADER_WIDTH:
             for track_num, eye_rect in self.video_track_eye_rects.items():
                 if eye_rect.contains(event.pos()):
-                    hidden = getattr(self.timeline, 'hidden_video_tracks', set())
-                    if track_num in hidden:
-                        hidden.remove(track_num)
-                    else:
-                        hidden.add(track_num)
-                    self.timeline.hidden_video_tracks = hidden
-                    self.window().update_project_resolution_from_timeline()
-                    self.window().playback_manager.seek_to_frame(self.playhead_pos_ms)
-                    self.update()
+                    self.window().toggle_video_track_hidden(track_num)
+                    return
+
+            for track_num, mute_rect in self.audio_track_mute_rects.items():
+                if mute_rect.contains(event.pos()):
+                    self.window().toggle_audio_track_muted(track_num)
                     return
 
             if self.add_video_track_btn_rect.contains(event.pos()): self.add_track.emit('video')
@@ -1941,7 +2061,7 @@ class TimelineWidget(QWidget):
             for clip in reversed(self.timeline.clips):
                 if clip.track_type == 'video' and clip.media_type != 'subtitle':
                     clip_rect = self.get_clip_rect(clip)
-                    fx_btn_rect = QRectF(clip_rect.left() + 4, clip_rect.bottom() - 17, 24, 13)
+                    fx_btn_rect = QRectF(clip_rect.left() + 4, clip_rect.bottom() - 19, 28, 16)
                     if fx_btn_rect.contains(QPointF(event.pos())):
                         self.window().open_effects_dialog(clip)
                         return
@@ -2207,9 +2327,56 @@ class TimelineWidget(QWidget):
 
         if not self.dragging_clip and not self.dragging_playhead and not self.creating_selection_region:
             cursor_set = False
+
+            if event.pos().x() < self.HEADER_WIDTH:
+                new_hovered_add = None
+                new_hovered_eye = None
+                new_hovered_mute = None
+
+                if self.add_video_track_btn_rect.contains(event.pos()):
+                    new_hovered_add = 'video'
+                elif self.add_audio_track_btn_rect.contains(event.pos()):
+                    new_hovered_add = 'audio'
+
+                for track_num, eye_rect in self.video_track_eye_rects.items():
+                    if eye_rect.contains(event.pos()):
+                        new_hovered_eye = track_num
+                        break
+
+                for track_num, mute_rect in self.audio_track_mute_rects.items():
+                    if mute_rect.contains(event.pos()):
+                        new_hovered_mute = track_num
+                        break
+
+                changed = (
+                    self.hovered_add_btn != new_hovered_add or
+                    self.hovered_video_eye_track != new_hovered_eye or
+                    self.hovered_audio_mute_track != new_hovered_mute
+                )
+                self.hovered_add_btn = new_hovered_add
+                self.hovered_video_eye_track = new_hovered_eye
+                self.hovered_audio_mute_track = new_hovered_mute
+
+                if new_hovered_add or new_hovered_eye or new_hovered_mute or \
+                   self.remove_video_track_btn_rect.contains(event.pos()) or \
+                   self.remove_audio_track_btn_rect.contains(event.pos()):
+                    self.setCursor(Qt.CursorShape.PointingHandCursor)
+                    cursor_set = True
+                else:
+                    self.unsetCursor()
+
+                if changed:
+                    self.update()
+            else:
+                if self.hovered_add_btn or self.hovered_video_eye_track or self.hovered_audio_mute_track:
+                    self.hovered_add_btn = None
+                    self.hovered_video_eye_track = None
+                    self.hovered_audio_mute_track = None
+                    self.update()
+
             playhead_x = self.ms_to_x(self.playhead_pos_ms)
             is_in_track_area = event.pos().y() > self.TIMESCALE_HEIGHT and event.pos().x() > self.HEADER_WIDTH
-            if is_in_track_area and abs(event.pos().x() - playhead_x) < self.SNAP_THRESHOLD_PIXELS:
+            if not cursor_set and is_in_track_area and abs(event.pos().x() - playhead_x) < self.SNAP_THRESHOLD_PIXELS:
                 self.setCursor(Qt.CursorShape.SizeHorCursor)
                 cursor_set = True
             
@@ -2222,7 +2389,7 @@ class TimelineWidget(QWidget):
                         self.setCursor(Qt.CursorShape.SizeHorCursor)
                         cursor_set = True
                         break
-            if not cursor_set:
+            if not cursor_set and is_in_track_area:
                 for clip in self.timeline.clips:
                     clip_rect = self.get_clip_rect(clip)
                     if (abs(event.pos().x() - clip_rect.left()) < self.RESIZE_HANDLE_WIDTH and clip_rect.contains(QPointF(clip_rect.left(), event.pos().y()))) or \
@@ -2234,10 +2401,11 @@ class TimelineWidget(QWidget):
                 self.unsetCursor()
 
             hovered_clip = None
-            for clip in reversed(self.timeline.clips):
-                if self.get_clip_rect(clip).contains(QPointF(event.pos())):
-                    hovered_clip = clip
-                    break
+            if is_in_track_area:
+                for clip in reversed(self.timeline.clips):
+                    if self.get_clip_rect(clip).contains(QPointF(event.pos())):
+                        hovered_clip = clip
+                        break
 
             new_hovered_id = hovered_clip.id if hovered_clip else None
             if self.hovered_clip_id != new_hovered_id:
@@ -2255,6 +2423,16 @@ class TimelineWidget(QWidget):
                     tip += f"\nEffects: {', '.join(fx_names)}"
                 clip_rect = self.get_clip_rect(hovered_clip).toRect()
                 QToolTip.showText(event.globalPosition().toPoint(), tip, self, clip_rect)
+            elif self.hovered_video_eye_track:
+                t_num = self.hovered_video_eye_track
+                is_hid = t_num in getattr(self.timeline, 'hidden_video_tracks', set())
+                tip = f"Video Track {t_num}: {'Hidden (Click to Unhide)' if is_hid else 'Visible (Click to Hide)'}"
+                QToolTip.showText(event.globalPosition().toPoint(), tip, self)
+            elif self.hovered_audio_mute_track:
+                t_num = self.hovered_audio_mute_track
+                is_mut = t_num in getattr(self.timeline, 'muted_audio_tracks', set())
+                tip = f"Audio Track {t_num}: {'Muted (Click to Unmute)' if is_mut else 'Audible (Click to Mute)'}"
+                QToolTip.showText(event.globalPosition().toPoint(), tip, self)
             else:
                 QToolTip.hideText()
 
@@ -2518,8 +2696,11 @@ class TimelineWidget(QWidget):
 
     def leaveEvent(self, event):
         QToolTip.hideText()
-        if self.hovered_clip_id is not None:
+        if self.hovered_clip_id is not None or self.hovered_add_btn or self.hovered_video_eye_track or self.hovered_audio_mute_track:
             self.hovered_clip_id = None
+            self.hovered_add_btn = None
+            self.hovered_video_eye_track = None
+            self.hovered_audio_mute_track = None
             self.update()
         super().leaveEvent(event)
 
@@ -2624,19 +2805,25 @@ class TimelineWidget(QWidget):
 
             if media_type in ['video', 'image', 'subtitle']:
                 if track_type == 'video':
-                    visual_index = self.timeline.num_video_tracks - track_index
-                    video_y = self.video_tracks_y_start + visual_index * self.TRACK_HEIGHT
+                    if track_index > self.timeline.num_video_tracks:
+                        video_y = self.TIMESCALE_HEIGHT
+                    else:
+                        visual_index = self.timeline.num_video_tracks - track_index
+                        video_y = self.video_tracks_y_start + visual_index * self.TRACK_HEIGHT
                     if has_audio:
-                        audio_y = self.audio_tracks_y_start + (track_index - 1) * self.TRACK_HEIGHT
+                        audio_y = self.audio_tracks_y_start + (min(track_index, self.timeline.num_audio_tracks) - 1) * self.TRACK_HEIGHT
                 elif track_type == 'audio' and has_audio:
                     visual_index = track_index - 1
                     audio_y = self.audio_tracks_y_start + visual_index * self.TRACK_HEIGHT
-                    video_y = self.video_tracks_y_start + (self.timeline.num_video_tracks - track_index) * self.TRACK_HEIGHT
+                    video_y = self.video_tracks_y_start + (self.timeline.num_video_tracks - min(track_index, self.timeline.num_video_tracks)) * self.TRACK_HEIGHT
             
             elif media_type == 'audio':
                 if track_type == 'audio':
-                    visual_index = track_index - 1
-                    audio_y = self.audio_tracks_y_start + visual_index * self.TRACK_HEIGHT
+                    if track_index > self.timeline.num_audio_tracks:
+                        audio_y = self.audio_tracks_y_start + self.timeline.num_audio_tracks * self.TRACK_HEIGHT
+                    else:
+                        visual_index = track_index - 1
+                        audio_y = self.audio_tracks_y_start + visual_index * self.TRACK_HEIGHT
 
             if video_y != -1:
                 self.drag_over_rect = QRectF(x, video_y, width, self.TRACK_HEIGHT)
@@ -3643,7 +3830,7 @@ class ProjectMediaWidget(QWidget):
         self.main_window = parent
         self.setAcceptDrops(True)
         
-        self.sort_column = 0 # 0=File, 1=Path, 2=Date Modified
+        self.sort_column = 0
         self.sort_ascending = True
 
         self.thumbnail_cache = ThumbnailCache()
@@ -3954,7 +4141,8 @@ class MainWindow(QMainWindow):
             media_properties=self.media_properties,
             selected_clip_ids=self.timeline_widget.selected_clips,
             selection_regions=self.timeline_widget.selection_regions,
-            hidden_video_tracks=getattr(self.timeline, 'hidden_video_tracks', set())
+            hidden_video_tracks=getattr(self.timeline, 'hidden_video_tracks', set()),
+            muted_audio_tracks=getattr(self.timeline, 'muted_audio_tracks', set())
         )
 
     def _restore_snapshot(self, snapshot):
@@ -3968,6 +4156,7 @@ class MainWindow(QMainWindow):
         self.timeline.num_video_tracks = int(snapshot.num_video_tracks)
         self.timeline.num_audio_tracks = int(snapshot.num_audio_tracks)
         self.timeline.hidden_video_tracks = set(getattr(snapshot, 'hidden_video_tracks', set()))
+        self.timeline.muted_audio_tracks = set(getattr(snapshot, 'muted_audio_tracks', set()))
 
         self.project_width = int(snapshot.project_width)
         self.project_height = int(snapshot.project_height)
@@ -4351,6 +4540,9 @@ class MainWindow(QMainWindow):
         self.timeline.num_video_tracks = int(self.timeline.num_video_tracks)
         self.timeline.num_audio_tracks = int(self.timeline.num_audio_tracks)
 
+        self.timeline.hidden_video_tracks = {t for t in self.timeline.hidden_video_tracks if t <= self.timeline.num_video_tracks}
+        self.timeline.muted_audio_tracks = {t for t in self.timeline.muted_audio_tracks if t <= self.timeline.num_audio_tracks}
+
         if pruned_something:
             self.timeline_widget.update()
 
@@ -4369,6 +4561,41 @@ class MainWindow(QMainWindow):
             elif track_type == 'audio' and self.timeline.num_audio_tracks > 1:
                 self.timeline.num_audio_tracks -= 1
         self._perform_complex_timeline_change(f"Remove {track_type.capitalize()} Track", action)
+
+    def toggle_video_track_hidden(self, track_num):
+        is_hidden = track_num in getattr(self.timeline, 'hidden_video_tracks', set())
+        desc = f"Unhide Video Track {track_num}" if is_hidden else f"Hide Video Track {track_num}"
+        def action():
+            hidden = getattr(self.timeline, 'hidden_video_tracks', set())
+            if track_num in hidden:
+                hidden.remove(track_num)
+            else:
+                hidden.add(track_num)
+            self.timeline.hidden_video_tracks = hidden
+            self.update_project_resolution_from_timeline()
+
+        self._perform_complex_timeline_change(desc, action)
+        self.playback_manager.seek_to_frame(self.timeline_widget.playhead_pos_ms)
+        self.timeline_widget.update()
+
+    def toggle_audio_track_muted(self, track_num):
+        is_muted = track_num in getattr(self.timeline, 'muted_audio_tracks', set())
+        desc = f"Unmute Audio Track {track_num}" if is_muted else f"Mute Audio Track {track_num}"
+        def action():
+            muted = getattr(self.timeline, 'muted_audio_tracks', set())
+            if track_num in muted:
+                muted.remove(track_num)
+            else:
+                muted.add(track_num)
+            self.timeline.muted_audio_tracks = muted
+
+        self._perform_complex_timeline_change(desc, action)
+        if self.playback_manager.is_playing:
+            cur = self.timeline_widget.playhead_pos_ms
+            self.playback_manager.play(cur)
+        else:
+            self.playback_manager.seek_to_frame(self.timeline_widget.playhead_pos_ms)
+        self.timeline_widget.update()
 
     def on_dock_visibility_changed(self, action, visible):
         if self.isMinimized():
@@ -4620,7 +4847,8 @@ class MainWindow(QMainWindow):
             return None
 
     def update_project_resolution_from_timeline(self):
-        video_clips = [c for c in self.timeline.clips if c.track_type == 'video' and c.media_type != 'subtitle']
+        hidden_v = getattr(self.timeline, 'hidden_video_tracks', set())
+        video_clips = [c for c in self.timeline.clips if c.track_type == 'video' and c.track_index not in hidden_v and c.media_type != 'subtitle']
         if not video_clips:
             return
 
@@ -4759,8 +4987,15 @@ class MainWindow(QMainWindow):
         if not self.timeline.clips: return
         self.playback_manager.pause()
         frame_duration_ms = 1000.0 / self.project_fps
-        new_time = self.timeline_widget.playhead_pos_ms + (direction * frame_duration_ms)
-        final_time = int(max(0, min(new_time, self.timeline.get_total_duration())))
+        cur_frame = round(self.timeline_widget.playhead_pos_ms / frame_duration_ms)
+        new_frame = max(0, cur_frame + direction)
+        
+        target_ms = new_frame * frame_duration_ms
+        tot_dur = self.timeline.get_total_duration()
+        if tot_dur > 0 and target_ms > tot_dur:
+            target_ms = float(tot_dur)
+            
+        final_time = int(target_ms)
         self.playback_manager.seek_to_frame(final_time)
 
     def snap_playhead(self, direction):
@@ -4870,6 +5105,7 @@ class MainWindow(QMainWindow):
         self.temp_session_files.clear()
         self.timeline.clips.clear(); self.timeline.num_video_tracks = 1; self.timeline.num_audio_tracks = 1
         self.timeline.hidden_video_tracks = set()
+        self.timeline.muted_audio_tracks = set()
         self.media_pool.clear(); self.media_properties.clear(); self.project_media_widget.clear_list()
         self.current_project_path = None
         self.last_export_path = None
@@ -4906,7 +5142,8 @@ class MainWindow(QMainWindow):
                 "project_width": self.project_width,
                 "project_height": self.project_height,
                 "project_fps": self.project_fps,
-                "hidden_video_tracks": list(getattr(self.timeline, 'hidden_video_tracks', []))
+                "hidden_video_tracks": list(getattr(self.timeline, 'hidden_video_tracks', [])),
+                "muted_audio_tracks": list(getattr(self.timeline, 'muted_audio_tracks', []))
             }
         }
         try:
@@ -4939,6 +5176,7 @@ class MainWindow(QMainWindow):
             self.timeline.num_video_tracks = project_settings.get("num_video_tracks", 1)
             self.timeline.num_audio_tracks = project_settings.get("num_audio_tracks", 1)
             self.timeline.hidden_video_tracks = set(project_settings.get("hidden_video_tracks", []))
+            self.timeline.muted_audio_tracks = set(project_settings.get("muted_audio_tracks", []))
             self.project_width = project_settings.get("project_width", 1280)
             self.project_height = project_settings.get("project_height", 720)
             self.project_fps = project_settings.get("project_fps", 25.0)
@@ -5253,7 +5491,6 @@ class MainWindow(QMainWindow):
             ]
 
             for conflict_clip in conflicting_clips:
-                found_spot = False
                 for check_track_idx in range(target_audio_track + 1, self.timeline.num_audio_tracks + 2):
                     is_occupied = any(
                         other.timeline_start_ms < conflict_clip.timeline_end_ms and other.timeline_end_ms > conflict_clip.timeline_start_ms
@@ -5266,7 +5503,6 @@ class MainWindow(QMainWindow):
                             self.timeline.num_audio_tracks = check_track_idx
                         
                         conflict_clip.track_index = check_track_idx
-                        found_spot = True
                         break
             
             orig_path = media_info.get('original_path', video_clip.source_path)
@@ -5463,7 +5699,8 @@ class MainWindow(QMainWindow):
             return
 
         if export_settings.get("vcodec") == "copy":
-            video_clips = [c for c in self.timeline.clips if c.track_type == 'video' and c.media_type != 'subtitle']
+            hidden_v = getattr(self.timeline, 'hidden_video_tracks', set())
+            video_clips = [c for c in self.timeline.clips if c.track_type == 'video' and c.track_index not in hidden_v and c.media_type != 'subtitle']
             if video_clips:
                 clip = video_clips[0]
                 if clip.clip_start_ms > 0:

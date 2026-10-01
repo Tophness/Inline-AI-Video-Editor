@@ -90,11 +90,11 @@ class PlaybackManager(QObject):
             if p and p.poll() is None:
                 try:
                     p.terminate()
-                    p.wait(timeout=1.0) # Wait a bit for graceful termination
+                    p.wait(timeout=1.0)
                 except Exception as e:
                     print(f"Error terminating process: {e}")
                     try:
-                        p.kill() # Force kill if terminate fails
+                        p.kill()
                     except Exception as ke:
                         print(f"Error killing process: {ke}")
 
@@ -216,7 +216,7 @@ class PlaybackManager(QObject):
                             seek_time_ms = video_clip_at_time.timeline_end_ms
 
             subtitle_clip_at_time = next((c for c in sorted(clips, key=lambda x: x.track_index, reverse=True)
-                                        if c.media_type == 'subtitle' and c.timeline_start_ms <= seek_time_ms < c.timeline_end_ms), None)
+                                        if c.media_type == 'subtitle' and c.track_index not in hidden_v_tracks and c.timeline_start_ms <= seek_time_ms < c.timeline_end_ms), None)
 
             pixmap = QPixmap(w, h)
             pixmap.fill(QColor("black"))
@@ -289,7 +289,7 @@ class PlaybackManager(QObject):
 
         hidden_v_tracks = getattr(timeline, 'hidden_video_tracks', set())
         visual_clips = [c for c in clips if c.track_type == 'video' and c.track_index not in hidden_v_tracks and c.media_type in ['video', 'image'] and c.timeline_end_ms > start_ms]
-        subtitle_clips = [c for c in clips if c.media_type == 'subtitle' and c.timeline_end_ms > start_ms]
+        subtitle_clips = [c for c in clips if c.media_type == 'subtitle' and c.track_index not in hidden_v_tracks and c.timeline_end_ms > start_ms]
         
         if not visual_clips:
             return None
@@ -378,7 +378,8 @@ class PlaybackManager(QObject):
         return ffmpeg.concat(*concat_inputs, v=1, a=0)
 
     def _build_audio_graph(self, start_ms, timeline, clips, proj_settings):
-        active_clips = [c for c in clips if c.track_type == 'audio' and c.timeline_end_ms > start_ms]
+        muted_a_tracks = getattr(timeline, 'muted_audio_tracks', set())
+        active_clips = [c for c in clips if c.track_type == 'audio' and c.track_index not in muted_a_tracks and c.timeline_end_ms > start_ms]
         if not active_clips:
             return None
 
