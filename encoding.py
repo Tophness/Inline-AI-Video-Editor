@@ -2,16 +2,21 @@ import ffmpeg
 import subprocess
 import re
 import shlex
+import os
+import tempfile
+import uuid
 from PyQt6.QtCore import QObject, pyqtSignal, QThread
 
 class _ExportRunner(QObject):
     progress = pyqtSignal(int)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, ffmpeg_cmd, total_duration_ms, parent=None):
+    def __init__(self, ffmpeg_cmd, total_duration_ms, prep_cmds=None, temp_files=None, parent=None):
         super().__init__(parent)
         self.ffmpeg_cmd = ffmpeg_cmd
         self.total_duration_ms = total_duration_ms
+        self.prep_cmds = prep_cmds or []
+        self.temp_files = temp_files or []
         self.process = None
 
     def run(self):
@@ -20,6 +25,18 @@ class _ExportRunner(QObject):
             if hasattr(subprocess, 'STARTUPINFO'):
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            # Run any fast preparatory slice commands for multi-clip stream copy
+            for i, cmd in enumerate(self.prep_cmds):
+                self.process = subprocess.Popen(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    startupinfo=startupinfo
+                )
+                _, stderr = self.process.communicate()
+                if self.process.returncode != 0:
+                    self._cleanup_temp_files()
+                    self.finished.emit(False, f"Direct stream copy slicing failed: {stderr.decode('utf-8', errors='ignore')}")
+                    return
 
             self.process = subprocess.Popen(
                 self.ffmpeg_cmd,
@@ -47,6 +64,8 @@ class _ExportRunner(QObject):
             self.process.stdout.close()
             return_code = self.process.wait()
 
+            self._cleanup_temp_files()
+
             if return_code == 0:
                 self.progress.emit(100)
                 self.finished.emit(True, "Export completed successfully!")
@@ -57,9 +76,19 @@ class _ExportRunner(QObject):
                 self.finished.emit(False, f"Export failed with code {return_code}. Check console.")
 
         except FileNotFoundError:
+            self._cleanup_temp_files()
             self.finished.emit(False, "Export failed: ffmpeg.exe not found in your system's PATH.")
         except Exception as e:
+            self._cleanup_temp_files()
             self.finished.emit(False, f"An exception occurred during export: {e}")
+
+    def _cleanup_temp_files(self):
+        for path in self.temp_files:
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
 
     def get_process(self):
         return self.process
@@ -112,12 +141,44 @@ class Encoder(QObject):
             v_bitrate = export_settings.get('v_bitrate')
             is_lossless = (v_bitrate == "Lossless (QP 0 / CRF 1)")
 
-            if vcodec == 'copy' and acodec == 'copy' and len(all_video_clips) == 1 and len(all_audio_clips) == 1 and all_video_clips[0].source_path == all_audio_clips[0].source_path and not all_subtitle_clips:
-                single_v_clip = all_video_clips[0]
-                crop = getattr(single_v_clip, 'effects', {}).get('crop')
-                if crop and all(k in crop for k in ('x', 'y', 'w', 'h')):
-                    raise ValueError("Direct Stream Copy (copy) for video cannot be used when a crop effect is applied. Please select a video codec such as libx265 or libx264.")
+            prep_cmds = []
+            temp_files = []
 
+            if vcodec == 'copy' and len(all_video_clips) > 1:
+                seg_files = []
+                for i, c in enumerate(all_video_clips):
+                    has_audio = (acodec == 'copy' and any(a for a in all_audio_clips if a.timeline_start_ms == c.timeline_start_ms))
+                    cut_start = c.clip_start_ms / 1000.0
+                    cut_dur = c.duration_ms / 1000.0
+                    temp_seg = os.path.join(tempfile.gettempdir(), f"ve_concat_seg_{uuid.uuid4().hex}_{i}.mp4")
+                    
+                    slice_cmd = ['ffmpeg', '-y', '-ss', f"{cut_start:.6f}", '-t', f"{cut_dur:.6f}", '-i', c.source_path]
+                    if has_audio:
+                        slice_cmd.extend(['-map', '0:v:0', '-map', '0:a:0?'])
+                    else:
+                        slice_cmd.extend(['-map', '0:v:0', '-an'])
+                    slice_cmd.extend(['-c', 'copy', '-avoid_negative_ts', 'make_zero', temp_seg])
+                    
+                    prep_cmds.append(slice_cmd)
+                    temp_files.append(temp_seg)
+                    seg_files.append(temp_seg)
+
+                list_path = os.path.join(tempfile.gettempdir(), f"ve_concat_list_{uuid.uuid4().hex}.txt")
+                with open(list_path, 'w', encoding='utf-8') as f:
+                    for seg in seg_files:
+                        escaped = seg.replace("'", "'\\''")
+                        f.write(f"file '{escaped}'\n")
+                temp_files.append(list_path)
+
+                concat_input = ffmpeg.input(list_path, f='concat', safe=0)
+                stream_args.append(concat_input.video)
+                output_args['vcodec'] = 'copy'
+                if acodec == 'copy':
+                    stream_args.append(concat_input.audio)
+                    output_args['acodec'] = 'copy'
+
+            elif vcodec == 'copy' and acodec == 'copy' and len(all_video_clips) == 1 and len(all_audio_clips) == 1 and all_video_clips[0].source_path == all_audio_clips[0].source_path and not all_subtitle_clips:
+                single_v_clip = all_video_clips[0]
                 cut_start_sec = single_v_clip.clip_start_ms / 1000.0
                 cut_dur_sec = single_v_clip.duration_ms / 1000.0
                 shared_in = ffmpeg.input(single_v_clip.source_path, ss=f"{cut_start_sec:.6f}", t=f"{cut_dur_sec:.6f}")
@@ -125,16 +186,11 @@ class Encoder(QObject):
                 stream_args.append(shared_in.audio)
                 output_args['vcodec'] = 'copy'
                 output_args['acodec'] = 'copy'
-            elif vcodec == 'copy':
-                if len(all_video_clips) != 1 or all_subtitle_clips:
-                    if len(all_video_clips) == 0:
-                        raise ValueError("Direct Stream Copy (copy) for video cannot be used because all video tracks are hidden or empty. Please select an encoder codec or unhide a video track.")
-                    raise ValueError("Direct Stream Copy (copy) for video cannot be used when there are multiple video clips or subtitles on the timeline. Please select a video codec such as libx265 or libx264.")
-                single_v_clip = all_video_clips[0]
-                crop = getattr(single_v_clip, 'effects', {}).get('crop')
-                if crop and all(k in crop for k in ('x', 'y', 'w', 'h')):
-                    raise ValueError("Direct Stream Copy (copy) for video cannot be used when a crop effect is applied. Please select a video codec such as libx265 or libx264.")
 
+            elif vcodec == 'copy':
+                if len(all_video_clips) == 0:
+                    raise ValueError("Direct Stream Copy (copy) for video cannot be used because all video tracks are hidden or empty.")
+                single_v_clip = all_video_clips[0]
                 cut_start_sec = single_v_clip.clip_start_ms / 1000.0
                 cut_dur_sec = single_v_clip.duration_ms / 1000.0
                 v_in = ffmpeg.input(single_v_clip.source_path, ss=f"{cut_start_sec:.6f}", t=f"{cut_dur_sec:.6f}")
@@ -319,7 +375,7 @@ class Encoder(QObject):
             return
 
         self.worker_thread = QThread()
-        self.worker = _ExportRunner(ffmpeg_cmd, total_dur_ms)
+        self.worker = _ExportRunner(ffmpeg_cmd, total_dur_ms, prep_cmds=prep_cmds, temp_files=temp_files)
         self.worker.moveToThread(self.worker_thread)
 
         self.worker.progress.connect(self.progress.emit)

@@ -3291,16 +3291,96 @@ class ReindexWorker(QThread):
 
         return None, None
 
+def check_direct_stream_copy_compatibility(timeline, media_properties):
+    hidden_v_tracks = getattr(timeline, 'hidden_video_tracks', set())
+    muted_a_tracks = getattr(timeline, 'muted_audio_tracks', set())
+
+    v_clips = sorted([c for c in timeline.clips if c.track_type == 'video' and c.media_type != 'subtitle' and c.track_index not in hidden_v_tracks], key=lambda c: c.timeline_start_ms)
+    sub_clips = [c for c in timeline.clips if c.media_type == 'subtitle' and c.track_index not in hidden_v_tracks]
+    a_clips = sorted([c for c in timeline.clips if c.track_type == 'audio' and c.track_index not in muted_a_tracks], key=lambda c: c.timeline_start_ms)
+
+    v_reasons = []
+    a_reasons = []
+
+    if not v_clips:
+        v_reasons.append("No video clips on visible video tracks.")
+    else:
+        if sub_clips:
+            v_reasons.append("Subtitles are present on the timeline (burning subtitles requires re-encoding).")
+        
+        for c in v_clips:
+            crop = getattr(c, 'effects', {}).get('crop')
+            if crop and all(k in crop for k in ('x', 'y', 'w', 'h')):
+                v_reasons.append(f"Crop effect is applied to '{os.path.basename(getattr(c, 'original_source_path', c.source_path))}' (cropping pixels requires re-encoding).")
+                break
+        
+        for c in v_clips:
+            if c.media_type == 'image':
+                v_reasons.append(f"Image clip '{os.path.basename(getattr(c, 'original_source_path', c.source_path))}' must be encoded into video frames.")
+                break
+
+        for i in range(len(v_clips) - 1):
+            if v_clips[i].timeline_end_ms > v_clips[i + 1].timeline_start_ms:
+                v_reasons.append("Video clips overlap in time (multi-track layering requires re-encoding).")
+                break
+
+        if v_clips and v_clips[0].timeline_start_ms > 40:
+            v_reasons.append(f"Timeline starts with a {v_clips[0].timeline_start_ms/1000.0:.2f}s gap (synthesizing black frames requires re-encoding).")
+        for i in range(len(v_clips) - 1):
+            gap_ms = v_clips[i + 1].timeline_start_ms - v_clips[i].timeline_end_ms
+            if gap_ms > 40:
+                v_reasons.append(f"Gap of {gap_ms/1000.0:.2f}s exists between video clips (synthesizing black frames requires re-encoding).")
+                break
+
+        if len(v_clips) > 1:
+            p0 = media_properties.get(v_clips[0].source_path, {})
+            for c in v_clips[1:]:
+                if c.source_path != v_clips[0].source_path:
+                    p = media_properties.get(c.source_path, {})
+                    if p0.get('width') != p.get('width') or p0.get('height') != p.get('height'):
+                        v_reasons.append(f"Clips have different resolutions ({p0.get('width')}x{p0.get('height')} vs {p.get('width')}x{p.get('height')}).")
+                        break
+                    if abs(p0.get('fps', 0) - p.get('fps', 0)) > 0.05:
+                        v_reasons.append(f"Clips have different frame rates ({p0.get('fps')} vs {p.get('fps')}).")
+                        break
+
+    if not a_clips:
+        a_reasons.append("No audio clips on unmuted audio tracks.")
+    else:
+        for i in range(len(a_clips) - 1):
+            if a_clips[i].timeline_end_ms > a_clips[i + 1].timeline_start_ms:
+                a_reasons.append("Audio clips overlap in time (mixing multiple tracks requires re-encoding).")
+                break
+
+        if len(a_clips) > 1:
+            p0 = media_properties.get(a_clips[0].source_path, {})
+            for c in a_clips[1:]:
+                if c.source_path != a_clips[0].source_path:
+                    p = media_properties.get(c.source_path, {})
+                    if p0.get('media_type') != p.get('media_type'):
+                        a_reasons.append("Audio clips from different media formats cannot be stream-copied together.")
+                        break
+
+    v_copy_allowed = (len(v_reasons) == 0)
+    a_copy_allowed = (len(a_reasons) == 0)
+    return v_copy_allowed, v_reasons, a_copy_allowed, a_reasons
+
 class ExportDialog(QDialog):
     def __init__(self, default_path, initial_settings=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Export Settings")
-        self.setMinimumWidth(580)
+        self.setMinimumWidth(600)
 
         self.initial_settings = initial_settings or {}
         self.video_bitrate_options = ["Lossless (QP 0 / CRF 1)", "500k", "1M", "2.5M", "5M", "8M", "15M", "Custom..."]
         self.audio_bitrate_options = ["384k", "320k", "256k", "192k", "128k", "96k", "Custom..."]
         self.display_ext_map = {'matroska': 'mkv', 'oga': 'ogg'}
+
+        main_win = self.parent()
+        self.v_copy_allowed, self.v_copy_reasons, self.a_copy_allowed, self.a_copy_reasons = (
+            check_direct_stream_copy_compatibility(main_win.timeline, main_win.media_properties)
+            if main_win and hasattr(main_win, 'timeline') else (True, [], True, [])
+        )
 
         self.layout = QVBoxLayout(self)
         self.formats = get_available_formats()
@@ -3308,6 +3388,7 @@ class ExportDialog(QDialog):
         self.audio_codecs = get_available_codecs('audio')
 
         self._setup_ui()
+        self._update_copy_reason_messages()
         
         self.path_edit.setText(self.initial_settings.get("output_path", default_path))
         init_w = int(self.initial_settings.get("width") or 1280)
@@ -3345,13 +3426,20 @@ class ExportDialog(QDialog):
         self.winner_profile_combo = QComboBox()
         self.winner_profile_combo.addItems([
             "Custom (Use settings below)",
-            "Clean MKV-Aligned Transcode (H.264 CRF 16, Slow Preset, AAC 192k, CFR)",
             "Direct Stream Copy (Instant, 0 Re-encode, Clean Edit-Lists)",
+            "Fast Hybrid (Video Stream Copy + Clean Audio Re-encode AAC 192k)",
+            "Clean MKV-Aligned Transcode (H.264 CRF 16, Slow Preset, AAC 192k, CFR)",
             "Lossless HEVC / H.265 (QP 0, Full Audio, Zero Freeze)",
             "Lossless H.264 (CRF 1, High Profile, Max Compatibility)"
         ])
         self.winner_profile_combo.currentIndexChanged.connect(self.on_winner_profile_selected)
         profile_layout.addRow("Preset Profile:", self.winner_profile_combo)
+
+        self.profile_copy_reason_lbl = QLabel()
+        self.profile_copy_reason_lbl.setWordWrap(True)
+        self.profile_copy_reason_lbl.setStyleSheet("color: #e5a544; font-size: 11px; padding-top: 2px;")
+        profile_layout.addRow(self.profile_copy_reason_lbl)
+
         profile_group.setLayout(profile_layout)
         self.layout.addWidget(profile_group)
 
@@ -3399,6 +3487,11 @@ class ExportDialog(QDialog):
         self.video_codec_combo = QComboBox()
         self.video_codec_combo.currentIndexChanged.connect(self.on_vcodec_changed)
         video_layout.addRow("Video Codec:", self.video_codec_combo)
+
+        self.v_copy_reason_lbl = QLabel()
+        self.v_copy_reason_lbl.setWordWrap(True)
+        self.v_copy_reason_lbl.setStyleSheet("color: #e5a544; font-size: 11px; padding: 2px 0;")
+        video_layout.addRow(self.v_copy_reason_lbl)
         self.v_bitrate_combo = QComboBox()
         self.v_bitrate_combo.addItems(self.video_bitrate_options)
         self.v_bitrate_custom_edit = QLineEdit()
@@ -3420,6 +3513,11 @@ class ExportDialog(QDialog):
         self.audio_codec_combo = QComboBox()
         self.audio_codec_combo.currentIndexChanged.connect(self.on_acodec_changed)
         audio_layout.addRow("Audio Codec:", self.audio_codec_combo)
+
+        self.a_copy_reason_lbl = QLabel()
+        self.a_copy_reason_lbl.setWordWrap(True)
+        self.a_copy_reason_lbl.setStyleSheet("color: #e5a544; font-size: 11px; padding: 2px 0;")
+        audio_layout.addRow(self.a_copy_reason_lbl)
         self.a_bitrate_combo = QComboBox()
         self.a_bitrate_combo.addItems(self.audio_bitrate_options)
         self.a_bitrate_custom_edit = QLineEdit()
@@ -3546,6 +3644,29 @@ class ExportDialog(QDialog):
         if index == 1:
             mp4_idx = self.container_combo.findData("mp4")
             if mp4_idx != -1: self.container_combo.setCurrentIndex(mp4_idx)
+            v_idx = self.video_codec_combo.findData("copy")
+            if v_idx != -1: self.video_codec_combo.setCurrentIndex(v_idx)
+            a_idx = self.audio_codec_combo.findData("copy")
+            if a_idx != -1: self.audio_codec_combo.setCurrentIndex(a_idx)
+            self.avoid_negative_ts_cb.setChecked(False)
+            self.use_editlist_cb.setChecked(True)
+            self.custom_args_edit.setText("")
+        elif index == 2:
+            mp4_idx = self.container_combo.findData("mp4")
+            if mp4_idx != -1: self.container_combo.setCurrentIndex(mp4_idx)
+            v_idx = self.video_codec_combo.findData("copy")
+            if v_idx != -1: self.video_codec_combo.setCurrentIndex(v_idx)
+            a_idx = self.audio_codec_combo.findData("aac")
+            if a_idx != -1: self.audio_codec_combo.setCurrentIndex(a_idx)
+            ab_idx = self.a_bitrate_combo.findText("192k")
+            if ab_idx != -1: self.a_bitrate_combo.setCurrentIndex(ab_idx)
+            self.aresample_first_pts_cb.setChecked(True)
+            self.avoid_negative_ts_cb.setChecked(False)
+            self.use_editlist_cb.setChecked(True)
+            self.custom_args_edit.setText("")
+        elif index == 3:
+            mp4_idx = self.container_combo.findData("mp4")
+            if mp4_idx != -1: self.container_combo.setCurrentIndex(mp4_idx)
             v_idx = self.video_codec_combo.findData("libx264")
             if v_idx != -1: self.video_codec_combo.setCurrentIndex(v_idx)
             b_idx = self.v_bitrate_combo.findText("Custom...")
@@ -3562,17 +3683,7 @@ class ExportDialog(QDialog):
             self.avoid_negative_ts_cb.setChecked(False)
             self.use_editlist_cb.setChecked(True)
             self.custom_args_edit.setText("-crf 16 -preset slow")
-        elif index == 2:
-            mp4_idx = self.container_combo.findData("mp4")
-            if mp4_idx != -1: self.container_combo.setCurrentIndex(mp4_idx)
-            v_idx = self.video_codec_combo.findData("copy")
-            if v_idx != -1: self.video_codec_combo.setCurrentIndex(v_idx)
-            a_idx = self.audio_codec_combo.findData("copy")
-            if a_idx != -1: self.audio_codec_combo.setCurrentIndex(a_idx)
-            self.avoid_negative_ts_cb.setChecked(False)
-            self.use_editlist_cb.setChecked(True)
-            self.custom_args_edit.setText("")
-        elif index == 3:
+        elif index == 4:
             mp4_idx = self.container_combo.findData("mp4")
             if mp4_idx != -1: self.container_combo.setCurrentIndex(mp4_idx)
             v_idx = self.video_codec_combo.findData("libx265")
@@ -3589,7 +3700,7 @@ class ExportDialog(QDialog):
             self.avoid_negative_ts_cb.setChecked(False)
             self.use_editlist_cb.setChecked(True)
             self.custom_args_edit.setText("-x265-params qp=0")
-        elif index == 4:
+        elif index == 5:
             mp4_idx = self.container_combo.findData("mp4")
             if mp4_idx != -1: self.container_combo.setCurrentIndex(mp4_idx)
             v_idx = self.video_codec_combo.findData("libx264")
@@ -3626,7 +3737,13 @@ class ExportDialog(QDialog):
         combo.blockSignals(True)
         combo.clear()
 
-        keys_to_show = filter_keys if filter_keys is not None else data_dict.keys()
+        keys_to_show = list(filter_keys if filter_keys is not None else data_dict.keys())
+
+        if combo is self.video_codec_combo and not self.v_copy_allowed:
+            keys_to_show = [k for k in keys_to_show if k != 'copy']
+        elif combo is self.audio_codec_combo and not self.a_copy_allowed:
+            keys_to_show = [k for k in keys_to_show if k != 'copy']
+
         for codename in keys_to_show:
             if codename in data_dict:
                 desc = data_dict[codename]
@@ -3636,6 +3753,42 @@ class ExportDialog(QDialog):
         new_index = combo.findData(current_selection)
         combo.setCurrentIndex(new_index if new_index != -1 else 0)
         combo.blockSignals(False)
+
+    def _update_copy_reason_messages(self):
+        if not self.v_copy_allowed and self.v_copy_reasons:
+            lines = ["<b>Direct Stream Copy unavailable for video:</b>"]
+            for r in self.v_copy_reasons:
+                lines.append(f"• {r}")
+            self.v_copy_reason_lbl.setText("<br>".join(lines))
+            self.v_copy_reason_lbl.show()
+        else:
+            self.v_copy_reason_lbl.clear()
+            self.v_copy_reason_lbl.hide()
+
+        if not self.a_copy_allowed and self.a_copy_reasons:
+            lines = ["<b>Direct Stream Copy unavailable for audio:</b>"]
+            for r in self.a_copy_reasons:
+                lines.append(f"• {r}")
+            self.a_copy_reason_lbl.setText("<br>".join(lines))
+            self.a_copy_reason_lbl.show()
+        else:
+            self.a_copy_reason_lbl.clear()
+            self.a_copy_reason_lbl.hide()
+
+        copy_idx = 1
+        if not self.v_copy_allowed or not self.a_copy_allowed:
+            item = self.winner_profile_combo.model().item(copy_idx)
+            if item:
+                item.setEnabled(False)
+            reasons = self.v_copy_reasons + self.a_copy_reasons
+            self.profile_copy_reason_lbl.setText(f"<i>Direct Stream Copy preset disabled ({len(reasons)} timeline conflict{'s' if len(reasons) > 1 else ''} detected)</i>")
+            self.profile_copy_reason_lbl.show()
+        else:
+            item = self.winner_profile_combo.model().item(copy_idx)
+            if item:
+                item.setEnabled(True)
+            self.profile_copy_reason_lbl.clear()
+            self.profile_copy_reason_lbl.hide()
 
     def on_advanced_toggled(self, checked):
         self._populate_combo(self.container_combo, self.formats, None if checked else CONTAINER_PRESETS.keys())
@@ -5753,6 +5906,80 @@ class MainWindow(QMainWindow):
                             if reply != QMessageBox.StandardButton.Ok:
                                 self.status_label.setText("Export canceled.")
                                 return
+
+        if export_settings.get("acodec") == "copy":
+            muted_a = getattr(self.timeline, 'muted_audio_tracks', set())
+            audio_clips = sorted([c for c in self.timeline.clips if c.track_type == 'audio' and c.track_index not in muted_a], key=lambda c: c.timeline_start_ms)
+            
+            has_gaps = False
+            if audio_clips and audio_clips[0].timeline_start_ms > 40:
+                has_gaps = True
+            for i in range(len(audio_clips) - 1):
+                if audio_clips[i + 1].timeline_start_ms - audio_clips[i].timeline_end_ms > 40:
+                    has_gaps = True
+                    break
+
+            if len(audio_clips) > 1 or has_gaps or (audio_clips and audio_clips[0].clip_start_ms > 0):
+                first_audio = audio_clips[0]
+                ffprobe_exe = 'ffprobe.exe' if os.name == 'nt' and os.path.exists('ffprobe.exe') else 'ffprobe'
+                probe_cmd = [
+                    ffprobe_exe, '-v', 'error', '-select_streams', 'a:0',
+                    '-show_entries', 'stream=codec_name,profile,sample_rate',
+                    '-of', 'json', first_audio.source_path
+                ]
+                try:
+                    p_res = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=1.5)
+                    probe_data = json.loads(p_res.stdout) if p_res.returncode == 0 else {}
+                    astream = probe_data.get('streams', [{}])[0]
+                    is_aac = (astream.get('codec_name', '').lower() == 'aac')
+                    profile = astream.get('profile', '')
+                    sr = int(astream.get('sample_rate', 48000) or 48000)
+                except Exception:
+                    is_aac = False
+                    profile = ''
+                    sr = 48000
+
+                if is_aac:
+                    warnings = []
+                    warnings.append("• <b>Audio Pops / Timing Discrepancy:</b> AAC encoders insert priming delay samples. Concatenating AAC packets with Direct Stream Copy can cause a small pop/click or a 10–20ms timing discrepancy at cut seams.")
+                    
+                    if profile and profile.upper() not in ['LC', 'LOW COMPLEXITY']:
+                        warnings.append(f"• <b>Non-Standard AAC Profile:</b> Source audio uses profile '<b>{profile}</b>' (standard FFmpeg silence uses 'LC'). Concatenating may cause decoder glitches.")
+
+                    packet_ms = (1024.0 / sr) * 1000.0
+                    boundary_mismatch = any(
+                        (c.clip_start_ms % packet_ms > 1.0 and c.clip_start_ms % packet_ms < packet_ms - 1.0)
+                        for c in audio_clips
+                    )
+                    if boundary_mismatch:
+                        warnings.append(f"• <b>Packet Boundary Discrepancy:</b> AAC audio is packaged in ~{packet_ms:.1f}ms packets (1024 samples). Slices that don't land exactly on packet boundaries will be rounded to the nearest packet.")
+
+                    msg = QMessageBox(self)
+                    msg.setWindowTitle("AAC Direct Stream Copy Notice")
+                    msg.setIcon(QMessageBox.Icon.Warning)
+                    
+                    warning_text = "<br>".join(warnings)
+                    msg.setText("<b>Notice regarding AAC Audio Direct Stream Copy:</b>")
+                    msg.setInformativeText(
+                        f"{warning_text}<br><br>"
+                        "<b>Recommended Alternative:</b><br>"
+                        "Use <b>'Fast Hybrid (Video Stream Copy + Clean Audio Re-encode)'</b>. "
+                        "Video is still copied with 0 quality loss and instant speed, while audio is re-encoded seamlessly in under a second with zero clicks or gaps."
+                    )
+                    
+                    hybrid_btn = msg.addButton("Switch to Recommended Hybrid", QMessageBox.ButtonRole.AcceptRole)
+                    copy_btn = msg.addButton("Proceed with Stream Copy Anyway", QMessageBox.ButtonRole.ActionRole)
+                    cancel_btn = msg.addButton("Cancel Export", QMessageBox.ButtonRole.RejectRole)
+                    msg.setDefaultButton(hybrid_btn)
+
+                    msg.exec()
+
+                    if msg.clickedButton() == cancel_btn:
+                        self.status_label.setText("Export canceled.")
+                        return
+                    elif msg.clickedButton() == hybrid_btn:
+                        export_settings["acodec"] = "aac"
+                        export_settings["a_bitrate"] = "192k"
 
         self.last_export_path = output_path
         self.last_export_settings = export_settings
