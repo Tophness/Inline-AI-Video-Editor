@@ -358,7 +358,7 @@ class Encoder(QObject):
                         timeline_end_sec = (clip.timeline_start_ms + clip.duration_ms) / 1000.0
                         enable_expression = f'between(t,{timeline_start_sec:.6f},{timeline_end_sec:.6f})'
 
-                        final_video = ffmpeg.overlay(final_video, timed_layer, enable=enable_expression, eof_action='endall')
+                        final_video = ffmpeg.overlay(final_video, timed_layer, enable=enable_expression)
 
                 for sub_clip in all_subtitle_clips:                
                     timeline_start_sec = sub_clip.timeline_start_ms / 1000.0
