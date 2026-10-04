@@ -2131,6 +2131,10 @@ class TimelineWidget(QWidget):
         self.pixels_per_ms = new_pps
         self.view_start_ms = int(max(0, new_view_start_ms))
 
+        if self.resizing_clip:
+            dummy = QMouseEvent(QEvent.Type.MouseMove, event.position(), Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, event.modifiers())
+            self.mouseMoveEvent(dummy)
+
         self.update()
         event.accept()
 
@@ -2267,6 +2271,13 @@ class TimelineWidget(QWidget):
             if self.resizing_clip:
                 self.drag_start_state = self.window()._create_snapshot()
                 self.resize_start_pos = event.pos()
+                orig_clip = next((c for c in self.drag_start_state.clips if c.id == self.resizing_clip.id), None)
+                click_time = self.x_to_ms(event.pos().x())
+                if orig_clip:
+                    edge_time = orig_clip.timeline_start_ms if self.resize_edge == 'left' else (orig_clip.timeline_start_ms + orig_clip.duration_ms)
+                    self.resize_mouse_offset_ms = click_time - edge_time
+                else:
+                    self.resize_mouse_offset_ms = 0
                 self.update()
                 return
 
@@ -2478,8 +2489,12 @@ class TimelineWidget(QWidget):
         if self.resizing_clip:
             is_shift_pressed = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             linked_clip = next((c for c in self.timeline.clips if c.group_id == self.resizing_clip.group_id and c.id != self.resizing_clip.id), None)
-            delta_x = event.pos().x() - self.resize_start_pos.x()
-            time_delta = delta_x / self.pixels_per_ms
+            
+            orig_clip = next((c for c in self.drag_start_state.clips if c.id == self.resizing_clip.id), None)
+            if not orig_clip:
+                return
+
+            current_time = self.x_to_ms(event.pos().x()) - getattr(self, 'resize_mouse_offset_ms', 0)
             min_duration_ms = int(1000 / self.project_fps)
             snap_time_delta = self.SNAP_THRESHOLD_PIXELS / self.pixels_per_ms
 
@@ -2493,15 +2508,11 @@ class TimelineWidget(QWidget):
             media_props = self.window().media_properties.get(self.resizing_clip.source_path)
             source_duration_ms = media_props['duration_ms'] if media_props else float('inf')
 
-            orig_clip = next((c for c in self.drag_start_state.clips if c.id == self.resizing_clip.id), None)
-            if not orig_clip:
-                return
-
             if self.resize_edge == 'left':
                 original_start = orig_clip.timeline_start_ms
                 original_duration = orig_clip.duration_ms
                 original_clip_start = orig_clip.clip_start_ms
-                true_new_start_ms = original_start + time_delta
+                true_new_start_ms = current_time
                 
                 if is_shift_pressed:
                     new_start_ms = self._snap_to_frame(true_new_start_ms)
@@ -2539,10 +2550,7 @@ class TimelineWidget(QWidget):
 
             elif self.resize_edge == 'right':
                 original_start = orig_clip.timeline_start_ms
-                original_duration = orig_clip.duration_ms
-                
-                true_new_duration = original_duration + time_delta
-                true_new_end_time = original_start + true_new_duration
+                true_new_end_time = current_time
                 
                 if is_shift_pressed:
                     new_end_time = self._snap_to_frame(true_new_end_time)
