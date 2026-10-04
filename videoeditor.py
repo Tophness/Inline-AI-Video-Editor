@@ -2082,6 +2082,58 @@ class TimelineWidget(QWidget):
                 main_win.status_label.setText(msg)
             self.update()
 
+    def _get_anchor_clip(self):
+        anchor_clip = None
+        if self.selection_anchor_clip_id:
+            anchor_clip = next((c for c in self.timeline.clips if c.id == self.selection_anchor_clip_id), None)
+        if not anchor_clip and self.selected_clips:
+            selected_list = [c for c in self.timeline.clips if c.id in self.selected_clips]
+            if selected_list:
+                anchor_clip = selected_list[0]
+        return anchor_clip
+
+    def _handle_shift_click_on_clip(self, clicked_clip, is_ctrl=False, is_alt=False):
+        anchor_clip = self._get_anchor_clip()
+        if anchor_clip and anchor_clip.id != clicked_clip.id:
+            target_name = os.path.basename(getattr(clicked_clip, 'original_source_path', clicked_clip.source_path))
+            self._select_clips_in_range(
+                anchor_clip=anchor_clip,
+                target_track_type=clicked_clip.track_type,
+                target_track_index=clicked_clip.track_index,
+                target_start_ms=clicked_clip.timeline_start_ms,
+                target_end_ms=clicked_clip.timeline_end_ms,
+                is_ctrl=is_ctrl,
+                is_alt=is_alt,
+                target_label=f"'{target_name}'"
+            )
+        else:
+            self.selection_anchor_clip_id = clicked_clip.id
+            old_selected = set(self.selected_clips)
+            new_selected = {clicked_clip.id}
+            if not is_alt:
+                linked = next((c for c in self.timeline.clips if c.group_id == clicked_clip.group_id and c.id != clicked_clip.id), None)
+                if linked:
+                    new_selected.add(linked.id)
+            if is_ctrl:
+                new_selected = old_selected.union(new_selected)
+
+            if new_selected != old_selected:
+                self.selected_clips = new_selected
+                should_undo = False
+                main_win = self.window()
+                if main_win and hasattr(main_win, 'settings'):
+                    should_undo = main_win.settings.get("undo_selections", False)
+                elif self.settings:
+                    should_undo = self.settings.get("undo_selections", False)
+
+                if should_undo and main_win and hasattr(main_win, 'undo_stack'):
+                    cmd = SelectClipsCommand("Select Clip", main_win, old_selected, new_selected)
+                    cmd.executed = True
+                    main_win.undo_stack.push(cmd)
+            else:
+                self.selected_clips = new_selected
+            self.update()
+
     def _snap_to_frame(self, time_ms):
         frame_duration_ms = 1000.0 / self.project_fps
         if frame_duration_ms <= 0:
@@ -2151,6 +2203,10 @@ class TimelineWidget(QWidget):
         is_ctrl_pressed = bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
         is_alt_pressed = bool(event.modifiers() & Qt.KeyboardModifier.AltModifier)
 
+        self.shift_click_candidate = None
+        self.shift_track_candidate = None
+        self.mouse_has_dragged = False
+
         should_undo_selections = False
         main_win = self.window()
         if main_win and hasattr(main_win, 'settings'):
@@ -2169,14 +2225,7 @@ class TimelineWidget(QWidget):
                 if not is_btn:
                     track_info = self.y_to_track_info(event.pos().y())
                     if track_info:
-                        anchor_clip = None
-                        if self.selection_anchor_clip_id:
-                            anchor_clip = next((c for c in self.timeline.clips if c.id == self.selection_anchor_clip_id), None)
-                        if not anchor_clip and self.selected_clips:
-                            selected_list = [c for c in self.timeline.clips if c.id in self.selected_clips]
-                            if selected_list:
-                                anchor_clip = selected_list[0]
-
+                        anchor_clip = self._get_anchor_clip()
                         if anchor_clip:
                             target_type, target_idx = track_info
                             if target_type == 'video':
@@ -2288,81 +2337,41 @@ class TimelineWidget(QWidget):
                     break
             
             if clicked_clip:
-                if is_shift_pressed:
-                    anchor_clip = None
-                    if self.selection_anchor_clip_id:
-                        anchor_clip = next((c for c in self.timeline.clips if c.id == self.selection_anchor_clip_id), None)
-                    if not anchor_clip and self.selected_clips:
-                        selected_clips_list = [c for c in self.timeline.clips if c.id in self.selected_clips]
-                        if selected_clips_list:
-                            anchor_clip = selected_clips_list[0]
-
-                    if anchor_clip and anchor_clip.id != clicked_clip.id:
-                        target_name = os.path.basename(getattr(clicked_clip, 'original_source_path', clicked_clip.source_path))
-                        self._select_clips_in_range(
-                            anchor_clip=anchor_clip,
-                            target_track_type=clicked_clip.track_type,
-                            target_track_index=clicked_clip.track_index,
-                            target_start_ms=clicked_clip.timeline_start_ms,
-                            target_end_ms=clicked_clip.timeline_end_ms,
-                            is_ctrl=is_ctrl_pressed,
-                            is_alt=is_alt_pressed,
-                            target_label=f"'{target_name}'"
-                        )
-                        return
-                    else:
-                        self.selection_anchor_clip_id = clicked_clip.id
-                        old_selected = set(self.selected_clips)
-                        new_selected = {clicked_clip.id}
-                        if not is_alt_pressed:
-                            linked = next((c for c in self.timeline.clips if c.group_id == clicked_clip.group_id and c.id != clicked_clip.id), None)
-                            if linked:
-                                new_selected.add(linked.id)
-                        if is_ctrl_pressed:
-                            new_selected = old_selected.union(new_selected)
-
-                        if new_selected != old_selected:
-                            self.selected_clips = new_selected
-                            if should_undo_selections and main_win and hasattr(main_win, 'undo_stack'):
-                                cmd = SelectClipsCommand("Select Clip", main_win, old_selected, new_selected)
-                                cmd.executed = True
-                                main_win.undo_stack.push(cmd)
-                        else:
-                            self.selected_clips = new_selected
-                        self.update()
-                        return
-
-                self.selection_anchor_clip_id = clicked_clip.id
                 linked_clip = None
                 if not is_alt_pressed:
                     linked_clip = next((c for c in self.timeline.clips if c.group_id == clicked_clip.group_id and c.id != clicked_clip.id), None)
-                
-                old_selected_snapshot = set(self.selected_clips)
-                if clicked_clip.id in self.selected_clips:
-                    if is_ctrl_pressed:
-                        self.selected_clips.remove(clicked_clip.id)
-                        if linked_clip and linked_clip.id in self.selected_clips:
-                            self.selected_clips.remove(linked_clip.id)
+
+                if is_shift_pressed:
+                    self.shift_click_candidate = (clicked_clip, is_ctrl_pressed, is_alt_pressed)
                 else:
-                    if not is_ctrl_pressed:
-                        self.selected_clips.clear()
-                    self.selected_clips.add(clicked_clip.id)
-                    if linked_clip:
-                        self.selected_clips.add(linked_clip.id)
+                    self.selection_anchor_clip_id = clicked_clip.id
+                    old_selected_snapshot = set(self.selected_clips)
+                    if clicked_clip.id in self.selected_clips:
+                        if is_ctrl_pressed:
+                            self.selected_clips.remove(clicked_clip.id)
+                            if linked_clip and linked_clip.id in self.selected_clips:
+                                self.selected_clips.remove(linked_clip.id)
+                    else:
+                        if not is_ctrl_pressed:
+                            self.selected_clips.clear()
+                        self.selected_clips.add(clicked_clip.id)
+                        if linked_clip:
+                            self.selected_clips.add(linked_clip.id)
 
-                if is_ctrl_pressed and should_undo_selections and main_win and hasattr(main_win, 'undo_stack'):
-                    if self.selected_clips != old_selected_snapshot:
-                        cmd = SelectClipsCommand("Toggle Clip Selection", main_win, old_selected_snapshot, set(self.selected_clips))
-                        cmd.executed = True
-                        main_win.undo_stack.push(cmd)
+                    if is_ctrl_pressed and should_undo_selections and main_win and hasattr(main_win, 'undo_stack'):
+                        if self.selected_clips != old_selected_snapshot:
+                            cmd = SelectClipsCommand("Toggle Clip Selection", main_win, old_selected_snapshot, set(self.selected_clips))
+                            cmd.executed = True
+                            main_win.undo_stack.push(cmd)
 
+                self.dragging_clip = clicked_clip
+                self.drag_start_state = self.window()._create_snapshot()
+                self.drag_start_pos = event.pos()
+                self.drag_start_time_ms = self.x_to_ms(event.pos().x())
+                self.drag_original_clip_states.clear()
+
+                clips_to_drag = set()
                 if clicked_clip.id in self.selected_clips:
-                    self.dragging_clip = clicked_clip
-                    self.drag_start_state = self.window()._create_snapshot()
-                    self.drag_start_pos = event.pos()
-                    self.drag_original_clip_states.clear()
-
-                    clips_to_drag = set()
                     for cid in self.selected_clips:
                         c = next((x for x in self.timeline.clips if x.id == cid), None)
                         if c:
@@ -2371,11 +2380,15 @@ class TimelineWidget(QWidget):
                                 partner = next((x for x in self.timeline.clips if x.group_id == c.group_id and x.id != c.id), None)
                                 if partner:
                                     clips_to_drag.add(partner)
+                else:
+                    clips_to_drag.add(clicked_clip)
+                    if not is_alt_pressed and linked_clip:
+                        clips_to_drag.add(linked_clip)
 
-                    for c in clips_to_drag:
-                        self.drag_original_clip_states[c.id] = (int(c.timeline_start_ms), int(c.track_index))
+                for c in clips_to_drag:
+                    self.drag_original_clip_states[c.id] = (int(c.timeline_start_ms), int(c.track_index))
 
-                    self.dragging_linked_clip = next((c for c in self.timeline.clips if c.group_id == clicked_clip.group_id and c.id != clicked_clip.id), None)
+                self.dragging_linked_clip = linked_clip
 
             else:
                 if is_shift_pressed:
@@ -2389,34 +2402,16 @@ class TimelineWidget(QWidget):
                                 track_info = ('audio', 1)
 
                     if track_info and event.pos().x() > self.HEADER_WIDTH:
-                        anchor_clip = None
-                        if self.selection_anchor_clip_id:
-                            anchor_clip = next((c for c in self.timeline.clips if c.id == self.selection_anchor_clip_id), None)
-                        if not anchor_clip and self.selected_clips:
-                            selected_clips_list = [c for c in self.timeline.clips if c.id in self.selected_clips]
-                            if selected_clips_list:
-                                anchor_clip = selected_clips_list[0]
+                        target_type, target_idx = track_info
+                        if target_type == 'video':
+                            target_idx = max(1, min(self.timeline.num_video_tracks, target_idx))
+                        else:
+                            target_idx = max(1, min(self.timeline.num_audio_tracks, target_idx))
 
-                        if anchor_clip:
-                            target_type, target_idx = track_info
-                            if target_type == 'video':
-                                target_idx = max(1, min(self.timeline.num_video_tracks, target_idx))
-                            else:
-                                target_idx = max(1, min(self.timeline.num_audio_tracks, target_idx))
-
-                            clicked_ms = max(0, self.x_to_ms(event.pos().x()))
-                            track_label = f"{target_type.capitalize()} {target_idx} at {clicked_ms / 1000.0:.2f}s"
-                            self._select_clips_in_range(
-                                anchor_clip=anchor_clip,
-                                target_track_type=target_type,
-                                target_track_index=target_idx,
-                                target_start_ms=clicked_ms,
-                                target_end_ms=clicked_ms,
-                                is_ctrl=is_ctrl_pressed,
-                                is_alt=is_alt_pressed,
-                                target_label=track_label
-                            )
-                            return
+                        clicked_ms = max(0, self.x_to_ms(event.pos().x()))
+                        track_label = f"{target_type.capitalize()} {target_idx} at {clicked_ms / 1000.0:.2f}s"
+                        self.shift_track_candidate = (target_type, target_idx, clicked_ms, track_label, is_ctrl_pressed, is_alt_pressed)
+                        return
 
                 self.selected_clips.clear()
                 self.selection_anchor_clip_id = None
@@ -2724,6 +2719,19 @@ class TimelineWidget(QWidget):
             self.playhead_moved.emit(self.playhead_pos_ms)
             self.update()
         elif self.dragging_clip:
+            if not getattr(self, 'mouse_has_dragged', False):
+                dist = (event.pos() - self.drag_start_pos).manhattanLength()
+                if dist >= 4:
+                    self.mouse_has_dragged = True
+                    self.shift_click_candidate = None
+                    self.shift_track_candidate = None
+                    if self.dragging_clip.id not in self.selected_clips:
+                        self.selected_clips.clear()
+                        for c in self.drag_original_clip_states.keys():
+                            self.selected_clips.add(c)
+                else:
+                    return
+
             self.highlighted_track_info = None
             self.highlighted_ghost_track_info = None
             self.highlighted_tracks.clear()
@@ -2908,7 +2916,41 @@ class TimelineWidget(QWidget):
                 self.dragging_selection_region = None
                 self.drag_selection_start_values = None
 
+            if getattr(self, 'shift_click_candidate', None) and not getattr(self, 'mouse_has_dragged', False):
+                target_clip, is_ctrl, is_alt = self.shift_click_candidate
+                self.shift_click_candidate = None
+                self.dragging_clip = None
+                self.dragging_linked_clip = None
+                self.drag_original_clip_states.clear()
+                self.drag_start_state = None
+                self._handle_shift_click_on_clip(target_clip, is_ctrl, is_alt)
+                return
+
+            if getattr(self, 'shift_track_candidate', None) and not getattr(self, 'mouse_has_dragged', False):
+                target_type, target_idx, clicked_ms, track_label, is_ctrl, is_alt = self.shift_track_candidate
+                self.shift_track_candidate = None
+                self.dragging_clip = None
+                self.dragging_linked_clip = None
+                self.drag_original_clip_states.clear()
+                self.drag_start_state = None
+                anchor_clip = self._get_anchor_clip()
+                if anchor_clip:
+                    self._select_clips_in_range(
+                        anchor_clip=anchor_clip,
+                        target_track_type=target_type,
+                        target_track_index=target_idx,
+                        target_start_ms=clicked_ms,
+                        target_end_ms=clicked_ms,
+                        is_ctrl=is_ctrl,
+                        is_alt=is_alt,
+                        target_label=track_label
+                    )
+                return
+
+            self.shift_click_candidate = None
+            self.shift_track_candidate = None
             self.dragging_playhead = False
+
             if self.dragging_clip:
                 moved = False
                 for cid, (orig_s, orig_t) in self.drag_original_clip_states.items():
@@ -2941,6 +2983,7 @@ class TimelineWidget(QWidget):
             self.dragging_linked_clip = None
             self.drag_original_clip_states.clear()
             self.drag_start_state = None
+            self.mouse_has_dragged = False
             if hasattr(self, 'drag_clip_sides'):
                 self.drag_clip_sides.clear()
             
