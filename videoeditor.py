@@ -2233,43 +2233,42 @@ class TimelineWidget(QWidget):
             self.resize_selection_edge = None
             self.resize_selection_start_values = None
 
-            if not is_shift_pressed:
-                for region in self.selection_regions:
-                    if not region: continue
-                    x_start = self.ms_to_x(region[0])
-                    x_end = self.ms_to_x(region[1])
-                    if event.pos().y() > self.TIMESCALE_HEIGHT:
-                        if abs(event.pos().x() - x_start) < self.RESIZE_HANDLE_WIDTH:
-                            self.resizing_selection_region = region
-                            self.resize_selection_edge = 'left'
-                            break
-                        elif abs(event.pos().x() - x_end) < self.RESIZE_HANDLE_WIDTH:
-                            self.resizing_selection_region = region
-                            self.resize_selection_edge = 'right'
-                            break
-                
-                if self.resizing_selection_region:
-                    self.resize_selection_start_values = tuple(self.resizing_selection_region)
-                    self.drag_start_pos = event.pos()
-                    self.update()
-                    return
+            for region in self.selection_regions:
+                if not region: continue
+                x_start = self.ms_to_x(region[0])
+                x_end = self.ms_to_x(region[1])
+                if event.pos().y() > self.TIMESCALE_HEIGHT:
+                    if abs(event.pos().x() - x_start) < self.RESIZE_HANDLE_WIDTH:
+                        self.resizing_selection_region = region
+                        self.resize_selection_edge = 'left'
+                        break
+                    elif abs(event.pos().x() - x_end) < self.RESIZE_HANDLE_WIDTH:
+                        self.resizing_selection_region = region
+                        self.resize_selection_edge = 'right'
+                        break
+            
+            if self.resizing_selection_region:
+                self.resize_selection_start_values = tuple(self.resizing_selection_region)
+                self.drag_start_pos = event.pos()
+                self.update()
+                return
 
-                for clip in reversed(self.timeline.clips):
-                    clip_rect = self.get_clip_rect(clip)
-                    if abs(event.pos().x() - clip_rect.left()) < self.RESIZE_HANDLE_WIDTH and clip_rect.contains(QPointF(clip_rect.left(), event.pos().y())):
-                        self.resizing_clip = clip
-                        self.resize_edge = 'left'
-                        break
-                    elif abs(event.pos().x() - clip_rect.right()) < self.RESIZE_HANDLE_WIDTH and clip_rect.contains(QPointF(clip_rect.right(), event.pos().y())):
-                        self.resizing_clip = clip
-                        self.resize_edge = 'right'
-                        break
-                
-                if self.resizing_clip:
-                    self.drag_start_state = self.window()._create_snapshot()
-                    self.resize_start_pos = event.pos()
-                    self.update()
-                    return
+            for clip in reversed(self.timeline.clips):
+                clip_rect = self.get_clip_rect(clip)
+                if abs(event.pos().x() - clip_rect.left()) < self.RESIZE_HANDLE_WIDTH and clip_rect.contains(QPointF(clip_rect.left(), event.pos().y())):
+                    self.resizing_clip = clip
+                    self.resize_edge = 'left'
+                    break
+                elif abs(event.pos().x() - clip_rect.right()) < self.RESIZE_HANDLE_WIDTH and clip_rect.contains(QPointF(clip_rect.right(), event.pos().y())):
+                    self.resizing_clip = clip
+                    self.resize_edge = 'right'
+                    break
+            
+            if self.resizing_clip:
+                self.drag_start_state = self.window()._create_snapshot()
+                self.resize_start_pos = event.pos()
+                self.update()
+                return
 
             clicked_clip = None
             for clip in reversed(self.timeline.clips):
