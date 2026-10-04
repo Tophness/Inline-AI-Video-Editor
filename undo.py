@@ -27,6 +27,43 @@ class CompositeCommand(UndoCommand):
             cmd.redo()
         self.executed = True
 
+class SelectClipsCommand(UndoCommand):
+    def __init__(self, description, target, old_selected_ids, new_selected_ids):
+        super().__init__(description)
+        if hasattr(target, 'timeline_widget'):
+            self.main_window = target
+            self.timeline_widget = target.timeline_widget
+        else:
+            self.timeline_widget = target
+            self.main_window = getattr(target, 'window', lambda: None)()
+        self.old_selected_ids = set(old_selected_ids)
+        self.new_selected_ids = set(new_selected_ids)
+        self.executed = True
+
+    def undo(self):
+        tw = self.timeline_widget
+        if tw:
+            valid_ids = {c.id for c in tw.timeline.clips}
+            tw.selected_clips = {cid for cid in self.old_selected_ids if cid in valid_ids}
+            if tw.selected_clips:
+                tw.selection_anchor_clip_id = next(iter(tw.selected_clips), None)
+            else:
+                tw.selection_anchor_clip_id = None
+            tw.update()
+        self.executed = False
+
+    def redo(self):
+        tw = self.timeline_widget
+        if tw:
+            valid_ids = {c.id for c in tw.timeline.clips}
+            tw.selected_clips = {cid for cid in self.new_selected_ids if cid in valid_ids}
+            if tw.selected_clips:
+                tw.selection_anchor_clip_id = next(iter(tw.selected_clips), None)
+            else:
+                tw.selection_anchor_clip_id = None
+            tw.update()
+        self.executed = True
+
 class ProjectSnapshot:
     def __init__(self, clips, num_video_tracks, num_audio_tracks,
                  project_width, project_height, project_fps,
