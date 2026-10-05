@@ -3293,6 +3293,15 @@ class TimelineWidget(QWidget):
         if clip_at_pos:
             if not menu.isEmpty(): menu.addSeparator()
 
+            selected_ids = set(self.selected_clips)
+            selected_ids.add(clip_at_pos.id)
+            if len(selected_ids) >= 2:
+                clip_name = os.path.basename(getattr(clip_at_pos, 'original_source_path', clip_at_pos.source_path))
+                align_action = menu.addAction(f"Align Audio to \"{clip_name}\"")
+                align_action.setToolTip("Align selected audio/video clips by matching waveform shapes to this clip")
+                align_action.triggered.connect(lambda checked, c=clip_at_pos: self.window().align_audio_clips(reference_clip=c))
+                menu.addSeparator()
+
             if clip_at_pos.track_type == 'video' and clip_at_pos.media_type != 'subtitle':
                 effects_action = menu.addAction("Effects...")
                 effects_action.triggered.connect(lambda: self.window().open_effects_dialog(clip_at_pos))
@@ -5191,6 +5200,15 @@ class MainWindow(QMainWindow):
         edit_menu.addAction(split_action)
         self.update_undo_redo_actions()
 
+        split_action = QAction("Split Clip at Playhead", self); split_action.triggered.connect(self.split_clip_at_playhead)
+        edit_menu.addAction(split_action)
+
+        align_audio_action = QAction("Align Audio Clips", self)
+        align_audio_action.setToolTip("Align selected clips by waveform matching")
+        align_audio_action.triggered.connect(lambda: self.align_audio_clips())
+        edit_menu.addAction(align_audio_action)
+        self.update_undo_redo_actions()
+
         effects_menu = menu_bar.addMenu("&Effects")
         transform_menu = effects_menu.addMenu("&Transform")
         crop_action = QAction("&Crop...", self)
@@ -6072,6 +6090,274 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Audio relinked.")
 
         self._perform_complex_timeline_change(f'Relink Audio for "{filename}"', action)
+
+    def _extract_mono_audio(self, source_path, start_sec, duration_sec, target_sr=12000):
+        try:
+            startupinfo = None
+            if hasattr(subprocess, 'STARTUPINFO'):
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+
+            start_sec = max(0.0, float(start_sec))
+            duration_sec = max(0.05, float(duration_sec))
+
+            cmd = [
+                'ffmpeg', '-v', 'error',
+                '-ss', f"{start_sec:.6f}",
+                '-t', f"{duration_sec:.6f}",
+                '-i', source_path,
+                '-vn', '-ac', '1',
+                '-ar', str(target_sr),
+                '-f', 'f32le', '-'
+            ]
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, startupinfo=startupinfo
+            )
+            raw_bytes, _ = proc.communicate(timeout=10.0)
+            if not raw_bytes:
+                return None
+            samples = np.frombuffer(raw_bytes, dtype=np.float32)
+            return samples
+        except Exception as e:
+            print(f"Error extracting audio slice from {source_path}: {e}")
+            return None
+
+    def _prepare_audio_for_correlation(self, samples, fs):
+        if samples is None or len(samples) < 10:
+            return np.zeros(1, dtype=np.float32)
+
+        # 1. Zero-center and normalize
+        samples = samples - np.mean(samples)
+        std = np.std(samples)
+        if std > 1e-7:
+            samples = samples / std
+        else:
+            return np.zeros_like(samples)
+
+        pre_emph = np.empty_like(samples)
+        pre_emph[0] = samples[0]
+        pre_emph[1:] = samples[1:] - 0.95 * samples[:-1]
+
+        env = np.abs(pre_emph)
+        win_size = max(1, int(0.005 * fs))
+        if win_size > 1:
+            win = np.ones(win_size, dtype=np.float32) / win_size
+            env = np.convolve(env, win, mode='same')
+        env = env - np.mean(env)
+        env_std = np.std(env)
+        if env_std > 1e-7:
+            env = env / env_std
+
+        return pre_emph + 0.6 * env
+
+    def _find_correlation_lag(self, ref_sig, target_sig, fs):
+        N_ref = len(ref_sig)
+        N_tgt = len(target_sig)
+        if N_ref == 0 or N_tgt == 0:
+            return 0, 0.0
+
+        n_fft = 1 << ((N_ref + N_tgt - 1).bit_length())
+
+        F_ref = np.fft.rfft(ref_sig, n_fft)
+        F_tgt = np.fft.rfft(target_sig, n_fft)
+
+        R = np.fft.irfft(F_ref * np.conj(F_tgt), n_fft)
+
+        # Re-center circular lag buffers
+        pos_corr = R[:N_ref]
+        neg_corr = R[n_fft - (N_tgt - 1):]
+        full_corr = np.concatenate([neg_corr, pos_corr])
+
+        best_idx = int(np.argmax(full_corr))
+        best_lag = best_idx - (N_tgt - 1)
+
+        peak_val = float(full_corr[best_idx])
+        mean_val = float(np.mean(full_corr))
+        std_val = float(np.std(full_corr))
+
+        confidence = (peak_val - mean_val) / (std_val + 1e-9)
+        return best_lag, confidence
+
+    def _resolve_track_collisions(self):
+        for track_type in ('video', 'audio'):
+            num_tracks = self.timeline.num_video_tracks if track_type == 'video' else self.timeline.num_audio_tracks
+            t_idx = 1
+            while t_idx <= num_tracks:
+                track_clips = sorted([c for c in self.timeline.clips if c.track_type == track_type and c.track_index == t_idx], key=lambda c: c.timeline_start_ms)
+                for i in range(len(track_clips) - 1):
+                    c1 = track_clips[i]
+                    c2 = track_clips[i + 1]
+                    if c1.timeline_end_ms > c2.timeline_start_ms:
+                        new_track = t_idx + 1
+                        if track_type == 'video':
+                            if new_track > self.timeline.num_video_tracks:
+                                self.timeline.num_video_tracks = new_track
+                        else:
+                            if new_track > self.timeline.num_audio_tracks:
+                                self.timeline.num_audio_tracks = new_track
+                        c2.track_index = new_track
+                num_tracks = self.timeline.num_video_tracks if track_type == 'video' else self.timeline.num_audio_tracks
+                t_idx += 1
+
+    def align_audio_clips(self, reference_clip=None):
+        selected_ids = set(self.timeline_widget.selected_clips)
+        if reference_clip and reference_clip.id not in selected_ids:
+            selected_ids.add(reference_clip.id)
+
+        selected_clips = [c for c in self.timeline.clips if c.id in selected_ids]
+        if len(selected_clips) < 2:
+            QMessageBox.information(self, "Align Audio Clips", "Please select at least two clips on the timeline to align.")
+            return
+
+        # Group selected clips into entities by group_id so linked audio/video shift together
+        groups = {}
+        for c in self.timeline.clips:
+            groups.setdefault(c.group_id, []).append(c)
+
+        entity_group_ids = []
+        for c in selected_clips:
+            if c.group_id not in entity_group_ids:
+                entity_group_ids.append(c.group_id)
+
+        if len(entity_group_ids) < 2:
+            QMessageBox.information(
+                self, "Align Audio Clips",
+                "Selected clips belong to the same linked group.\nPlease select clips from at least two different tracks or sources."
+            )
+            return
+
+        entities = []
+        for gid in entity_group_ids:
+            all_group_clips = groups[gid]
+            audio_clip = next((c for c in all_group_clips if c.track_type == 'audio'), None)
+            if not audio_clip:
+                video_clip = next((c for c in all_group_clips if c.track_type == 'video' and c.media_type != 'subtitle'), None)
+                if video_clip:
+                    mprops = self.media_properties.get(video_clip.source_path, {})
+                    if mprops.get('has_audio', True):
+                        audio_clip = video_clip
+
+            if not audio_clip:
+                continue
+
+            entities.append({
+                'group_id': gid,
+                'clips': all_group_clips,
+                'audio_clip': audio_clip,
+                'source_path': audio_clip.source_path,
+                'clip_start_ms': audio_clip.clip_start_ms,
+                'duration_ms': audio_clip.duration_ms,
+                'timeline_start_ms': audio_clip.timeline_start_ms
+            })
+
+        if len(entities) < 2:
+            QMessageBox.warning(
+                self, "Align Audio Clips",
+                "At least two of the selected clips must contain audio tracks to perform waveform alignment."
+            )
+            return
+
+        ref_entity = None
+        if reference_clip:
+            ref_entity = next((e for e in entities if e['group_id'] == reference_clip.group_id), None)
+        if not ref_entity:
+            ref_entity = entities[0]
+
+        target_entities = [e for e in entities if e['group_id'] != ref_entity['group_id']]
+
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        self.status_label.setText("Analyzing audio waveforms and calculating alignment...")
+        QApplication.processEvents()
+
+        shifts = {}
+        failed_entities = []
+
+        try:
+            fs = 12000
+            ref_padding_ms = 20000
+            ref_start_sec = max(0.0, (ref_entity['clip_start_ms'] - ref_padding_ms) / 1000.0)
+            ref_dur_sec = (ref_entity['duration_ms'] + (ref_padding_ms * 2)) / 1000.0
+
+            ref_audio = self._extract_mono_audio(ref_entity['source_path'], ref_start_sec, ref_dur_sec, target_sr=fs)
+            if ref_audio is None or len(ref_audio) < fs * 0.2:
+                QApplication.restoreOverrideCursor()
+                ref_name = os.path.basename(getattr(ref_entity['audio_clip'], 'original_source_path', ref_entity['source_path']))
+                QMessageBox.warning(self, "Align Audio Clips", f"Could not extract audio from reference clip: {ref_name}")
+                return
+
+            ref_signal = self._prepare_audio_for_correlation(ref_audio, fs)
+            ref_in_sample = int(round(((ref_entity['clip_start_ms'] / 1000.0) - ref_start_sec) * fs))
+
+            for tgt in target_entities:
+                tgt_name = os.path.basename(getattr(tgt['audio_clip'], 'original_source_path', tgt['source_path']))
+                tgt_start_sec = max(0.0, tgt['clip_start_ms'] / 1000.0)
+                tgt_dur_sec = max(0.1, tgt['duration_ms'] / 1000.0)
+
+                tgt_audio = self._extract_mono_audio(tgt['source_path'], tgt_start_sec, tgt_dur_sec, target_sr=fs)
+                if tgt_audio is None or len(tgt_audio) < fs * 0.2:
+                    failed_entities.append((tgt_name, "Unable to extract audio data."))
+                    continue
+
+                tgt_signal = self._prepare_audio_for_correlation(tgt_audio, fs)
+                best_lag, conf = self._find_correlation_lag(ref_signal, tgt_signal, fs)
+
+                if conf < 3.0:
+                    failed_entities.append((tgt_name, f"Low waveform similarity (confidence score: {conf:.1f})."))
+                    continue
+
+                delta_sec = (best_lag - ref_in_sample) / float(fs)
+                new_target_timeline_ms = int(round(ref_entity['timeline_start_ms'] + (delta_sec * 1000.0)))
+                shift_ms = new_target_timeline_ms - tgt['timeline_start_ms']
+                shifts[tgt['group_id']] = shift_ms
+
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        ref_name = os.path.basename(getattr(ref_entity['audio_clip'], 'original_source_path', ref_entity['source_path']))
+
+        if not shifts:
+            reasons = "\n".join([f"• {name}: {reason}" for name, reason in failed_entities])
+            QMessageBox.warning(
+                self, "Align Audio Clips",
+                f"Could not find matching waveforms between the selected clips and \"{ref_name}\":\n\n{reasons}"
+            )
+            self.status_label.setText("Audio alignment failed: No matching waveforms found.")
+            return
+
+        min_new_start = 0
+        for gid, shift in shifts.items():
+            ent = next(e for e in target_entities if e['group_id'] == gid)
+            for c in ent['clips']:
+                new_s = c.timeline_start_ms + shift
+                if new_s < min_new_start:
+                    min_new_start = new_s
+
+        global_adjustment = abs(min_new_start) if min_new_start < 0 else 0
+
+        def action():
+            if global_adjustment > 0:
+                for c in ref_entity['clips']:
+                    c.timeline_start_ms += global_adjustment
+
+            for gid, shift in shifts.items():
+                actual_shift = shift + global_adjustment
+                ent = next(e for e in target_entities if e['group_id'] == gid)
+                for c in ent['clips']:
+                    c.timeline_start_ms = max(0, c.timeline_start_ms + actual_shift)
+
+            self._resolve_track_collisions()
+            self.prune_empty_tracks()
+            self.timeline.clips.sort(key=lambda c: c.timeline_start_ms)
+            self.update_project_resolution_from_timeline()
+            self.playback_manager.seek_to_frame(self.timeline_widget.playhead_pos_ms)
+
+        self._perform_complex_timeline_change(f'Align Audio to "{ref_name}"', action)
+
+        status_msg = f"Aligned {len(shifts)} clip(s) to '{ref_name}'."
+        if failed_entities:
+            status_msg += f" ({len(failed_entities)} clip(s) had no matching audio)"
+        self.status_label.setText(status_msg)
 
     def _perform_complex_timeline_change(self, description, change_function):
         before_snapshot = self._create_snapshot()
