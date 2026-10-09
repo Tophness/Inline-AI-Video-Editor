@@ -7,6 +7,9 @@ import tempfile
 import shutil
 import uuid
 import inspect
+import shlex
+import urllib.request
+import subprocess
 from pathlib import Path
 from contextlib import contextmanager
 import ffmpeg
@@ -31,7 +34,6 @@ class MockComponent:
         if not self.choices and args and isinstance(args[0], list):
             self.choices = args[0]
         self.visible = kwargs.get('visible', True)
-        self.choices = kwargs.get('choices', [])
         self.elem_id = kwargs.get('elem_id', None)
         self.minimum = kwargs.get('minimum', 0)
         self.maximum = kwargs.get('maximum', 100)
@@ -238,10 +240,11 @@ from PyQt6.QtWidgets import (
     QPushButton, QLabel, QLineEdit, QTextEdit, QSlider, QCheckBox, QComboBox,
     QFileDialog, QGroupBox, QFormLayout, QTableWidget, QTableWidgetItem,
     QHeaderView, QProgressBar, QScrollArea, QListWidget, QListWidgetItem,
-    QMessageBox, QRadioButton, QSizePolicy, QMenu, QSplitter, QInputDialog
+    QMessageBox, QRadioButton, QSizePolicy, QMenu, QSplitter, QInputDialog,
+    QStackedWidget, QButtonGroup
 )
 from PyQt6.QtCore import Qt, QThread, QObject, pyqtSignal, QUrl, QSize, QRectF, QTimer
-from PyQt6.QtGui import QPixmap, QImage, QDropEvent
+from PyQt6.QtGui import QPixmap, QImage, QDropEvent, QFont
 from PyQt6.QtMultimedia import QMediaPlayer
 from PyQt6.QtMultimediaWidgets import QVideoWidget
 from PIL.ImageQt import ImageQt
@@ -257,6 +260,16 @@ def working_directory(path):
         yield
     finally:
         os.chdir(old_cwd)
+
+def _get_subprocess_hidden_kwargs():
+    kwargs = {}
+    if os.name == 'nt':
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = subprocess.SW_HIDE
+        kwargs['startupinfo'] = startupinfo
+        kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+    return kwargs
 
 class DynamicUiBuilder(QObject):
     def __init__(self, main_widget):
@@ -361,7 +374,6 @@ class DynamicUiBuilder(QObject):
             if mock_gradio.is_capturing: mock_gradio.stop_capture()
 
     def build_config_tab(self):
-        """Introspects the wan2gp-configuration plugin to build the config UI."""
         mock_gradio.start_capture()
         config_plugin_path = wan2gp_dir / 'plugins' / 'wan2gp-configuration' / 'plugin.py'
         
@@ -580,52 +592,858 @@ class DynamicUiBuilder(QObject):
                 target_config[var_name] = {'type': 'file', 'widget': self.main.widgets[var_name]}
                 parent_layout.addWidget(container)
 
+class Wan2GPInstallWorker(QThread):
+    step_changed = pyqtSignal(int, str)
+    progress_updated = pyqtSignal(int, str)
+    log_output = pyqtSignal(str)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, target_dir, mode="auto", env_type="venv", auto_flag=True, extra_args="", 
+                 install_git=True, install_python=True, install_uv_conda=True, is_existing_folder=False, parent=None):
+        super().__init__(parent)
+        self.target_dir = Path(target_dir)
+        self.mode = mode
+        self.env_type = env_type
+        self.auto_flag = auto_flag
+        self.extra_args = extra_args
+        self.install_git = install_git
+        self.install_python = install_python
+        self.install_uv_conda = install_uv_conda
+        self.is_existing_folder = is_existing_folder
+        self.is_cancelled = False
+        self.current_process = None
+
+    def cancel(self):
+        self.is_cancelled = True
+        if self.current_process and self.current_process.poll() is None:
+            try:
+                self.current_process.terminate()
+                self.current_process.kill()
+            except Exception:
+                pass
+
+    def run(self):
+        try:
+            self._execute_installation()
+        except InterruptedError:
+            self.log_output.emit("[-] Installation was cancelled by user.")
+            self.finished.emit(False, "Installation cancelled.")
+        except Exception as e:
+            self.log_output.emit(f"[!] Error: {e}")
+            import traceback
+            self.log_output.emit(traceback.format_exc())
+            self.finished.emit(False, str(e))
+
+    def _execute_installation(self):
+        self.step_changed.emit(0, "Prerequisites")
+        self.progress_updated.emit(5, "Checking prerequisites...")
+        
+        python_exe = self._ensure_prerequisites()
+        if self.is_cancelled: raise InterruptedError()
+
+        self.step_changed.emit(1, "Wan2GP Repository")
+        self.progress_updated.emit(35, "Preparing Wan2GP repository...")
+        self._ensure_repository()
+        if self.is_cancelled: raise InterruptedError()
+
+        self.step_changed.emit(2, "Installer Script")
+        self.progress_updated.emit(50, "Executing Wan2GP installer...")
+        self._run_wan2gp_installer(python_exe)
+        if self.is_cancelled: raise InterruptedError()
+
+        self.step_changed.emit(3, "Finalizing")
+        self.progress_updated.emit(95, "Verifying environment...")
+        self._verify_installation()
+
+        self.progress_updated.emit(100, "Installation complete!")
+        self.log_output.emit("[+] Wan2GP installation finished successfully!")
+        self.finished.emit(True, "Installation complete.")
+
+    def _download_file(self, url, dest_path, desc=""):
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0 Wan2GPInstaller'})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            total_size = int(resp.headers.get('content-length', 0))
+            downloaded = 0
+            chunk_size = 65536
+            with open(dest_path, 'wb') as f:
+                while True:
+                    if self.is_cancelled: raise InterruptedError()
+                    chunk = resp.read(chunk_size)
+                    if not chunk: break
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        pct = int((downloaded / total_size) * 100)
+                        self.log_output.emit(f"[*] {desc}: {pct}% ({downloaded // (1024*1024)}MB / {total_size // (1024*1024)}MB)")
+
+    def _run_command(self, cmd, cwd=None, env=None):
+        if self.is_cancelled: raise InterruptedError()
+        kwargs = _get_subprocess_hidden_kwargs()
+        
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            encoding='utf-8',
+            errors='replace',
+            **kwargs
+        )
+        self.current_process = proc
+
+        for line in iter(proc.stdout.readline, ''):
+            if self.is_cancelled:
+                proc.terminate()
+                raise InterruptedError()
+            clean_line = line.rstrip('\r\n')
+            if clean_line:
+                self.log_output.emit(clean_line)
+
+        proc.wait()
+        self.current_process = None
+        return proc.returncode
+
+    def _ensure_prerequisites(self):
+        self.log_output.emit("[*] Checking Git...")
+        git_path = shutil.which('git')
+        if not git_path and os.name == 'nt' and os.path.exists(r"C:\Program Files\Git\cmd\git.exe"):
+            git_path = r"C:\Program Files\Git\cmd\git.exe"
+            os.environ["PATH"] = r"C:\Program Files\Git\cmd" + os.pathsep + os.environ.get("PATH", "")
+
+        if not git_path:
+            if self.install_git and os.name == 'nt':
+                self.log_output.emit("[*] Git not found. Downloading Git for Windows...")
+                self.progress_updated.emit(10, "Downloading Git for Windows...")
+                git_url = "https://github.com/git-for-windows/git/releases/download/v2.54.0.windows.1/Git-2.54.0-64-bit.exe"
+                tmp_git = Path(tempfile.gettempdir()) / "Git-Installer.exe"
+                self._download_file(git_url, tmp_git, "Downloading Git")
+                
+                self.log_output.emit("[*] Installing Git silently...")
+                self.progress_updated.emit(18, "Installing Git silently...")
+                ret = self._run_command([str(tmp_git), "/VERYSILENT", "/NORESTART", "/NOCANCEL", "/SP-", "/SUPPRESSMSGBOXES"])
+                if tmp_git.exists(): tmp_git.unlink(missing_ok=True)
+                if ret != 0: raise RuntimeError(f"Git installer returned error code {ret}")
+                os.environ["PATH"] = r"C:\Program Files\Git\cmd" + os.pathsep + os.environ.get("PATH", "")
+                self.log_output.emit("[+] Git installed successfully.")
+            else:
+                raise RuntimeError("Git is required. Please install Git manually or enable Auto-install Git.")
+        else:
+            self.log_output.emit(f"[+] Git detected: {git_path}")
+
+        self.log_output.emit("[*] Checking Python (>= 3.11)...")
+        self.progress_updated.emit(22, "Checking Python version...")
+        python_candidates = [
+            sys.executable,
+            shutil.which('python'),
+            shutil.which('python3'),
+            r"C:\Program Files\PyManager\pymanager.exe" if os.name == 'nt' else None,
+            os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python311\python.exe") if os.name == 'nt' else None
+        ]
+
+        valid_python = None
+        for cand in [c for c in python_candidates if c and os.path.exists(c)]:
+            try:
+                kwargs = _get_subprocess_hidden_kwargs()
+                res = subprocess.run(
+                    [cand, "-c", "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)"],
+                    capture_output=True, **kwargs
+                )
+                if res.returncode == 0:
+                    valid_python = cand
+                    break
+            except Exception:
+                continue
+
+        if not valid_python:
+            if self.install_python and os.name == 'nt':
+                self.log_output.emit("[*] Python 3.11+ not found. Downloading PyManager...")
+                self.progress_updated.emit(25, "Downloading PyManager...")
+                py_url = "https://www.python.org/ftp/python/pymanager/python-manager-26.0.msi"
+                tmp_py = Path(tempfile.gettempdir()) / "pymanager.msi"
+                self._download_file(py_url, tmp_py, "Downloading PyManager")
+
+                self.log_output.emit("[*] Installing PyManager silently...")
+                self.progress_updated.emit(28, "Installing PyManager...")
+                ret = self._run_command(["msiexec", "/i", str(tmp_py), "/passive", "/norestart"])
+                if tmp_py.exists(): tmp_py.unlink(missing_ok=True)
+                if ret != 0: raise RuntimeError(f"PyManager MSI returned error code {ret}")
+
+                pymanager_exe = r"C:\Program Files\PyManager\pymanager.exe"
+                if not os.path.exists(pymanager_exe):
+                    raise RuntimeError("PyManager was not found after installation.")
+
+                self.log_output.emit("[*] Configuring Python 3.11 via PyManager...")
+                self.progress_updated.emit(30, "Configuring Python 3.11...")
+                self._run_command([pymanager_exe, "install", "--configure"])
+                self._run_command([pymanager_exe, "install", "3.11"])
+                self._run_command([pymanager_exe, "install", "--aliases"])
+
+                py311_dir = os.path.expandvars(r"%LOCALAPPDATA%\Programs\Python\Python311")
+                py311_exe = os.path.join(py311_dir, "python.exe")
+                os.environ["PATH"] = py311_dir + os.pathsep + os.path.join(py311_dir, "Scripts") + os.pathsep + os.environ.get("PATH", "")
+                if os.path.exists(py311_exe):
+                    valid_python = py311_exe
+                    self.log_output.emit(f"[+] Python 3.11 installed: {valid_python}")
+                else:
+                    raise RuntimeError("Python 3.11 was not found after PyManager configuration.")
+            else:
+                raise RuntimeError("Python 3.11+ is required. Please install Python 3.11+ or enable Auto-install Python.")
+        else:
+            self.log_output.emit(f"[+] Compatible Python detected: {valid_python}")
+
+        if self.env_type == 'uv' and not shutil.which('uv'):
+            if self.install_uv_conda:
+                self.log_output.emit("[*] uv not found. Installing uv via pip...")
+                self.progress_updated.emit(33, "Installing uv...")
+                self._run_command([valid_python, "-m", "pip", "install", "uv"])
+            else:
+                raise RuntimeError("uv environment was selected, but 'uv' is not installed.")
+
+        elif self.env_type == 'conda' and not shutil.which('conda'):
+            user_conda = os.path.expandvars(r"%USERPROFILE%\Miniconda3\condabin\conda.bat") if os.name == 'nt' else None
+            if user_conda and os.path.exists(user_conda):
+                pass
+            elif self.install_uv_conda and os.name == 'nt':
+                self.log_output.emit("[*] Conda not found. Downloading Miniconda3...")
+                self.progress_updated.emit(33, "Downloading Miniconda3...")
+                conda_url = "https://repo.anaconda.com/miniconda/Miniconda3-latest-Windows-x86_64.exe"
+                tmp_conda = Path(tempfile.gettempdir()) / "miniconda.exe"
+                self._download_file(conda_url, tmp_conda, "Downloading Miniconda")
+                
+                self.log_output.emit("[*] Installing Miniconda3 silently...")
+                target_conda = os.path.expandvars(r"%USERPROFILE%\Miniconda3")
+                ret = self._run_command([str(tmp_conda), "/InstallationType=JustMe", "/RegisterPython=0", "/S", f"/D={target_conda}"])
+                if tmp_conda.exists(): tmp_conda.unlink(missing_ok=True)
+                if ret != 0: raise RuntimeError(f"Miniconda installer returned error code {ret}")
+            else:
+                raise RuntimeError("Conda environment was selected, but 'conda' was not found.")
+
+        return valid_python
+
+    def _ensure_repository(self):
+        if self.is_existing_folder:
+            if not (self.target_dir / "setup.py").exists() or not (self.target_dir / "wgp.py").exists():
+                raise RuntimeError(f"The selected folder '{self.target_dir}' does not contain Wan2GP (setup.py or wgp.py missing).")
+            self.log_output.emit(f"[+] Using existing Wan2GP directory: {self.target_dir}")
+            return
+
+        if not self.target_dir.exists() or not (self.target_dir / "setup.py").exists():
+            self.log_output.emit(f"[*] Cloning Wan2GP from https://github.com/deepbeepmeep/Wan2GP.git...")
+            self.progress_updated.emit(40, "Cloning Wan2GP repository...")
+            if not self.target_dir.parent.exists():
+                self.target_dir.parent.mkdir(parents=True, exist_ok=True)
+            ret = self._run_command(["git", "clone", "https://github.com/deepbeepmeep/Wan2GP.git", str(self.target_dir)])
+            if ret != 0: raise RuntimeError(f"git clone failed with return code {ret}")
+            self.log_output.emit("[+] Repository cloned successfully.")
+        else:
+            self.log_output.emit(f"[+] Repository already exists at {self.target_dir}.")
+
+    def _run_wan2gp_installer(self, python_exe):
+        setup_script = self.target_dir / "setup.py"
+        if not setup_script.exists():
+            raise RuntimeError(f"setup.py not found in {self.target_dir}")
+
+        cmd = [python_exe, "setup.py", "install", "--env", self.env_type]
+        if self.auto_flag:
+            cmd.append("--auto")
+        if self.extra_args.strip():
+            cmd.extend(shlex.split(self.extra_args.strip()))
+
+        self.log_output.emit(f"[*] Running command: {' '.join(cmd)}")
+        self.progress_updated.emit(60, "Running setup.py install...")
+
+        ret = self._run_command(cmd, cwd=self.target_dir)
+        if ret != 0:
+            raise RuntimeError(f"Wan2GP setup.py install failed with exit code {ret}.")
+
+    def _verify_installation(self):
+        envs_json = self.target_dir / "envs.json"
+        if envs_json.exists():
+            self.log_output.emit(f"[+] envs.json verified: {envs_json}")
+        else:
+            self.log_output.emit("[!] Warning: envs.json was not generated, checking fallback venv...")
+            candidate = self.target_dir / "envs" / self.env_type
+            if not candidate.exists() and not (self.target_dir / "venv").exists():
+                raise RuntimeError("Installation completed but virtual environment was not detected.")
+
 class Wan2GPSetupWidget(QWidget):
+    PAGE_WELCOME = 0
+    PAGE_DIRECTORY = 1
+    PAGE_MODE = 2
+    PAGE_PROGRESS = 3
+    PAGE_FINISH = 4
+
     def __init__(self, plugin_instance, parent=None):
         super().__init__(parent)
         self.plugin = plugin_instance
+        self.worker = None
 
-        layout = QVBoxLayout(self)
+        self.main_layout = QVBoxLayout(self)
+        self.main_layout.setContentsMargins(20, 20, 20, 20)
+
+        self.stacked = QStackedWidget()
+        self.main_layout.addWidget(self.stacked)
+
+        self._setup_welcome_page()
+        self._setup_directory_page()
+        self._setup_mode_page()
+        self._setup_progress_page()
+        self._setup_finish_page()
+
+        self.stacked.setCurrentIndex(self.PAGE_WELCOME)
+
+    def _setup_welcome_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.setSpacing(20)
+
+        layout.addStretch()
+
+        header_label = QLabel(
+            "<h2>Wan2GP AI Generator Setup</h2>"
+            "<p style='color: #aaa;'>"
+            "Choose whether you would like to connect an existing Wan2GP setup or perform a new installation."
+            "</p>"
+        )
+        header_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        header_label.setWordWrap(True)
+        layout.addWidget(header_label)
+
+        btn_box = QWidget()
+        btn_layout = QVBoxLayout(btn_box)
+        btn_layout.setSpacing(12)
+        btn_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        button_style = """
+            QPushButton {
+                background-color: #383838;
+                color: #ffffff;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 10px 24px;
+                font-size: 13px;
+                font-weight: 500;
+                min-width: 280px;
+            }
+            QPushButton:hover {
+                background-color: #4a4a4a;
+                border: 1px solid #777777;
+            }
+            QPushButton:pressed {
+                background-color: #2b2b2b;
+                border: 1px solid #333333;
+            }
+        """
+
+        primary_button_style = """
+            QPushButton {
+                background-color: #2e7d32;
+                color: #ffffff;
+                border: 1px solid #43a047;
+                border-radius: 4px;
+                padding: 10px 24px;
+                font-size: 13px;
+                font-weight: 600;
+                min-width: 280px;
+            }
+            QPushButton:hover {
+                background-color: #388e3c;
+                border: 1px solid #66bb6a;
+            }
+            QPushButton:pressed {
+                background-color: #1b5e20;
+                border: 1px solid #2e7d32;
+            }
+        """
+
+        self.select_existing_btn = QPushButton("Select Existing Wan2GP Installation")
+        self.select_existing_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.select_existing_btn.setStyleSheet(button_style)
+        self.select_existing_btn.clicked.connect(self._on_welcome_select_existing)
+
+        self.install_wan2gp_btn = QPushButton("Install Wan2GP")
+        self.install_wan2gp_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.install_wan2gp_btn.setStyleSheet(primary_button_style)
+        self.install_wan2gp_btn.clicked.connect(lambda: self.stacked.setCurrentIndex(self.PAGE_DIRECTORY))
+
+        btn_layout.addWidget(self.select_existing_btn)
+        btn_layout.addWidget(self.install_wan2gp_btn)
+        layout.addWidget(btn_box)
+
+        layout.addStretch()
+        self.stacked.addWidget(page)
+
+    def _setup_directory_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
         layout.setSpacing(15)
 
-        info_label = QLabel(
-            "<h2>AI Generator Setup Required</h2>"
-            "<p>The 'Wan2GP' backend could not be found.</p>"
-            "<p>Please choose an option below:</p>"
+        header = QLabel(
+            "<h2>Step 1: Choose Wan2GP Directory</h2>"
+            "<p style='color: #aaa;'>Specify the directory where Wan2GP will be downloaded and installed.</p>"
         )
-        info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        info_label.setWordWrap(True)
+        header.setWordWrap(True)
+        layout.addWidget(header)
 
-        self.install_button = QPushButton("Install Wan2GP Automatically (Recommended)")
-        self.install_button.setToolTip("Clones the repository from GitHub and installs dependencies.\nRequires Git and an internet connection.")
+        dir_group = QGroupBox("Directory Options")
+        dir_layout = QVBoxLayout(dir_group)
+        dir_layout.setSpacing(10)
 
-        self.select_folder_button = QPushButton("Select Existing Wan2GP Folder...")
-        self.select_folder_button.setToolTip("Point the plugin to a folder where you have already downloaded Wan2GP.")
+        self.default_loc_radio = QRadioButton("Standard Wan2GP directory (Recommended)")
+        self.default_loc_radio.setChecked(True)
+        self.custom_loc_radio = QRadioButton("Custom destination directory")
 
-        self.status_label = QLabel("")
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_label.setWordWrap(True)
+        path_row = QHBoxLayout()
+        self.target_dir_edit = QLineEdit(str(wan2gp_dir))
+        self.target_dir_edit.textChanged.connect(lambda txt: self._update_folder_status(Path(txt.strip())))
+        self.browse_dir_btn = QPushButton("Browse...")
+        self.browse_dir_btn.clicked.connect(self._browse_directory)
+        path_row.addWidget(self.target_dir_edit, 1)
+        path_row.addWidget(self.browse_dir_btn)
+
+        dir_layout.addWidget(self.default_loc_radio)
+        dir_layout.addWidget(self.custom_loc_radio)
+        dir_layout.addLayout(path_row)
+
+        self.folder_status_label = QLabel()
+        self.folder_status_label.setWordWrap(True)
+        dir_layout.addWidget(self.folder_status_label)
+        layout.addWidget(dir_group)
+
+        self.default_loc_radio.toggled.connect(self._on_loc_radio_toggled)
 
         layout.addStretch()
-        layout.addWidget(info_label)
-        layout.addWidget(self.install_button)
-        layout.addWidget(self.select_folder_button)
-        layout.addWidget(self.status_label)
+
+        nav_row = QHBoxLayout()
+        self.dir_back_btn = QPushButton("← Back")
+        self.dir_back_btn.clicked.connect(lambda: self.stacked.setCurrentIndex(self.PAGE_WELCOME))
+        self.dir_next_btn = QPushButton("Next →")
+        self.dir_next_btn.setStyleSheet("QPushButton { font-weight: bold; padding: 6px 16px; }")
+        self.dir_next_btn.clicked.connect(lambda: self.stacked.setCurrentIndex(self.PAGE_MODE))
+
+        nav_row.addWidget(self.dir_back_btn)
+        nav_row.addStretch()
+        nav_row.addWidget(self.dir_next_btn)
+        layout.addLayout(nav_row)
+
+        self.stacked.addWidget(page)
+
+    def _setup_mode_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(14)
+
+        header = QLabel(
+            "<h2>Step 2: Choose Installation Mode</h2>"
+            "<p style='color: #aaa;'>Select the installation type and configure environment options.</p>"
+        )
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        mode_box = QGroupBox("Installation Mode")
+        mode_layout = QVBoxLayout(mode_box)
+        mode_layout.setSpacing(8)
+
+        self.auto_mode_radio = QRadioButton("Automatic Install (1-Click) (Recommended)")
+        self.auto_mode_radio.setChecked(True)
+        self.auto_mode_desc = QLabel("<small style='color: #aaa;'>Automatically creates a Python virtual environment (venv) and runs the official 1-Click setup.</small>")
+        self.auto_mode_desc.setWordWrap(True)
+
+        self.manual_mode_radio = QRadioButton("Manual Install (Custom Environment & Script Options)")
+        self.manual_mode_desc = QLabel("<small style='color: #aaa;'>Allows customizing the environment manager (venv, uv, conda, system), prerequisites, and flags.</small>")
+        self.manual_mode_desc.setWordWrap(True)
+
+        mode_layout.addWidget(self.auto_mode_radio)
+        mode_layout.addWidget(self.auto_mode_desc)
+        mode_layout.addWidget(self.manual_mode_radio)
+        mode_layout.addWidget(self.manual_mode_desc)
+        layout.addWidget(mode_box)
+
+        self.manual_box = QGroupBox("Manual Environment Settings")
+        manual_layout = QVBoxLayout(self.manual_box)
+        manual_layout.setSpacing(8)
+
+        env_label = QLabel("<b>Environment Manager:</b>")
+        manual_layout.addWidget(env_label)
+
+        self.env_group = QButtonGroup(self)
+        self.env_venv_radio = QRadioButton("venv (Standard Python Virtual Environment)")
+        self.env_uv_radio = QRadioButton("uv (Astral uv - Ultra fast)")
+        self.env_conda_radio = QRadioButton("conda (Miniconda / Anaconda)")
+        self.env_none_radio = QRadioButton("none (System Python / No virtual environment)")
+        self.env_venv_radio.setChecked(True)
+
+        for btn in [self.env_venv_radio, self.env_uv_radio, self.env_conda_radio, self.env_none_radio]:
+            self.env_group.addButton(btn)
+            manual_layout.addWidget(btn)
+
+        prereq_label = QLabel("<b>Prerequisites & Automation:</b>")
+        manual_layout.addWidget(prereq_label)
+        self.cb_git = QCheckBox("Automatically install Git if missing (Silent Git installer)")
+        self.cb_git.setChecked(True)
+        self.cb_python = QCheckBox("Automatically install Python 3.11+ via PyManager if missing")
+        self.cb_python.setChecked(True)
+        self.cb_uv_conda = QCheckBox("Automatically install UV or Miniconda if selected environment manager is missing")
+        self.cb_uv_conda.setChecked(True)
+        manual_layout.addWidget(self.cb_git)
+        manual_layout.addWidget(self.cb_python)
+        manual_layout.addWidget(self.cb_uv_conda)
+
+        flags_label = QLabel("<b>Script Flags:</b>")
+        manual_layout.addWidget(flags_label)
+        self.cb_auto_flag = QCheckBox("Pass --auto flag (Unattended setup)")
+        self.cb_auto_flag.setChecked(True)
+        manual_layout.addWidget(self.cb_auto_flag)
+
+        extra_row = QHBoxLayout()
+        extra_row.addWidget(QLabel("Extra Flags:"))
+        self.extra_args_edit = QLineEdit()
+        self.extra_args_edit.setPlaceholderText("e.g. --torch-version 2.4.0")
+        extra_row.addWidget(self.extra_args_edit, 1)
+        manual_layout.addLayout(extra_row)
+
+        self.manual_box.setVisible(False)
+        layout.addWidget(self.manual_box)
+
+        self.auto_mode_radio.toggled.connect(lambda checked: self.manual_box.setVisible(not checked))
+
         layout.addStretch()
 
-        self.install_button.clicked.connect(self.plugin._handle_install)
-        self.select_folder_button.clicked.connect(self.plugin._handle_select_folder)
+        nav_row = QHBoxLayout()
+        nav_button_style = """
+            QPushButton {
+                background-color: #383838;
+                color: #ffffff;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 7px 16px;
+                font-size: 12px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background-color: #4a4a4a;
+                border: 1px solid #777777;
+            }
+            QPushButton:pressed {
+                background-color: #2b2b2b;
+            }
+        """
 
-    def show_message(self, text):
-        self.status_label.setText(text)
+        primary_button_style = """
+            QPushButton {
+                background-color: #2e7d32;
+                color: #ffffff;
+                border: 1px solid #43a047;
+                border-radius: 4px;
+                padding: 7px 20px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background-color: #388e3c;
+                border: 1px solid #66bb6a;
+            }
+            QPushButton:pressed {
+                background-color: #1b5e20;
+            }
+        """
 
-    def set_buttons_enabled(self, enabled):
-        self.install_button.setEnabled(enabled)
-        self.select_folder_button.setEnabled(enabled)
+        self.mode_back_btn = QPushButton("← Back")
+        self.mode_back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.mode_back_btn.setStyleSheet(nav_button_style)
+        self.mode_back_btn.clicked.connect(lambda: self.stacked.setCurrentIndex(self.PAGE_DIRECTORY))
+
+        self.check_prereqs_btn = QPushButton("🔍 Check Prerequisites")
+        self.check_prereqs_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.check_prereqs_btn.setStyleSheet(nav_button_style)
+        self.check_prereqs_btn.clicked.connect(self._check_prerequisites)
+
+        self.start_btn = QPushButton("🚀 Start Installation")
+        self.start_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.start_btn.setStyleSheet(primary_button_style)
+        self.start_btn.clicked.connect(self._start_installation)
+
+        nav_row.addWidget(self.mode_back_btn)
+        nav_row.addWidget(self.check_prereqs_btn)
+        nav_row.addStretch()
+        nav_row.addWidget(self.start_btn)
+        layout.addLayout(nav_row)
+
+        self.stacked.addWidget(page)
+
+    def _setup_progress_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(10)
+
+        self.progress_title = QLabel("<h2>Installing Wan2GP...</h2>")
+        layout.addWidget(self.progress_title)
+
+        self.step_label = QLabel("Current Step: Initializing")
+        self.step_label.setStyleSheet("font-weight: bold; color: #4fc3f7;")
+        layout.addWidget(self.step_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedHeight(22)
+        layout.addWidget(self.progress_bar)
+
+        self.status_detail = QLabel("Preparing execution...")
+        layout.addWidget(self.status_detail)
+
+        log_box = QGroupBox("Installation Log")
+        log_layout = QVBoxLayout(log_box)
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setFont(QFont("Consolas", 9))
+        self.log_text.setStyleSheet("background-color: #1e1e1e; color: #e0e0e0; border: 1px solid #333;")
+        log_layout.addWidget(self.log_text)
+
+        self.autoscroll_cb = QCheckBox("Auto-scroll output")
+        self.autoscroll_cb.setChecked(True)
+        log_layout.addWidget(self.autoscroll_cb)
+        layout.addWidget(log_box, 1)
+
+        bottom_row = QHBoxLayout()
+        bottom_row.addStretch()
+        self.cancel_btn = QPushButton("Cancel Installation")
+        self.cancel_btn.clicked.connect(self._cancel_installation)
+        bottom_row.addWidget(self.cancel_btn)
+        layout.addLayout(bottom_row)
+
+        self.stacked.addWidget(page)
+
+    def _setup_finish_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setSpacing(15)
+
+        self.finish_header = QLabel("<h2>Installation Complete!</h2>")
+        layout.addWidget(self.finish_header)
+
+        self.finish_info = QLabel("Wan2GP has been installed successfully and the environment is ready.")
+        self.finish_info.setWordWrap(True)
+        layout.addWidget(self.finish_info)
+
+        layout.addStretch()
+
+        btn_row = QHBoxLayout()
+        self.retry_btn = QPushButton("Back to Settings")
+        self.retry_btn.clicked.connect(lambda: self.stacked.setCurrentIndex(self.PAGE_MODE))
+        self.launch_btn = QPushButton("✨ Launch AI Generator")
+        self.launch_btn.setStyleSheet(
+            "QPushButton { font-weight: bold; padding: 8px 18px; background-color: #1976d2; color: white; border-radius: 4px; }"
+        )
+        self.launch_btn.clicked.connect(self._on_launch_clicked)
+
+        btn_row.addWidget(self.retry_btn)
+        btn_row.addStretch()
+        btn_row.addWidget(self.launch_btn)
+        layout.addLayout(btn_row)
+
+        self.stacked.addWidget(page)
+
+    def _on_welcome_select_existing(self):
+        selected = QFileDialog.getExistingDirectory(self, "Select Existing Wan2GP Installation", self.target_dir_edit.text())
+        if not selected:
+            return
+
+        p = Path(selected)
+        has_wgp = (p / "wgp.py").exists()
+        has_envs = (p / "envs.json").exists()
+        has_venv = any((p / v).exists() for v in ["envs/venv", "envs/uv", "venv", ".venv"])
+
+        if has_wgp and (has_envs or has_venv):
+            # Already installed and ready -> load immediately
+            global wan2gp_dir
+            wan2gp_dir = p
+            self.plugin.app.settings['wan2gp_path'] = str(p)
+            self.plugin.app._save_settings()
+            QMessageBox.information(
+                self, "Installation Found",
+                f"Valid Wan2GP installation detected in:\n{selected}\n\nLoading AI Generator..."
+            )
+            self.plugin._on_install_completed()
+        elif has_wgp and (p / "setup.py").exists():
+            self.target_dir_edit.setText(selected)
+            self.custom_loc_radio.setChecked(True)
+            self._update_folder_status(p)
+            QMessageBox.information(
+                self, "Repository Found",
+                "Wan2GP source code detected, but its environment has not been configured yet.\n\n"
+                "Advancing to install settings so the installer can set up the environment."
+            )
+            self.stacked.setCurrentIndex(self.PAGE_MODE)
+        else:
+            QMessageBox.warning(
+                self, "Invalid Directory",
+                "The selected folder does not contain 'wgp.py'. Please select a valid Wan2GP directory."
+            )
+
+    def _browse_directory(self):
+        selected = QFileDialog.getExistingDirectory(self, "Select Destination Directory", self.target_dir_edit.text())
+        if selected:
+            self.target_dir_edit.setText(selected)
+            self.custom_loc_radio.setChecked(True)
+            self._update_folder_status(Path(selected))
+
+    def _on_loc_radio_toggled(self, checked):
+        if checked:
+            self.target_dir_edit.setText(str(wan2gp_dir))
+            self._update_folder_status(Path(wan2gp_dir))
+
+    def _update_folder_status(self, folder_path):
+        if not folder_path or not folder_path.exists():
+            self.folder_status_label.setText("<small style='color: #aaa;'>Directory does not exist yet. Wan2GP will be cloned here.</small>")
+            return
+
+        has_wgp = (folder_path / "wgp.py").exists()
+        has_setup = (folder_path / "setup.py").exists()
+        has_envs = (folder_path / "envs.json").exists()
+        has_venv = any((folder_path / p).exists() for p in ["envs/venv", "envs/uv", "venv", ".venv"])
+
+        if has_wgp and (has_envs or has_venv):
+            self.folder_status_label.setText(
+                "<span style='color: #4caf50;'><b>✓ Ready:</b> Valid existing Wan2GP installation detected in this folder!</span>"
+            )
+        elif has_wgp and has_setup:
+            self.folder_status_label.setText(
+                "<span style='color: #ff9800;'><b>⚡ Source Found:</b> Wan2GP repository detected, but environment needs setup.</span>"
+            )
+        else:
+            self.folder_status_label.setText(
+                "<small style='color: #888;'>Directory exists but does not contain Wan2GP. The repository will be cloned here.</small>"
+            )
+
+    def _check_prerequisites(self):
+        git_found = shutil.which('git') or (os.name == 'nt' and os.path.exists(r"C:\Program Files\Git\cmd\git.exe"))
+        py_found = None
+        for cand in [sys.executable, shutil.which('python'), shutil.which('python3'), r"C:\Program Files\PyManager\pymanager.exe"]:
+            if cand and os.path.exists(cand):
+                try:
+                    kwargs = _get_subprocess_hidden_kwargs()
+                    res = subprocess.run([cand, "-c", "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)"], capture_output=True, **kwargs)
+                    if res.returncode == 0:
+                        py_found = cand
+                        break
+                except Exception:
+                    continue
+
+        uv_found = bool(shutil.which('uv'))
+        conda_found = bool(shutil.which('conda'))
+
+        git_status = '<font color="green">Detected</font>' if git_found else '<font color="orange">Not Detected (will be auto-installed)</font>'
+        py_status = ('<font color="green">Detected (' + str(py_found) + ')</font>') if py_found else '<font color="orange">Not Detected (PyManager will be auto-installed)</font>'
+        uv_status = '<font color="green">Detected</font>' if uv_found else '<font color="gray">Not Installed</font>'
+        conda_status = '<font color="green">Detected</font>' if conda_found else '<font color="gray">Not Installed</font>'
+
+        msg = (
+            "<b>Prerequisites Status:</b><br><br>"
+            f"• <b>Git:</b> {git_status}<br>"
+            f"• <b>Python 3.11+:</b> {py_status}<br>"
+            f"• <b>uv:</b> {uv_status}<br>"
+            f"• <b>Conda:</b> {conda_status}<br>"
+        )
+        QMessageBox.information(self, "Prerequisites Check", msg)
+
+    def _start_installation(self):
+        target = Path(self.target_dir_edit.text().strip())
+        is_auto = self.auto_mode_radio.isChecked()
+
+        if is_auto:
+            env_type = "venv"
+            auto_flag = True
+            extra_args = ""
+            install_git = True
+            install_python = True
+            install_uv_conda = True
+        else:
+            if self.env_venv_radio.isChecked(): env_type = "venv"
+            elif self.env_uv_radio.isChecked(): env_type = "uv"
+            elif self.env_conda_radio.isChecked(): env_type = "conda"
+            else: env_type = "none"
+
+            auto_flag = self.cb_auto_flag.isChecked()
+            extra_args = self.extra_args_edit.text()
+            install_git = self.cb_git.isChecked()
+            install_python = self.cb_python.isChecked()
+            install_uv_conda = self.cb_uv_conda.isChecked()
+
+        is_existing = (target / "setup.py").exists()
+
+        self.log_text.clear()
+        self.progress_bar.setValue(0)
+        self.step_label.setText("Step 1/4: Prerequisites")
+        self.status_detail.setText("Starting installation worker...")
+        self.stacked.setCurrentIndex(self.PAGE_PROGRESS)
+
+        self.worker = Wan2GPInstallWorker(
+            target_dir=target,
+            mode="auto" if is_auto else "manual",
+            env_type=env_type,
+            auto_flag=auto_flag,
+            extra_args=extra_args,
+            install_git=install_git,
+            install_python=install_python,
+            install_uv_conda=install_uv_conda,
+            is_existing_folder=is_existing,
+            parent=self
+        )
+
+        self.worker.step_changed.connect(self._on_worker_step)
+        self.worker.progress_updated.connect(self._on_worker_progress)
+        self.worker.log_output.connect(self._on_worker_log)
+        self.worker.finished.connect(self._on_worker_finished)
+        self.worker.start()
+
+    def _on_worker_step(self, step_idx, step_name):
+        self.step_label.setText(f"Step {step_idx + 1}/4: {step_name}")
+
+    def _on_worker_progress(self, percent, message):
+        self.progress_bar.setValue(percent)
+        self.status_detail.setText(message)
+
+    def _on_worker_log(self, line):
+        self.log_text.append(line)
+        if self.autoscroll_cb.isChecked():
+            sb = self.log_text.verticalScrollBar()
+            sb.setValue(sb.maximum())
+
+    def _on_worker_finished(self, success, message):
+        global wan2gp_dir
+        target = Path(self.target_dir_edit.text().strip())
+        wan2gp_dir = target
+        self.plugin.app.settings['wan2gp_path'] = str(target)
+        self.plugin.app._save_settings()
+
+        self.stacked.setCurrentIndex(self.PAGE_FINISH)
+        if success:
+            self.finish_header.setText("<h2>🎉 Installation Complete!</h2>")
+            self.finish_info.setText("Wan2GP has been installed successfully and is ready to load.")
+            self.launch_btn.setVisible(True)
+            self.retry_btn.setVisible(False)
+        else:
+            self.finish_header.setText("<h2>❌ Installation Failed</h2>")
+            self.finish_info.setText(f"The installation could not be completed.<br><br><b>Error:</b> {message}<br><br>Check the log for details.")
+            self.launch_btn.setVisible(False)
+            self.retry_btn.setVisible(True)
+
+    def _cancel_installation(self):
+        if self.worker and self.worker.isRunning():
+            self.cancel_btn.setEnabled(False)
+            self.status_detail.setText("Cancelling installation...")
+            self.worker.cancel()
+
+    def _on_launch_clicked(self):
+        self.plugin._on_install_completed()
 
 class VideoResultItemWidget(QWidget):
-    """A widget to display a generated video with a hover-to-play preview and insert button."""
     def __init__(self, video_path, plugin, parent=None):
         super().__init__(parent)
         self.video_path = video_path
@@ -715,7 +1533,6 @@ class VideoResultItemWidget(QWidget):
         self.media_player.setVideoOutput(None)
         self.app.timeline_widget.set_hover_preview_rects(None, None)
         self.plugin.insert_generated_clip(self.video_path)
-
 
 class QueueTableWidget(QTableWidget):
     rowsMoved = pyqtSignal(int, int)
@@ -1264,21 +2081,16 @@ class WgpDesktopPluginWidget(QWidget):
         else:
             self.config_layout_container.addWidget(QLabel("Configuration options unavailable."))
 
+        btn_row = QHBoxLayout()
         self.apply_config_btn = QPushButton("Apply Changes")
         self.apply_config_btn.clicked.connect(self._on_apply_config_changes)
-        main_layout.addWidget(self.apply_config_btn)
-    
-    def _create_scrollable_form_tab(self):
-        tab_widget = QWidget()
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        layout = QVBoxLayout(tab_widget)
-        layout.addWidget(scroll_area)
-        content_widget = QWidget()
-        form_layout = QFormLayout(content_widget)
-        scroll_area.setWidget(content_widget)
-        return tab_widget, form_layout
+        btn_row.addWidget(self.apply_config_btn)
 
+        self.manage_install_btn = QPushButton("Manage / Reinstall Wan2GP...")
+        self.manage_install_btn.clicked.connect(self.plugin.open_setup_wizard)
+        btn_row.addWidget(self.manage_install_btn)
+
+        main_layout.addLayout(btn_row)
 
     def init_wgp_state(self):
         with working_directory(wan2gp_dir):
@@ -2072,147 +2884,110 @@ class Plugin(VideoEditorPlugin):
         if visible and not self._heavy_content_loaded:
             self._load_heavy_ui()
 
-    def _handle_select_folder(self):
-        if not self.setup_widget: return
-        self.setup_widget.show_message("Waiting for folder selection...")
-        
-        selected_path_str = QFileDialog.getExistingDirectory(self.app, "Select Wan2GP Installation Folder")
+    def _get_active_env_path(self):
+        global wan2gp_dir
+        if not wan2gp_dir or not wan2gp_dir.exists():
+            return None
 
-        if not selected_path_str:
-            self.setup_widget.show_message("")
-            return
-
-        selected_path = Path(selected_path_str)
-        wgp_path_check = selected_path / 'wgp.py'
-        if not wgp_path_check.exists():
-            QMessageBox.warning(self.app, "Invalid Folder", "The selected folder does not contain 'wgp.py'.\nPlease select a valid Wan2GP root directory.")
-            self.setup_widget.show_message("Invalid folder selected.")
-            return
-
-        self.setup_widget.set_buttons_enabled(False)
-        self.setup_widget.show_message("Valid folder selected. Checking requirements...")
-        QApplication.processEvents()
-
-        requirements_path = selected_path / 'requirements.txt'
-
-        try:
-            if requirements_path.exists():
-                import subprocess
-
-                self.setup_widget.show_message("Installing PyTorch... This can take several minutes.")
-                QApplication.processEvents()
-                torch_command = [
-                    sys.executable, "-m", "pip", "install",
-                    "torch", "torchvision", "torchaudio",
-                    "--index-url", "https://download.pytorch.org/whl/cu130"
-                ]
-                subprocess.check_call(torch_command)
-
-                self.setup_widget.show_message("Installing other requirements from selected folder...")
-                QApplication.processEvents()
-                req_command = [
-                    sys.executable, "-m", "pip", "install",
-                    "-r", str(requirements_path)
-                ]
-                subprocess.check_call(req_command)
-                self.setup_widget.show_message("Dependency installation complete!")
-
-            global wan2gp_dir
-            wan2gp_dir = selected_path
-            self.app.settings['wan2gp_path'] = selected_path_str
-            self.app._save_settings()
-            
-            QTimer.singleShot(500, self._load_heavy_ui)
-
-        except (subprocess.CalledProcessError, Exception) as e:
-            error_message = f"An error occurred installing dependencies.\nPlease check the console for more details.\n\nError: {e}"
-            QMessageBox.critical(self.app, "Setup Failed", error_message)
-            print(f"Full error details: {e}")
-            self.setup_widget.show_message(f"Installation failed. Check console for details.")
-            self.setup_widget.set_buttons_enabled(True)
-
-    def _handle_install(self):
-        if not self.setup_widget: return
-        self.setup_widget.set_buttons_enabled(False)
-        
-        repo_url = "https://github.com/deepbeepmeep/Wan2GP.git"
-        requirements_path = wan2gp_dir / 'requirements.txt'
-
-        if wan2gp_dir.exists():
-            reply = QMessageBox.question(
-                self.app, "Folder Exists",
-                f"The target folder '{wan2gp_dir}' already exists. Delete it and re-clone?\n\nWARNING: This is irreversible.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.No:
-                self.setup_widget.show_message("Installation cancelled.")
-                self.setup_widget.set_buttons_enabled(True)
-                return
+        envs_json = wan2gp_dir / 'envs.json'
+        if envs_json.exists():
             try:
-                shutil.rmtree(wan2gp_dir)
-            except OSError as e:
-                QMessageBox.critical(self.app, "Error", f"Failed to delete existing directory: {e}")
-                self.setup_widget.show_message("Error: Could not delete folder.")
-                self.setup_widget.set_buttons_enabled(True)
-                return
+                with open(envs_json, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
 
-        self.setup_widget.show_message("Cloning Wan2GP repository...")
-        QApplication.processEvents()
-        
-        try:
-            import git
-            import subprocess
+                active = data.get('active') or data.get('current_env')
+                envs = data.get('envs') or data.get('environments') or {}
+
+                if active and active in envs:
+                    raw_path = envs[active].get('path') or envs[active].get('env_path')
+                    if raw_path:
+                        p = Path(raw_path)
+                        if not p.is_absolute():
+                            p = (wan2gp_dir / p).resolve()
+                        if p.exists():
+                            return p
+
+                for env_name, env_info in envs.items():
+                    raw_path = env_info.get('path') or env_info.get('env_path')
+                    if raw_path:
+                        p = Path(raw_path)
+                        if not p.is_absolute():
+                            p = (wan2gp_dir / p).resolve()
+                        if p.exists():
+                            return p
+            except Exception as e:
+                print(f"[Wan2GP] Error parsing envs.json: {e}")
+
+        candidates = [
+            wan2gp_dir / 'env_venv',
+            wan2gp_dir / 'env_uv',
+            wan2gp_dir / 'env_conda',
+            wan2gp_dir / 'envs' / 'venv',
+            wan2gp_dir / 'envs' / 'uv',
+            wan2gp_dir / 'venv',
+            wan2gp_dir / '.venv'
+        ]
+        for c in candidates:
+            if (c / 'Scripts' / 'python.exe').exists() or (c / 'bin' / 'python').exists():
+                return c
+
+        return None
+
+    def _is_wan2gp_installed(self):
+        global wan2gp_dir
+        if not wan2gp_dir or not wan2gp_dir.exists():
+            return False
+
+        wgp_path = wan2gp_dir / 'wgp.py'
+        if not wgp_path.exists():
+            return False
+
+        env_path = self._get_active_env_path()
+        return env_path is not None and env_path.exists()
+
+    def _activate_wan2gp_env(self):
+        env_path = self._get_active_env_path()
+        if not env_path or not env_path.exists():
+            return False
+
+        if os.name == 'nt':
+            site_packages = env_path / 'Lib' / 'site-packages'
+            scripts_dir = env_path / 'Scripts'
+            lib_bin = env_path / 'Library' / 'bin'
+            if site_packages.exists() and str(site_packages) not in sys.path:
+                sys.path.insert(0, str(site_packages))
             
-            git.Repo.clone_from(repo_url, wan2gp_dir)
+            paths_to_add = [str(scripts_dir), str(lib_bin)]
+            os.environ["PATH"] = os.pathsep.join([p for p in paths_to_add if os.path.exists(p)]) + os.pathsep + os.environ.get("PATH", "")
             
-            if str(wan2gp_dir) not in sys.path:
-                sys.path.insert(0, str(wan2gp_dir))
-
-            self.setup_widget.show_message("Installing PyTorch... This can take several minutes.")
-            QApplication.processEvents()
-            torch_command = [
-                sys.executable, "-m", "pip", "install",
-                "torch", "torchvision", "torchaudio",
-                "--index-url", "https://download.pytorch.org/whl/cu130"
-            ]
-            subprocess.check_call(torch_command)
-
-            self.setup_widget.show_message("Installing other requirements...")
-            QApplication.processEvents()
-            req_command = [
-                sys.executable, "-m", "pip", "install",
-                "-r", str(requirements_path)
-            ]
-            subprocess.check_call(req_command)
-
-            self.setup_widget.show_message("Installation complete! Loading plugin...")
-            QMessageBox.information(
-                self.app, "Installation Complete",
-                "Wan2GP and its dependencies have been successfully installed. The plugin will now load."
-            )
-            
-            QTimer.singleShot(500, self._load_heavy_ui)
-
-        except (git.exc.GitCommandError, subprocess.CalledProcessError, Exception) as e:
-            error_message = f"An error occurred during setup.\n\nPlease ensure 'git' is installed and you have an internet connection.\nCheck the console for more details.\n\nError: {e}"
-            QMessageBox.critical(self.app, "Setup Failed", error_message)
-            print(f"Full error details: {e}")
-            self.setup_widget.show_message(f"Installation failed. Check console for details.")
-            self.setup_widget.set_buttons_enabled(True)
-            if wan2gp_dir.exists():
-                shutil.rmtree(wan2gp_dir, ignore_errors=True)
+            if hasattr(os, 'add_dll_directory'):
+                for d in [site_packages / 'torch' / 'lib', scripts_dir, lib_bin]:
+                    if d.exists():
+                        try:
+                            os.add_dll_directory(str(d))
+                        except Exception:
+                            pass
+        else:
+            for sp in env_path.glob("lib/python*/site-packages"):
+                if sp.exists() and str(sp) not in sys.path:
+                    sys.path.insert(0, str(sp))
+            bin_dir = env_path / 'bin'
+            if bin_dir.exists():
+                os.environ["PATH"] = str(bin_dir) + os.pathsep + os.environ.get("PATH", "")
+                
+        os.environ["VIRTUAL_ENV"] = str(env_path)
+        return True
 
     def _load_heavy_ui(self):
         if self._heavy_content_loaded:
             return True
 
-        wgp_path = wan2gp_dir / 'wgp.py'
-
-        if not wgp_path.exists():
+        if not self._is_wan2gp_installed():
             self.setup_widget = Wan2GPSetupWidget(self)
             self.dock_widget.setWidget(self.setup_widget)
             return False
+
+        self._activate_wan2gp_env()
 
         self.app.status_label.setText("Loading AI Generator backend...")
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
@@ -2220,16 +2995,15 @@ class Plugin(VideoEditorPlugin):
         try:
             import importlib
             global wgp
+            wgp_path = wan2gp_dir / 'wgp.py'
             if wgp is None:
                 with working_directory(wan2gp_dir):
                     module_name = "wgp"
                     spec = importlib.util.spec_from_file_location(module_name, wgp_path)
-                    
                     if spec is None or spec.loader is None:
                         raise ImportError(f"Could not create a module spec for the file at {wgp_path}")
 
                     wgp_module = importlib.util.module_from_spec(spec)
-
                     original_sys_path = list(sys.path)
                     if str(wan2gp_dir) not in sys.path:
                         sys.path.insert(0, str(wan2gp_dir))
@@ -2261,6 +3035,18 @@ class Plugin(VideoEditorPlugin):
             return False
         finally:
             QApplication.restoreOverrideCursor()
+
+    def _on_install_completed(self):
+        self.setup_widget = None
+        self._heavy_content_loaded = False
+        self._load_heavy_ui()
+
+    def open_setup_wizard(self):
+        self._heavy_content_loaded = False
+        self.setup_widget = Wan2GPSetupWidget(self)
+        self.dock_widget.setWidget(self.setup_widget)
+        self.dock_widget.show()
+        self.dock_widget.raise_()
 
     def disable(self):
         try: self.app.timeline_widget.context_menu_requested.disconnect(self.on_timeline_context_menu)
@@ -2557,6 +3343,7 @@ class Plugin(VideoEditorPlugin):
         if not os.path.exists(video_path):
             self.app.status_label.setText(f"Error: Output file not found: {video_path}"); return
         start_ms, end_ms = self.active_region
+
         def complex_insertion_action():
             self.app._add_media_files_to_project([video_path])
             media_info = self.app.media_properties.get(video_path)
@@ -2580,6 +3367,7 @@ class Plugin(VideoEditorPlugin):
                 if audio_track_index > self.app.timeline.num_audio_tracks: self.app.timeline.num_audio_tracks = audio_track_index
                 audio_clip = TimelineClip(video_path, start_ms, 0, actual_duration_ms, audio_track_index, 'audio', 'video', group_id)
                 self.app.timeline.add_clip(audio_clip)
+
         try:
             self.app._perform_complex_timeline_change("Insert AI Clip", complex_insertion_action)
             self.app.prune_empty_tracks()
