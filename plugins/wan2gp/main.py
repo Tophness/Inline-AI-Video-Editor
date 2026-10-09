@@ -4,6 +4,7 @@ import threading
 import time
 import json
 import tempfile
+import types
 import shutil
 import uuid
 import inspect
@@ -13,6 +14,10 @@ import subprocess
 from pathlib import Path
 from contextlib import contextmanager
 import ffmpeg
+import importlib.util
+
+os.environ.setdefault("WANGP_DISABLE_GRADIO_ENGINE_PATCH", "1")
+os.environ.setdefault("WANGP_DISABLE_GRADIO_MODEL_SWITCH_PATCH", "1")
 
 class MockApp:
     def __init__(self):
@@ -21,51 +26,190 @@ class MockApp:
     def setup_ui_tabs(self, *args, **kwargs): pass
     def run_component_insertion(self, *args, **kwargs): pass
 
-class MockComponent:
-    def __init__(self, type_name="Generic", *args, **kwargs):
-        self.type_name = type_name
+class MockComponentMeta(type):
+    def __getattr__(cls, name):
+        if name.startswith('__') and name.endswith('__'):
+            raise AttributeError(name)
+        def dummy(*args, **kwargs):
+            return cls
+        setattr(cls, name, dummy)
+        return dummy
+
+    def __fspath__(cls):
+        return ""
+
+    def __enter__(cls):
+        inst = MockComponent(cls.__name__)
+        return inst.__enter__()
+
+    def __exit__(cls, exc_type, exc_val, exc_tb):
+        pass
+
+class MockBlockFn:
+    def __init__(self, fn, inputs=None, outputs=None):
+        self.fn = fn
+        self.name = getattr(fn, '__name__', str(fn))
+        self.inputs = list(inputs) if isinstance(inputs, (list, tuple, set)) else ([inputs] if inputs is not None else [])
+        self.outputs = list(outputs) if isinstance(outputs, (list, tuple, set)) else ([outputs] if outputs is not None else [])
+
+class MockComponent(metaclass=MockComponentMeta):
+    _last_blocks = None
+
+    def __init__(self, *args, **kwargs):
+        # 1. Identify component type from class name (Tab, Tabs, Row, Column, Slider, Dropdown, etc.)
+        cls_name = self.__class__.__name__
+        if cls_name != "MockComponent":
+            self.type_name = cls_name
+        elif args and isinstance(args[0], str) and args[0] in ("Blocks", "Block", "Slider", "Dropdown", "Row", "Column", "Tabs", "Tab", "Markdown", "HTML", "Button", "Checkbox", "Textbox", "Audio", "Video", "Image", "File", "Gallery", "State"):
+            self.type_name = args[0]
+        else:
+            self.type_name = kwargs.pop("type_name", None) or "Generic"
+
+        if self.type_name in ("Blocks", "Block"):
+            MockComponent._last_blocks = self
+
         self.args = args
         self.kwargs = kwargs
         self.children = []
         self.id = str(uuid.uuid4())
+        self._id = self.id
+        self.fns = {}
+
+        # 2. Extract label (from kwargs or first positional string argument like gr.Tab("General"))
         self.label = kwargs.get('label', None)
-        self.value = kwargs.get('value', None)
+        if self.label is None and args and isinstance(args[0], str):
+            self.label = args[0]
+
+        # 3. Extract choices
         self.choices = kwargs.get('choices', [])
-        if not self.choices and args and isinstance(args[0], list):
-            self.choices = args[0]
-        self.visible = kwargs.get('visible', True)
-        self.elem_id = kwargs.get('elem_id', None)
+        if not self.choices and args and isinstance(args[0], (list, tuple)):
+            self.choices = list(args[0])
+
+        # 4. Extract value & numeric ranges for sliders
+        self.value = kwargs.get('value', None)
         self.minimum = kwargs.get('minimum', 0)
         self.maximum = kwargs.get('maximum', 100)
         self.step = kwargs.get('step', 1)
+        if len(args) >= 1 and isinstance(args[0], (int, float)):
+            self.minimum = args[0]
+        if len(args) >= 2 and isinstance(args[1], (int, float)):
+            self.maximum = args[1]
+        if len(args) >= 3 and self.value is None:
+            self.value = args[2]
+
+        self.visible = bool(kwargs.get('visible', True))
+        self.elem_id = kwargs.get('elem_id', None)
+        self.elem_classes = kwargs.get('elem_classes', None)
         self.interactive = kwargs.get('interactive', True)
         self.placeholder = kwargs.get('placeholder', None)
         self.info = kwargs.get('info', None)
 
-        self.change = lambda *a, **k: self
-        self.click = lambda *a, **k: self
-        self.input = lambda *a, **k: self
-        self.select = lambda *a, **k: self
-        self.upload = lambda *a, **k: self
-        self.then = lambda *a, **k: self
-        self.mount = lambda *a, **k: self
+        for k, v in kwargs.items():
+            setattr(self, k, v)
+
+        # 5. Automatically register with the active parent container (Row, Column, Tab)
+        gr_mod = sys.modules.get('gradio')
+        if gr_mod and hasattr(gr_mod, '_register_component'):
+            gr_mod._register_component(self)
+
+        # Event handlers
+        self.change = lambda *a, **k: self._add_event(*a, **k)
+        self.click = lambda *a, **k: self._add_event(*a, **k)
+        self.input = lambda *a, **k: self._add_event(*a, **k)
+        self.select = lambda *a, **k: self._add_event(*a, **k)
+        self.upload = lambda *a, **k: self._add_event(*a, **k)
+        self.then = lambda *a, **k: self._add_event(*a, **k)
+        self.mount = lambda *a, **k: self._add_event(*a, **k)
+        self.blur = lambda *a, **k: self._add_event(*a, **k)
+        self.submit = lambda *a, **k: self._add_event(*a, **k)
+        self.release = lambda *a, **k: self._add_event(*a, **k)
+
+    def _add_event(self, fn=None, inputs=None, outputs=None, **kwargs):
+        if fn is not None:
+            block_fn = MockBlockFn(fn, inputs, outputs)
+            self.fns[id(block_fn)] = block_fn
+            if MockComponent._last_blocks is not None:
+                MockComponent._last_blocks.fns[id(block_fn)] = block_fn
+        return self
 
     def __enter__(self):
-        if hasattr(sys.modules['gradio'], '_push_context'):
-            sys.modules['gradio']._push_context(self)
+        gr_mod = sys.modules.get('gradio')
+        if gr_mod and hasattr(gr_mod, '_push_context'):
+            gr_mod._push_context(self)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if hasattr(sys.modules['gradio'], '_pop_context'):
-            sys.modules['gradio']._pop_context()
+        gr_mod = sys.modules.get('gradio')
+        if gr_mod and hasattr(gr_mod, '_pop_context'):
+            gr_mod._pop_context()
+
+    def get_config_file(self, *args, **kwargs):
+        return {"dependencies": []}
+
+    def get_toggable_elements(self, *args, **kwargs):
+        return []
+
+    def __call__(self, *args, **kwargs):
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+        return self
 
     def __getattr__(self, name):
+        if name in ("elem_classes", "classes"):
+            return None
+        if name == "visible":
+            return True
+        if name == "choices":
+            return []
+        if name in ("fns", "dependencies", "kwargs"):
+            return {}
+        if name in ("children", "blocks", "args"):
+            return []
+        if name == "value":
+            return None
         def dummy_method(*args, **kwargs):
             return self
         return dummy_method
 
-    def __repr__(self):
-        return f"<MockComponent {self.type_name} id={self.id} label='{self.label}'>"
+class MockAutoModule(types.ModuleType):
+    def __init__(self, name="gradio"):
+        super().__init__(name)
+        self.__path__ = []
+
+    def __getattr__(self, name):
+        if name.startswith('__') and name.endswith('__'):
+            raise AttributeError(name)
+
+        if name == "choices":
+            return []
+        if name in ("fns", "dependencies"):
+            return {}
+        if name in ("children", "blocks"):
+            return []
+        if name == "update":
+            return lambda *args, **kwargs: MockComponent("update", *args, **kwargs)
+
+        if name.isupper() and '_' in name:
+            return ""
+
+        if name[0].isupper():
+            cls = type(name, (MockComponent,), {
+                "get_config_file": lambda self, *a, **k: {"dependencies": []},
+            })
+            setattr(self, name, cls)
+            return cls
+
+        sub_name = f"{self.__name__}.{name}" if hasattr(self, '__name__') else f"gradio.{name}"
+        sub_mod = MockAutoModule(sub_name)
+        sys.modules[sub_name] = sub_mod
+        setattr(self, name, sub_mod)
+        return sub_mod
+
+    def __call__(self, *args, **kwargs):
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+        name = getattr(self, '__name__', 'Generic').split('.')[-1]
+        return MockComponent(name, *args, **kwargs)
 
 class MockEventData:
     def __init__(self, target=None, _data=None):
@@ -86,16 +230,12 @@ class MockProgress:
 class MockThemes:
     def Soft(self, *args, **kwargs): return None
 
-class MockGradioModule:
+class MockGradioModule(MockAutoModule):
     def __init__(self):
+        super().__init__("gradio")
         self.context_stack = []
         self.root_components = []
         self.is_capturing = False
-
-        self.EventData = MockEventData
-        self.SelectData = MockSelectData
-        self.Progress = MockProgress
-        self.themes = MockThemes()
 
     def _push_context(self, component):
         if not self.is_capturing: return
@@ -127,41 +267,12 @@ class MockGradioModule:
         self.is_capturing = False
         return self.root_components
 
-    def Column(self, *args, **kwargs): return MockComponent("Column", *args, **kwargs)
-    def Row(self, *args, **kwargs): return MockComponent("Row", *args, **kwargs)
-    def Tabs(self, *args, **kwargs): return MockComponent("Tabs", *args, **kwargs)
-    def Tab(self, *args, **kwargs): return MockComponent("Tab", *args, **kwargs)
-    def Group(self, *args, **kwargs): return MockComponent("Group", *args, **kwargs)
-    def Accordion(self, *args, **kwargs): return MockComponent("Accordion", *args, **kwargs)
-    def Slider(self, *args, **kwargs): return self._register_component(MockComponent("Slider", *args, **kwargs))
-    def Dropdown(self, *args, **kwargs): return self._register_component(MockComponent("Dropdown", *args, **kwargs))
-    def Textbox(self, *args, **kwargs): return self._register_component(MockComponent("Textbox", *args, **kwargs))
-    def Number(self, *args, **kwargs): return self._register_component(MockComponent("Number", *args, **kwargs))
-    def Checkbox(self, *args, **kwargs): return self._register_component(MockComponent("Checkbox", *args, **kwargs))
-    def CheckboxGroup(self, *args, **kwargs): return self._register_component(MockComponent("CheckboxGroup", *args, **kwargs))
-    def Radio(self, *args, **kwargs): return self._register_component(MockComponent("Radio", *args, **kwargs))
-    def Audio(self, *args, **kwargs): return self._register_component(MockComponent("Audio", *args, **kwargs))
-    def File(self, *args, **kwargs): return self._register_component(MockComponent("File", *args, **kwargs))
-    def Image(self, *args, **kwargs): return self._register_component(MockComponent("Image", *args, **kwargs))
-    def Video(self, *args, **kwargs): return self._register_component(MockComponent("Video", *args, **kwargs))
-    def HTML(self, *args, **kwargs): return self._register_component(MockComponent("HTML", *args, **kwargs))
-    def Markdown(self, *args, **kwargs): return self._register_component(MockComponent("Markdown", *args, **kwargs))
-    def Button(self, *args, **kwargs): return self._register_component(MockComponent("Button", *args, **kwargs))
-    def DownloadButton(self, *args, **kwargs): return self._register_component(MockComponent("Button", *args, **kwargs))
-    def UploadButton(self, *args, **kwargs): return self._register_component(MockComponent("Button", *args, **kwargs))
-    def State(self, *args, **kwargs): return self._register_component(MockComponent("State", *args, **kwargs))
-    def Gallery(self, *args, **kwargs): return self._register_component(MockComponent("Gallery", *args, **kwargs))
-    def ImageEditor(self, *args, **kwargs): return self._register_component(MockComponent("Image", *args, **kwargs))
-    def Text(self, *args, **kwargs): return self.Textbox(*args, **kwargs)
-    def Files(self, *args, **kwargs): return self.File(*args, **kwargs) 
-    def Blocks(self, *args, **kwargs): return MockComponent("Blocks", *args, **kwargs)
-    
-    def update(self, *args, **kwargs): return None
-    def on(self, *args, **kwargs): return MockComponent("Dependency", *args, **kwargs)
-
     def Error(self, *args, **kwargs): raise Exception(f"Gradio Error: {args}")
     def Info(self, *args, **kwargs): print(f"Gradio Info: {args}")
     def Warning(self, *args, **kwargs): print(f"Gradio Warning: {args}")
+    def update(self, *args, **kwargs):
+        return self._register_component(MockComponent("update", *args, **kwargs))
+    def skip(self, *args, **kwargs): return None
 
 class MockAdvancedMediaGallery:
     def __init__(self, *args, **kwargs):
@@ -180,6 +291,7 @@ class MockPluginModule: pass
 class MockPluginManager:
     def __init__(self, *args, **kwargs): pass
     def discover_plugins(self, *args, **kwargs): return []
+    def discover_plugin_model_extensions(self, *args, **kwargs): return []
     def get_custom_js(self): return ""
     def run_component_insertion(self, *args, **kwargs): pass
     def load_plugins_from_directory(self, *args, **kwargs): pass
@@ -187,6 +299,13 @@ class MockPluginManager:
     def get_all_plugins(self, *args, **kwargs): return {}
     def setup_ui(self, *args, **kwargs): return {}
     def run_data_hooks(self, hook_name, configs=None, **kwargs): return configs
+    def set_server_config(self, *args, **kwargs): pass
+    def notify_model_change(self, *args, **kwargs): pass
+
+    def __getattr__(self, name):
+        def dummy_method(*args, **kwargs):
+            return [] if ("discover" in name or "list" in name or "extensions" in name) else None
+        return dummy_method
 
 class MockWAN2GPApplication:
     def __init__(self, *args, **kwargs): self.plugin_manager = MockPluginManager()
@@ -205,7 +324,9 @@ class MockWAN2GPPlugin:
             setattr(self, name, None)
 
     def request_component(self, name):
-        setattr(self, name, MockComponent(elem_id=name))
+        comp = MockComponent(elem_id=name)
+        comp.value = MockAutoModule(name + "_val")
+        setattr(self, name, comp)
 
     def add_tab(self, tab_id, label, component_constructor):
         component_constructor()
@@ -215,11 +336,51 @@ class MockWAN2GPPlugin:
             return self.wgp_module.get_sorted_dropdown(*args, **kwargs)
         return [], [], []
 
+    def set_global(self, name, value):
+        if self.wgp_module and hasattr(self.wgp_module, name):
+            setattr(self.wgp_module, name, value)
+
+    def __getattr__(self, name):
+        def dummy_method(*args, **kwargs): return None
+        return dummy_method
+
+class MockGradioForm:
+    def __init__(self, *args, **kwargs):
+        self.baseline = MockComponent("Textbox")
+        self.remote = MockComponent("Textbox")
+        self.notice = MockComponent("HTML")
+        self.conflict_controls = MockComponent("Row")
+    def bind_save(self, *args, **kwargs):
+        return MockComponent("Dependency")
+
+mock_form_sync = MockAutoModule("shared.gradio.form_sync")
+mock_form_sync.GradioForm = MockGradioForm
+sys.modules['shared.gradio.form_sync'] = mock_form_sync
+
 mock_gradio = MockGradioModule()
 sys.modules['gradio'] = mock_gradio
-sys.modules['gradio.gallery'] = mock_gradio
-sys.modules['shared.gradio.gallery'] = mock_gallery = MockGradioModule()
-mock_gallery.AdvancedMediaGallery = MockAdvancedMediaGallery
+sys.modules['gradio_client'] = MockAutoModule("gradio_client")
+mock_shared_gallery = MockAutoModule("shared.gradio.gallery")
+mock_shared_gallery.AdvancedMediaGallery = MockAdvancedMediaGallery
+sys.modules['shared.gradio.gallery'] = mock_shared_gallery
+
+class GradioFinder:
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "gradio" or fullname.startswith("gradio.") or fullname == "gradio_client" or fullname.startswith("gradio_client."):
+            return importlib.util.spec_from_loader(fullname, self)
+        return None
+
+    def create_module(self, spec):
+        if spec.name == "gradio":
+            return mock_gradio
+        mod = MockAutoModule(spec.name)
+        sys.modules[spec.name] = mod
+        return mod
+
+    def exec_module(self, module):
+        pass
+
+sys.meta_path.insert(0, GradioFinder())
 
 sys.modules['shared.gradio.audio_gallery'] = mock_audio_gallery = MockGradioModule()
 mock_audio_gallery.AudioGallery = MockAudioGallery
@@ -298,7 +459,15 @@ class DynamicUiBuilder(QObject):
         
         try:
             with working_directory(wan2gp_dir):
-                locals_dict = wgp.generate_video_tab(
+                gen_tab_fn = getattr(wgp, 'generate_media_tab', getattr(wgp, 'generate_video_tab', None))
+                if not gen_tab_fn:
+                    print("[DynamicUI] Neither generate_media_tab nor generate_video_tab found in wgp.")
+                    return None
+
+                main_blocks = MockComponent("Blocks")
+                MockComponent._last_blocks = main_blocks
+
+                locals_dict = gen_tab_fn(
                     update_form=False,
                     state_dict=mock_state,
                     ui_defaults=ui_defaults,
@@ -307,7 +476,7 @@ class DynamicUiBuilder(QObject):
                     model_base_type_choice=MockComponent("Dropdown"),
                     model_choice=MockComponent("Dropdown"),
                     header=MockComponent("Markdown"),
-                    main=MockComponent("Blocks"),
+                    main=main_blocks,
                     main_tabs=MockComponent("Tabs")
                 )
 
@@ -375,10 +544,17 @@ class DynamicUiBuilder(QObject):
 
     def build_config_tab(self):
         mock_gradio.start_capture()
-        config_plugin_path = wan2gp_dir / 'plugins' / 'wan2gp-configuration' / 'plugin.py'
-        
-        if not config_plugin_path.exists():
-            print(f"[DynamicUI] Config plugin not found at {config_plugin_path}")
+
+        config_candidates = [
+            wan2gp_dir / 'plugins' / 'configuration' / 'plugin.py',
+            wan2gp_dir / 'plugins' / 'wan2gp-configuration' / 'plugin.py',
+        ]
+        if (wan2gp_dir / 'plugins').exists():
+            config_candidates += list((wan2gp_dir / 'plugins').glob('*config*/plugin.py'))
+
+        config_plugin_path = next((p for p in config_candidates if p.exists()), None)
+        if not config_plugin_path:
+            print(f"[DynamicUI] Config plugin not found in {wan2gp_dir / 'plugins'}")
             return None
 
         try:
@@ -404,15 +580,16 @@ class DynamicUiBuilder(QObject):
 
             root_components = mock_gradio.stop_capture()
 
-            config_tabs_node = None
-            for comp in root_components:
-                if comp.type_name == 'Tabs':
-                    config_tabs_node = comp
-                    break
-                for child in comp.children:
-                    if child.type_name == 'Tabs':
-                        config_tabs_node = child
-                        break
+            def find_tabs_node(nodes):
+                for comp in nodes:
+                    if comp.type_name == 'Tabs':
+                        return comp
+                    found = find_tabs_node(comp.children)
+                    if found:
+                        return found
+                return None
+
+            config_tabs_node = find_tabs_node(root_components)
             
             if not config_tabs_node:
                 print("[DynamicUI] Could not locate Tabs in config UI.")
@@ -459,12 +636,15 @@ class DynamicUiBuilder(QObject):
             if var_name in ['audio_source']: continue
             
             if node.type_name in ['Column', 'Row', 'Group', 'Blocks']:
-                container = QGroupBox(label) if label and node.type_name != 'Blocks' else QWidget()
+                has_explicit_title = bool(node.label) and (node.type_name in ['Group', 'Column'] and not node.label.endswith('_row') and not node.label.endswith('_col'))
+                container = QGroupBox(node.label) if has_explicit_title else QWidget()
                 layout = QHBoxLayout(container) if node.type_name == 'Row' else QVBoxLayout(container)
-                layout.setContentsMargins(0,0,0,0)
-                if label: layout.setContentsMargins(5,15,5,5)
+                layout.setContentsMargins(0, 0, 0, 0)
+                if has_explicit_title:
+                    layout.setContentsMargins(5, 15, 5, 5)
                 self._build_qt_layout(node.children, layout, is_config)
-                if not node.visible: container.hide()
+                if not node.visible:
+                    container.hide()
                 parent_layout.addWidget(container)
             
             elif node.type_name == 'Accordion':
@@ -478,11 +658,15 @@ class DynamicUiBuilder(QObject):
 
             elif node.type_name == 'Slider':
                 if not var_name: continue
+                scale = 100.0 if isinstance(node.step, float) else 1.0
+                precision = 2 if isinstance(node.step, float) else 0
+                val = node.value if node.value is not None else node.minimum
                 container = self.main._create_slider_with_label_dynamic(
-                    var_name, node.minimum, node.maximum, node.value or node.minimum, 
-                    100.0 if isinstance(node.step, float) else 1.0, 
-                    2 if isinstance(node.step, float) else 0, label
+                    var_name, node.minimum, node.maximum, val, 
+                    scale, precision, label
                 )
+                target_dict = self.main.config_inputs_config if is_config else self.main.dynamic_inputs_config
+                target_dict[var_name] = {'type': 'slider', 'widget': self.main.widgets[var_name], 'scale': scale, 'precision': precision}
                 parent_layout.addWidget(container)
 
             elif node.type_name == 'Dropdown' or node.type_name == 'CheckboxGroup':
@@ -896,6 +1080,9 @@ class Wan2GPSetupWidget(QWidget):
 
         self.stacked.setCurrentIndex(self.PAGE_WELCOME)
 
+    # -------------------------------------------------------------------------
+    # Screen 1: Welcome (Select Existing or Install)
+    # -------------------------------------------------------------------------
     def _setup_welcome_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -978,6 +1165,9 @@ class Wan2GPSetupWidget(QWidget):
         layout.addStretch()
         self.stacked.addWidget(page)
 
+    # -------------------------------------------------------------------------
+    # Screen 2: Wan2GP Directory Options
+    # -------------------------------------------------------------------------
     def _setup_directory_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1033,6 +1223,9 @@ class Wan2GPSetupWidget(QWidget):
 
         self.stacked.addWidget(page)
 
+    # -------------------------------------------------------------------------
+    # Screen 3: Installation Mode & Configuration
+    # -------------------------------------------------------------------------
     def _setup_mode_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1176,6 +1369,9 @@ class Wan2GPSetupWidget(QWidget):
 
         self.stacked.addWidget(page)
 
+    # -------------------------------------------------------------------------
+    # Screen 4: Live Progress Screen
+    # -------------------------------------------------------------------------
     def _setup_progress_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1219,6 +1415,9 @@ class Wan2GPSetupWidget(QWidget):
 
         self.stacked.addWidget(page)
 
+    # -------------------------------------------------------------------------
+    # Screen 5: Finish Screen
+    # -------------------------------------------------------------------------
     def _setup_finish_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -1249,6 +1448,9 @@ class Wan2GPSetupWidget(QWidget):
 
         self.stacked.addWidget(page)
 
+    # -------------------------------------------------------------------------
+    # Logic & Navigation
+    # -------------------------------------------------------------------------
     def _on_welcome_select_existing(self):
         selected = QFileDialog.getExistingDirectory(self, "Select Existing Wan2GP Installation", self.target_dir_edit.text())
         if not selected:
@@ -1260,7 +1462,6 @@ class Wan2GPSetupWidget(QWidget):
         has_venv = any((p / v).exists() for v in ["envs/venv", "envs/uv", "venv", ".venv"])
 
         if has_wgp and (has_envs or has_venv):
-            # Already installed and ready -> load immediately
             global wan2gp_dir
             wan2gp_dir = p
             self.plugin.app.settings['wan2gp_path'] = str(p)
@@ -2145,15 +2346,24 @@ class WgpDesktopPluginWidget(QWidget):
             is_visible = True
             if hasattr(mock, 'kwargs') and isinstance(mock.kwargs, dict):
                 is_visible = mock.kwargs.get('visible', True)
-            elif hasattr(mock, 'visible'):
+            elif hasattr(mock, 'visible') and not callable(mock.visible):
                 is_visible = mock.visible
-            combo.setVisible(is_visible)
+            combo.setVisible(bool(is_visible) if not callable(is_visible) else True)
             
             combo.blockSignals(False)
 
+    def _update_header_info(self, model_type):
+        res = wgp.generate_header(model_type, wgp.compile, wgp.attention_mode)
+        if isinstance(res, tuple):
+            description, header = res
+            text = f"{description}<br>{header}" if description else header
+        else:
+            text = str(res)
+        self.header_info.setText(text)
+
     def refresh_ui_from_model_change(self, model_type):
         with working_directory(wan2gp_dir):
-            self.header_info.setText(wgp.generate_header(model_type, wgp.compile, wgp.attention_mode))
+            self._update_header_info(model_type)
             ui_defaults = wgp.get_default_settings(model_type)
             wgp.set_model_settings(self.state, model_type, ui_defaults)
 
@@ -2189,7 +2399,10 @@ class WgpDesktopPluginWidget(QWidget):
             current_res_choice = ui_defaults.get("resolution")
             model_resolutions = model_def.get("resolutions", None)
             self.full_resolution_choices, current_res_choice = wgp.get_resolution_choices(current_res_choice, model_resolutions)
-            available_groups, selected_group_resolutions, selected_group = wgp.group_resolutions(model_def, self.full_resolution_choices, current_res_choice)
+            if hasattr(wgp, "resolution_utils"):
+                available_groups, selected_group_resolutions, selected_group = wgp.resolution_utils.group_resolution_choices(self.full_resolution_choices, current_res_choice)
+            else:
+                available_groups, selected_group_resolutions, selected_group = wgp.group_resolutions(model_def, self.full_resolution_choices, current_res_choice)
 
             self.widgets['resolution_group'].clear()
             self.widgets['resolution_group'].addItems(available_groups)
@@ -2404,7 +2617,7 @@ class WgpDesktopPluginWidget(QWidget):
         if base_type_mock.choices:
             for label, value in base_type_mock.choices: self.widgets['model_base_type_choice'].addItem(label, value)
         self.widgets['model_base_type_choice'].setCurrentIndex(self.widgets['model_base_type_choice'].findData(base_type_mock.value))
-        self.widgets['model_base_type_choice'].setVisible(is_visible_base)
+        self.widgets['model_base_type_choice'].setVisible(bool(is_visible_base) if not callable(is_visible_base) else True)
         self.widgets['model_base_type_choice'].blockSignals(False)
 
         if hasattr(choice_mock, 'kwargs') and isinstance(choice_mock.kwargs, dict):
@@ -2419,7 +2632,7 @@ class WgpDesktopPluginWidget(QWidget):
         if choice_mock.choices:
             for label, value in choice_mock.choices: self.widgets['model_choice'].addItem(label, value)
         self.widgets['model_choice'].setCurrentIndex(self.widgets['model_choice'].findData(choice_mock.value))
-        self.widgets['model_choice'].setVisible(is_visible_choice)
+        self.widgets['model_choice'].setVisible(bool(is_visible_choice) if not callable(is_visible_choice) else True)
         self.widgets['model_choice'].blockSignals(False)
         
         self._on_model_changed()
@@ -2443,7 +2656,7 @@ class WgpDesktopPluginWidget(QWidget):
         if choice_mock.choices:
             for label, value in choice_mock.choices: self.widgets['model_choice'].addItem(label, value)
         self.widgets['model_choice'].setCurrentIndex(self.widgets['model_choice'].findData(choice_mock.value))
-        self.widgets['model_choice'].setVisible(is_visible_choice)
+        self.widgets['model_choice'].setVisible(bool(is_visible_choice) if not callable(is_visible_choice) else True)
         self.widgets['model_choice'].blockSignals(False)
         self._on_model_changed()
 
@@ -2462,7 +2675,8 @@ class WgpDesktopPluginWidget(QWidget):
         model_resolutions = model_def.get("resolutions", None)
         group_resolution_choices = []
         if model_resolutions is None:
-            group_resolution_choices = [res for res in self.full_resolution_choices if wgp.categorize_resolution(res[1]) == selected_group]
+            cat_fn = getattr(getattr(wgp, "resolution_utils", None), "categorize_resolution", getattr(wgp, "categorize_resolution", None))
+            group_resolution_choices = [res for res in self.full_resolution_choices if cat_fn(res[1]) == selected_group]
         else: return
         last_resolution = self.state.get("last_resolution_per_group", {}).get(selected_group, "")
         if not any(last_resolution == res[1] for res in group_resolution_choices) and group_resolution_choices:
@@ -2504,7 +2718,8 @@ class WgpDesktopPluginWidget(QWidget):
                 best_res_value = res_value
 
         if best_res_value:
-            best_group = wgp.categorize_resolution(best_res_value)
+            cat_fn = getattr(getattr(wgp, "resolution_utils", None), "categorize_resolution", getattr(wgp, "categorize_resolution", None))
+            best_group = cat_fn(best_res_value)
 
             group_combo = self.widgets['resolution_group']
             group_combo.blockSignals(True)
@@ -2526,7 +2741,8 @@ class WgpDesktopPluginWidget(QWidget):
         with working_directory(wan2gp_dir):
              full_inputs = wgp.get_default_settings(self.state['model_type']).copy()
 
-        sig = inspect.signature(wgp.generate_video)
+        gen_fn = getattr(wgp, 'generate_media', getattr(wgp, 'generate_video', None))
+        sig = inspect.signature(gen_fn)
         for param in sig.parameters:
             if param not in full_inputs and param not in ['task', 'send_cmd', 'plugin_data', 'state']:
                 full_inputs[param] = None
@@ -2619,6 +2835,15 @@ class WgpDesktopPluginWidget(QWidget):
             if list_key in full_inputs and full_inputs[list_key] is None:
                 full_inputs[list_key] = []
 
+        full_inputs['spatial_upsampler_parameters'] = dict(self.state.get('spatial_upsampler_parameters', {}))
+
+        if hasattr(wgp, 'clean_settings'):
+            wgp.clean_settings(self.state['model_type'], full_inputs)
+
+        for param, p_obj in sig.parameters.items():
+            if param not in full_inputs and param not in ['task', 'send_cmd', 'plugin_data', 'state']:
+                full_inputs[param] = p_obj.default if p_obj.default is not inspect.Parameter.empty else None
+
         return full_inputs
 
     def _prepare_state_for_generation(self):
@@ -2642,7 +2867,8 @@ class WgpDesktopPluginWidget(QWidget):
             
     def _add_task_to_queue(self):
         all_inputs = self.collect_inputs()
-        sig = inspect.signature(wgp.generate_video)
+        gen_fn = getattr(wgp, 'generate_media', getattr(wgp, 'generate_video', None))
+        sig = inspect.signature(gen_fn)
         valid_keys = set(sig.parameters.keys())
         params = {k: v for k, v in all_inputs.items() if k in valid_keys}
         params['state'] = self.state
@@ -2839,7 +3065,7 @@ class WgpDesktopPluginWidget(QWidget):
                     json.dump(wgp.server_config, writer, indent=4)
 
             self.config_status_label.setText("Settings saved successfully. Restart may be required for some changes.")
-            self.header_info.setText(wgp.generate_header(self.state['model_type'], wgp.compile, wgp.attention_mode))
+            self._update_header_info(self.state['model_type'])
             self.update_model_dropdowns(wgp.transformer_type)
             self.refresh_ui_from_model_change(wgp.transformer_type)
 
@@ -2894,19 +3120,24 @@ class Plugin(VideoEditorPlugin):
             try:
                 with open(envs_json, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-
+                
+                # Wan2GP can use 'active' or 'current_env'
                 active = data.get('active') or data.get('current_env')
+                # Wan2GP uses 'envs' (or fallback 'environments')
                 envs = data.get('envs') or data.get('environments') or {}
-
+                
+                # 1. Check selected active environment
                 if active and active in envs:
                     raw_path = envs[active].get('path') or envs[active].get('env_path')
                     if raw_path:
                         p = Path(raw_path)
+                        # Resolve relative paths like ".\env_venv" against wan2gp_dir
                         if not p.is_absolute():
                             p = (wan2gp_dir / p).resolve()
                         if p.exists():
                             return p
-
+                
+                # 2. Fallback: inspect any listed environment
                 for env_name, env_info in envs.items():
                     raw_path = env_info.get('path') or env_info.get('env_path')
                     if raw_path:
@@ -2918,6 +3149,7 @@ class Plugin(VideoEditorPlugin):
             except Exception as e:
                 print(f"[Wan2GP] Error parsing envs.json: {e}")
 
+        # 3. Disk fallback: check standard Wan2GP virtualenv directories
         candidates = [
             wan2gp_dir / 'env_venv',
             wan2gp_dir / 'env_uv',
@@ -3002,18 +3234,23 @@ class Plugin(VideoEditorPlugin):
                     spec = importlib.util.spec_from_file_location(module_name, wgp_path)
                     if spec is None or spec.loader is None:
                         raise ImportError(f"Could not create a module spec for the file at {wgp_path}")
-
                     wgp_module = importlib.util.module_from_spec(spec)
+                    sys.modules["wgp"] = wgp_module
                     original_sys_path = list(sys.path)
                     if str(wan2gp_dir) not in sys.path:
                         sys.path.insert(0, str(wan2gp_dir))
-
                     try:
                         spec.loader.exec_module(wgp_module)
                     finally:
                         sys.path[:] = original_sys_path
-
                     wgp = wgp_module
+                    if hasattr(wgp, "generate_media") and not hasattr(wgp, "generate_video"):
+                        wgp.generate_video = wgp.generate_media
+                    if hasattr(wgp, "generate_media_tab") and not hasattr(wgp, "generate_video_tab"):
+                        wgp.generate_video_tab = wgp.generate_media_tab
+                    if hasattr(wgp, "resolution_utils"):
+                        wgp.group_resolutions = lambda model_def, choices, current: wgp.resolution_utils.group_resolution_choices(choices, current)
+                        wgp.categorize_resolution = wgp.resolution_utils.categorize_resolution
 
             wgp.app = MockApp()
             self.client_widget = WgpDesktopPluginWidget(self)
